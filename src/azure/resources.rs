@@ -3,9 +3,11 @@
 
 #![allow(dead_code, unused_variables)]
 
+use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 
 use crate::azure::auth::AzureAuth;
+use crate::azure::client::ArmClient;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ResourceKind {
@@ -53,5 +55,179 @@ Resources
 /// Query Resource Graph. Empty `subscription_ids` means "all subscriptions the
 /// credential can see" — the caller should resolve that via [`super::subscriptions::list`] first.
 pub async fn list(auth: &AzureAuth, subscription_ids: &[String]) -> anyhow::Result<Vec<Resource>> {
-    todo!("Lane 2: POST /providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01 with body {{subscriptions, query: KQL}}; map type+kind into ResourceKind")
+    let client = ArmClient::new(auth.clone())?;
+
+    let body = if subscription_ids.is_empty() {
+        serde_json::json!({ "query": KQL })
+    } else {
+        serde_json::json!({
+            "subscriptions": subscription_ids,
+            "query": KQL,
+        })
+    };
+
+    let resp = client
+        .post(
+            "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01",
+            &body,
+        )
+        .await?;
+
+    let rows = resp
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("resource graph response missing 'data' array"))?;
+
+    if rows.len() >= 1000 {
+        tracing::warn!(
+            "resource graph returned {} rows; pagination not implemented in v1",
+            rows.len()
+        );
+    }
+
+    let resources: Vec<Resource> = rows.iter().filter_map(parse_resource).collect();
+    Ok(resources)
+}
+
+fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
+    let ty = v.get("type")?.as_str()?.to_lowercase();
+    let kind_str = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+
+    let kind = if ty == "microsoft.web/sites" && kind_str.to_lowercase().contains("functionapp") {
+        ResourceKind::FunctionApp
+    } else if ty == "microsoft.apimanagement/service" {
+        ResourceKind::Apim
+    } else if ty == "microsoft.app/containerapps" {
+        ResourceKind::ContainerApp
+    } else {
+        return None;
+    };
+
+    let id = v.get("id")?.as_str()?.to_string();
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+    let location = v
+        .get("location")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let resource_group = v
+        .get("resourceGroup")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let subscription_id = v
+        .get("subscriptionId")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let state = v
+        .get("state")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Some(Resource {
+        id,
+        name,
+        kind,
+        location,
+        resource_group,
+        subscription_id,
+        state,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_each_resource_kind() {
+        let payload = json!({
+            "data": [
+                {
+                    "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Web/sites/myfunc",
+                    "name": "myfunc",
+                    "type": "microsoft.web/sites",
+                    "kind": "functionapp,linux",
+                    "location": "westeurope",
+                    "resourceGroup": "rg1",
+                    "subscriptionId": "sub1",
+                    "state": "Running"
+                },
+                {
+                    "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.ApiManagement/service/myapim",
+                    "name": "myapim",
+                    "type": "microsoft.apimanagement/service",
+                    "kind": "",
+                    "location": "westeurope",
+                    "resourceGroup": "rg1",
+                    "subscriptionId": "sub1",
+                    "state": ""
+                },
+                {
+                    "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.App/containerApps/myca",
+                    "name": "myca",
+                    "type": "microsoft.app/containerapps",
+                    "kind": "",
+                    "location": "westeurope",
+                    "resourceGroup": "rg1",
+                    "subscriptionId": "sub1",
+                    "state": "Running"
+                },
+                {
+                    "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Web/sites/justawebapp",
+                    "name": "justawebapp",
+                    "type": "microsoft.web/sites",
+                    "kind": "app,linux",
+                    "location": "westeurope",
+                    "resourceGroup": "rg1",
+                    "subscriptionId": "sub1",
+                    "state": "Running"
+                }
+            ]
+        });
+
+        let resources: Vec<Resource> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .collect();
+
+        // Plain web app (kind=app,linux) must be skipped.
+        assert_eq!(resources.len(), 3);
+        assert_eq!(resources[0].kind, ResourceKind::FunctionApp);
+        assert_eq!(resources[0].state.as_deref(), Some("Running"));
+        assert_eq!(resources[1].kind, ResourceKind::Apim);
+        assert_eq!(resources[1].state, None); // empty string filtered out
+        assert_eq!(resources[2].kind, ResourceKind::ContainerApp);
+    }
+
+    #[test]
+    fn skips_unknown_resource_types() {
+        let payload = json!({
+            "data": [
+                {
+                    "id": "/subscriptions/x/resourceGroups/y/providers/Microsoft.Storage/storageAccounts/z",
+                    "name": "z",
+                    "type": "microsoft.storage/storageaccounts",
+                    "kind": "",
+                    "location": "westeurope",
+                    "resourceGroup": "y",
+                    "subscriptionId": "x",
+                    "state": ""
+                }
+            ]
+        });
+
+        let resources: Vec<Resource> = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .collect();
+        assert!(resources.is_empty());
+    }
 }
