@@ -15,10 +15,15 @@ Pre-alpha. Build is in progress.
 
 ## Authentication
 
-`azpect` uses Azure's `DefaultAzureCredential` chain — environment
-variables, workload identity, managed identity, the Azure CLI
-(`az login`), Azure PowerShell, then `azd`. Whichever resolves first
-wins. For most users the easiest path is `az login`.
+`azpect` uses the `DefaultAzureCredential` from Microsoft's official Rust
+SDK (`azure_identity` 0.27). At this SDK version the chain consists of
+the **Azure CLI** (`az login`) and **Azure Developer CLI** (`azd auth
+login`), in that order — environment-variable, workload-identity, and
+managed-identity links are not yet ported to the Rust SDK. For most
+users the easiest path is `az login`.
+
+Run `azpect debug-auth` to confirm credentials resolve and to print the
+list of subscriptions the active credential can see.
 
 ## Build
 
