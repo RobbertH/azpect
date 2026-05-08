@@ -1,0 +1,40 @@
+[package]
+name = "azpect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Terminal UI for observing the health of Azure APIs (Function Apps, APIM, Container Apps)."
+repository = "https://github.com/RobbertH/azpect"
+readme = "README.md"
+keywords = ["azure", "tui", "monitoring", "ratatui", "observability"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "azpect"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+azure_core = "0.27"
+azure_identity = "0.27"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+toml = "0.9"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tui-input = "0.14"
+nucleo-matcher = "0.3"
+futures = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
