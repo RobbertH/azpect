@@ -153,13 +153,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::OpenSelected => {
             if let Some(sub) = state.subscriptions.get(state.subscription_cursor) {
                 state.selected_subscription = Some(sub.id.clone());
+                state.config.last_subscription_id = Some(sub.id.clone());
                 state.previous_view = Some(state.view);
                 state.view = View::List;
-                // Lane 3 watches `selected_subscription` to spawn the resource loader.
-                // Reset the list cursor so we don't carry over an old position.
                 state.list_cursor = 0;
                 state.resources.clear();
-                state.loading_resources = true;
             }
             true
         }
@@ -239,8 +237,16 @@ mod tests {
         state.subscription_cursor = 1;
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::List);
-        assert_eq!(state.selected_subscription.as_deref(), Some("22222222-2222-2222-2222-222222222222"));
-        assert!(state.loading_resources);
+        assert_eq!(
+            state.selected_subscription.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(
+            state.config.last_subscription_id.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222"),
+            "picking a sub should update the persisted last_subscription_id",
+        );
+        assert!(state.resources.is_empty());
     }
 
     #[test]

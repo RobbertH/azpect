@@ -304,7 +304,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if supports {
                 state.previous_view = Some(state.view);
                 state.view = View::Logs;
-                state.list_cursor = 0;
             } else {
                 state.status_message =
                     Some("logs are not supported for this resource type".to_string());

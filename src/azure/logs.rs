@@ -140,8 +140,11 @@ fn parse_logs_response(value: &serde_json::Value, kind: ResourceKind) -> anyhow:
         .and_then(|r| r.as_array())
         .ok_or_else(|| anyhow!("logs response table missing 'rows'"))?;
 
+    // Empty rows just means no log lines in the requested window
+    // (quiet period, errors-only filter excluded everything, etc.).
+    // `NoLogDestination` is reserved for the missing-tables case above.
     if rows.is_empty() {
-        return Err(anyhow!(AzpectError::NoLogDestination));
+        return Ok(Vec::new());
     }
 
     let mut out = Vec::with_capacity(rows.len());
@@ -285,12 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_rows_yields_no_log_destination() {
+    fn empty_rows_yields_empty_vec() {
         let payload = json!({
             "tables": [
                 { "name": "PrimaryResult", "columns": [{"name": "TimeGenerated", "type": "datetime"}], "rows": [] }
             ]
         });
+        let lines = parse_logs_response(&payload, ResourceKind::FunctionApp).unwrap();
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn missing_tables_yields_no_log_destination() {
+        let payload = json!({});
         let err = parse_logs_response(&payload, ResourceKind::FunctionApp).unwrap_err();
         assert!(err.downcast_ref::<AzpectError>().map(|e| matches!(e, AzpectError::NoLogDestination)).unwrap_or(false));
     }

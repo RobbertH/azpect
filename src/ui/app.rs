@@ -18,7 +18,7 @@ use std::io::{stdout, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -28,6 +28,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tui_input::backend::crossterm::EventHandler as _;
 
 use crate::azure::auth::AzureAuth;
 use crate::azure::metrics::TimeRange;
@@ -164,6 +165,15 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
                     continue;
                 }
+                // When the list filter input has focus, forward raw keystrokes
+                // into the `tui_input::Input` widget. `Esc` and `Enter` still
+                // flow through the action dispatcher so they can cancel/apply.
+                if should_forward_to_filter(state, key) {
+                    state.list_filter.handle_event(&CtEvent::Key(key));
+                    // Filter contents may shrink; keep the cursor in range.
+                    state.list_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -228,6 +238,14 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+/// True when the list filter is active *and* the key is something the input
+/// widget should consume (i.e. anything except `Esc` / `Enter`, which remain
+/// reserved for cancel / apply via [`decide_action`]).
+fn should_forward_to_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.list_filter_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
 }
 
 /// Run the key event through the chord state machine and the per-view +
@@ -556,6 +574,27 @@ mod tests {
         // `j` after a stale `g` should be MoveDown, not GotoTop.
         assert_eq!(a, Action::MoveDown);
         assert!(input.pending_chord.is_none());
+    }
+
+    #[test]
+    fn filter_forwarding_gating() {
+        let mut state = fresh_state();
+
+        // Filter inactive: nothing should be forwarded, even printable keys.
+        assert!(!should_forward_to_filter(&state, k('a')));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!should_forward_to_filter(&state, esc));
+        assert!(!should_forward_to_filter(&state, enter));
+
+        // Filter active: printable keys forward; Esc/Enter still reach the dispatcher.
+        state.list_filter_active = true;
+        assert!(should_forward_to_filter(&state, k('a')));
+        assert!(should_forward_to_filter(&state, k('/')));
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(should_forward_to_filter(&state, backspace));
+        assert!(!should_forward_to_filter(&state, esc));
+        assert!(!should_forward_to_filter(&state, enter));
     }
 
     #[test]

@@ -313,8 +313,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 if supports_logs(sel.kind) {
                     state.previous_view = Some(state.view);
                     state.view = View::Logs;
-                    // Repurpose list_cursor for log scrolling while we're in logs view.
-                    state.list_cursor = 0;
                 } else {
                     state.status_message =
                         Some("logs are not supported for this resource type".to_string());
@@ -446,6 +444,19 @@ mod tests {
         state.list_cursor = 0;
         assert!(handle(Action::OpenLogs, &mut state));
         assert_eq!(state.view, View::Logs);
+    }
+
+    #[test]
+    fn open_logs_preserves_list_cursor() {
+        // Regression: previously, OpenLogs reset list_cursor to 0, which caused
+        // the Logs view to dispatch loads against filtered_resources[0] instead
+        // of the user's highlighted row. The cursor must survive the trip.
+        let mut state = fixture();
+        // cursor 2 -> gamma-ctra (ContainerApp, supports logs)
+        state.list_cursor = 2;
+        assert!(handle(Action::OpenLogs, &mut state));
+        assert_eq!(state.view, View::Logs);
+        assert_eq!(state.list_cursor, 2);
     }
 
     #[test]

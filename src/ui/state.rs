@@ -41,6 +41,9 @@ pub struct LogsCache {
     pub errors_only: bool,
     pub loading: bool,
     pub last_error: Option<String>,
+    /// Scroll offset/cursor inside the logs table.
+    /// Kept separate from `AppState::list_cursor` so navigating logs does not corrupt the resource selection in the List view.
+    pub scroll: usize,
 }
 
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.

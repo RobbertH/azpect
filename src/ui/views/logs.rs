@@ -135,8 +135,8 @@ fn render_table(
     theme: &Theme,
 ) {
     let visible = area.height as usize;
-    let scroll = scroll_for(state.list_cursor, lines.len(), visible);
-    let cursor = state.list_cursor.min(lines.len().saturating_sub(1));
+    let scroll = scroll_for(state.logs.scroll, lines.len(), visible);
+    let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
 
     let rows: Vec<Row> = lines
         .iter()
@@ -259,38 +259,38 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
                 state.logs.by_resource.remove(&id);
             }
-            state.list_cursor = 0;
+            state.logs.scroll = 0;
             true
         }
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::MoveDown => {
             if lines_len > 0 {
-                state.list_cursor = (state.list_cursor + 1).min(lines_len - 1);
+                state.logs.scroll = (state.logs.scroll + 1).min(lines_len - 1);
             }
             true
         }
         Action::MoveUp => {
-            state.list_cursor = state.list_cursor.saturating_sub(1);
+            state.logs.scroll = state.logs.scroll.saturating_sub(1);
             true
         }
         Action::HalfPageDown => {
             if lines_len > 0 {
-                state.list_cursor = (state.list_cursor + HALF_PAGE).min(lines_len - 1);
+                state.logs.scroll = (state.logs.scroll + HALF_PAGE).min(lines_len - 1);
             }
             true
         }
         Action::HalfPageUp => {
-            state.list_cursor = state.list_cursor.saturating_sub(HALF_PAGE);
+            state.logs.scroll = state.logs.scroll.saturating_sub(HALF_PAGE);
             true
         }
         Action::GotoTop => {
-            state.list_cursor = 0;
+            state.logs.scroll = 0;
             true
         }
         Action::GotoBottom => {
             if lines_len > 0 {
-                state.list_cursor = lines_len - 1;
+                state.logs.scroll = lines_len - 1;
             }
             true
         }
@@ -306,7 +306,7 @@ fn set_window(state: &mut AppState, range: TimeRange) -> bool {
     if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
         state.logs.by_resource.remove(&id);
     }
-    state.list_cursor = 0;
+    state.logs.scroll = 0;
     true
 }
 
@@ -435,9 +435,9 @@ mod tests {
             ],
         );
         assert!(handle(Action::MoveDown, &mut state));
-        assert_eq!(state.list_cursor, 1);
+        assert_eq!(state.logs.scroll, 1);
         assert!(handle(Action::MoveDown, &mut state));
-        assert_eq!(state.list_cursor, 1);
+        assert_eq!(state.logs.scroll, 1);
     }
 
     #[test]

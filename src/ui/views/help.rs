@@ -144,8 +144,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let _ = action;
-    let target = state.previous_view.unwrap_or(View::List);
-    state.previous_view = Some(state.view);
+    let target = state.previous_view.take().unwrap_or(View::List);
     state.view = target;
     true
 }
@@ -177,6 +176,7 @@ mod tests {
         state.previous_view = Some(View::Detail);
         assert!(handle(Action::Back, &mut state));
         assert_eq!(state.view, View::Detail);
+        assert_eq!(state.previous_view, None);
     }
 
     #[test]
@@ -186,6 +186,21 @@ mod tests {
         state.previous_view = None;
         assert!(handle(Action::Help, &mut state));
         assert_eq!(state.view, View::List);
+        assert_eq!(state.previous_view, None);
+    }
+
+    #[test]
+    fn handle_does_not_bounce_back_into_help() {
+        // Simulates: start in List -> ? to Help -> key to dismiss.
+        // After dismiss, previous_view must be None so a subsequent Esc/q
+        // from List does not warp the user back into Help.
+        let mut state = AppState::new(Config::default());
+        state.view = View::Help;
+        state.previous_view = Some(View::List);
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.view, View::List);
+        assert_ne!(state.previous_view, Some(View::Help));
+        assert_eq!(state.previous_view, None);
     }
 
     #[test]
