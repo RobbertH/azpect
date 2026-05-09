@@ -13,6 +13,9 @@ pub struct Theme {
     pub accent: Color,
     pub favorite: Color,
     pub healthy: Color,
+    /// Running-but-quiet resources: distinct enough from `healthy` to telegraph
+    /// "no traffic" at a glance, but not alarming like `degraded`.
+    pub idle: Color,
     pub degraded: Color,
     pub critical: Color,
     pub unknown: Color,
@@ -40,6 +43,7 @@ impl Theme {
             accent: Color::Rgb(0xcb, 0xa6, 0xf7),   // mauve
             favorite: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
             healthy: Color::Rgb(0xa6, 0xe3, 0xa1),  // green
+            idle: Color::Rgb(0x89, 0xb4, 0xfa),     // blue
             degraded: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
             critical: Color::Rgb(0xf3, 0x8b, 0xa8), // red
             unknown: Color::Rgb(0x6c, 0x70, 0x86),  // overlay0
@@ -58,6 +62,7 @@ impl Theme {
             accent: Color::Rgb(0x88, 0x39, 0xef),   // mauve
             favorite: Color::Rgb(0xdf, 0x8e, 0x1d), // yellow
             healthy: Color::Rgb(0x40, 0xa0, 0x2b),  // green
+            idle: Color::Rgb(0x1e, 0x66, 0xf5),     // blue
             degraded: Color::Rgb(0xdf, 0x8e, 0x1d), // yellow
             critical: Color::Rgb(0xd2, 0x0f, 0x39), // red
             unknown: Color::Rgb(0x9c, 0xa0, 0xb0),  // overlay0
@@ -76,6 +81,7 @@ impl Theme {
             accent: Color::Magenta,
             favorite: Color::Yellow,
             healthy: Color::Green,
+            idle: Color::Blue,
             degraded: Color::Yellow,
             critical: Color::Red,
             unknown: Color::DarkGray,
@@ -93,6 +99,7 @@ impl Theme {
             accent: Color::Magenta,
             favorite: Color::Yellow,
             healthy: Color::Green,
+            idle: Color::Blue,
             degraded: Color::Yellow,
             critical: Color::Red,
             unknown: Color::Gray,

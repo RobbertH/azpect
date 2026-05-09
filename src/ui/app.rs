@@ -17,9 +17,7 @@
 use std::io::{stdout, Stdout};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEventKind,
-};
+use crossterm::event::{Event as CtEvent, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -56,7 +54,10 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // Don't capture mouse events: we don't react to them anywhere, and
+        // capturing them breaks native click-and-drag text selection in the
+        // terminal emulator (so users can't copy error messages).
+        execute!(stdout(), EnterAlternateScreen)?;
         Ok(Self { active: true })
     }
 
@@ -67,7 +68,7 @@ impl TerminalGuard {
         self.active = false;
         // Best-effort restore. Log but don't propagate — we're probably already
         // unwinding and the terminal will be in a bad state regardless.
-        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -171,7 +172,9 @@ async fn event_loop(
                 // dispatcher) runs.
                 if state.quit_confirm {
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        // Direct yes/no shortcuts always commit, regardless of
+                        // which button is focused.
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
                             state.should_quit = true;
                             break;
                         }
@@ -180,6 +183,26 @@ async fn event_loop(
                         | KeyCode::Esc
                         | KeyCode::Char('q') => {
                             state.quit_confirm = false;
+                            continue;
+                        }
+                        // Enter commits whichever button is currently focused.
+                        KeyCode::Enter => {
+                            if state.quit_confirm_yes {
+                                state.should_quit = true;
+                                break;
+                            } else {
+                                state.quit_confirm = false;
+                                continue;
+                            }
+                        }
+                        // Toggle focus between Yes and No.
+                        KeyCode::Left
+                        | KeyCode::Char('h')
+                        | KeyCode::Right
+                        | KeyCode::Char('l')
+                        | KeyCode::Tab
+                        | KeyCode::BackTab => {
+                            state.quit_confirm_yes = !state.quit_confirm_yes;
                             continue;
                         }
                         _ => continue,
@@ -250,10 +273,20 @@ async fn event_loop(
                 match res {
                     Ok(rs) => {
                         state.resources = rs;
+                        // Restore the cursor to the last-selected resource if
+                        // it's still in the loaded set; otherwise clamp.
+                        if let Some(last) = state.config.last_resource_id.as_deref() {
+                            if let Some(idx) =
+                                state.resources.iter().position(|r| r.id == last)
+                            {
+                                state.list_cursor = idx;
+                            }
+                        }
                         if state.list_cursor >= state.resources.len() {
                             state.list_cursor = state.resources.len().saturating_sub(1);
                         }
                         spawn_missing_list_metrics(state, auth, tx);
+                        spawn_missing_list_health(state, auth, tx);
                     }
                     Err(e) => state.status_message = Some(format!("resources: {e}")),
                 }
@@ -284,6 +317,18 @@ async fn event_loop(
                     Err(e) => state.logs.last_error = Some(e),
                 }
             }
+            AppEvent::HealthLoaded { resource_id, result } => {
+                state.health.pending.remove(&resource_id);
+                match result {
+                    Ok(avail) => {
+                        state.health.failures.remove(&resource_id);
+                        state.health.by_resource.insert(resource_id, avail);
+                    }
+                    Err(e) => {
+                        state.health.failures.insert(resource_id, e);
+                    }
+                }
+            }
         }
 
         if state.should_quit {
@@ -295,11 +340,20 @@ async fn event_loop(
 }
 
 /// True when the list filter is active *and* the key is something the input
-/// widget should consume (i.e. anything except `Esc` / `Enter`, which remain
-/// reserved for cancel / apply via [`decide_action`]).
+/// widget should consume. `Esc` / `Enter` are reserved for cancel / apply, and
+/// arrow / page-navigation keys must continue to steer the underlying list
+/// rather than moving the text cursor inside the search box.
 fn should_forward_to_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
     state.list_filter_active
-        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
 }
 
 /// True when the command palette is active *and* the key is something the
@@ -424,7 +478,10 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
                 // routes y/n until the user resolves it. `:q` and friends in
                 // `run_command` bypass this and quit immediately — that's
                 // explicit intent.
-                None => state.quit_confirm = true,
+                None => {
+                    state.quit_confirm = true;
+                    state.quit_confirm_yes = false;
+                }
             }
             true
         }
@@ -573,7 +630,7 @@ fn dispatch_view(
     // command bar to the screen — render it before the command bar. (In
     // practice both flags can't be true at once given input gating.)
     if state.quit_confirm {
-        render_quit_modal(f, area, theme);
+        render_quit_modal(f, area, state, theme);
     }
 
     if let Some(ca) = command_area {
@@ -581,15 +638,15 @@ fn dispatch_view(
     }
 }
 
-/// Render a small centered "Are you sure you want to quit?" modal over `area`.
-/// Caller is responsible for only invoking this when `state.quit_confirm`.
-fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, theme: &Theme) {
+/// Render a centered "Are you sure you want to quit?" modal with focusable
+/// Yes / No buttons. Caller invokes only when `state.quit_confirm`.
+fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
     use ratatui::layout::Alignment;
     use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-    let popup = centered_fixed_rect(46, 5, area);
+    let popup = centered_fixed_rect(50, 7, area);
     if popup.width == 0 || popup.height == 0 {
         return;
     }
@@ -612,22 +669,35 @@ fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, theme: &Theme) {
         return;
     }
 
-    // Layout (5 rows total, borders eat 2 -> inner height 3):
-    //   blank
-    //   "Are you sure you want to quit?"
-    //   blank
-    //   "y / Enter — yes        n / Esc — no"
-    // Paragraph clips the leading blank when inner.height < 4, which is the
-    // normal case at the spec'd size and looks fine.
+    let focused_style = Style::default()
+        .bg(theme.accent)
+        .fg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+    let unfocused_style = Style::default().fg(theme.muted);
+
+    let yes_label = "  Yes  ";
+    let no_label = "  No  ";
+    let (yes_style, no_style) = if state.quit_confirm_yes {
+        (focused_style, unfocused_style)
+    } else {
+        (unfocused_style, focused_style)
+    };
+
+    // Inner is 5 rows; lay out as: message, blank, buttons, blank, hint.
     let lines = vec![
-        Line::from(""),
         Line::from(Span::styled(
             "Are you sure you want to quit?",
             Style::default().fg(theme.fg),
         )),
         Line::from(""),
+        Line::from(vec![
+            Span::styled(yes_label, yes_style),
+            Span::raw("    "),
+            Span::styled(no_label, no_style),
+        ]),
+        Line::from(""),
         Line::from(Span::styled(
-            "y / Enter \u{2014} yes        n / Esc \u{2014} no",
+            "←/→ or Tab \u{2014} choose · Enter \u{2014} confirm · Esc \u{2014} cancel",
             Style::default().fg(theme.muted),
         )),
     ];
@@ -772,6 +842,41 @@ fn spawn_missing_list_metrics(
     }
 }
 
+fn spawn_load_health(
+    auth: AzureAuth,
+    resource_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::resource_health::fetch(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::HealthLoaded { resource_id, result });
+    });
+}
+
+/// Kick off a Resource Health fetch for every loaded resource that doesn't
+/// already have one cached or in flight. Mirrors `spawn_missing_list_metrics`.
+fn spawn_missing_list_health(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let to_fetch: Vec<String> = state
+        .resources
+        .iter()
+        .filter(|r| {
+            !state.health.by_resource.contains_key(&r.id)
+                && !state.health.pending.contains(&r.id)
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    for resource_id in to_fetch {
+        state.health.pending.insert(resource_id.clone());
+        spawn_load_health(auth.clone(), resource_id, tx.clone());
+    }
+}
+
 fn spawn_load_logs(
     auth: AzureAuth,
     resource: Resource,
@@ -842,7 +947,9 @@ mod tests {
         assert!(!should_forward_to_filter(&state, esc));
         assert!(!should_forward_to_filter(&state, enter));
 
-        // Filter active: printable keys forward; Esc/Enter still reach the dispatcher.
+        // Filter active: printable keys forward; Esc/Enter still reach the
+        // dispatcher; arrows / page nav stay with the dispatcher so they can
+        // drive the underlying list.
         state.list_filter_active = true;
         assert!(should_forward_to_filter(&state, k('a')));
         assert!(should_forward_to_filter(&state, k('/')));
@@ -850,6 +957,14 @@ mod tests {
         assert!(should_forward_to_filter(&state, backspace));
         assert!(!should_forward_to_filter(&state, esc));
         assert!(!should_forward_to_filter(&state, enter));
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let pgdn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let pgup = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(!should_forward_to_filter(&state, down));
+        assert!(!should_forward_to_filter(&state, up));
+        assert!(!should_forward_to_filter(&state, pgdn));
+        assert!(!should_forward_to_filter(&state, pgup));
     }
 
     #[test]
@@ -1043,5 +1158,82 @@ mod tests {
             !state.quit_confirm,
             ":q is explicit intent and must not open the modal"
         );
+    }
+
+    #[test]
+    fn list_badge_uses_resource_health_signal() {
+        // When Resource Health says Available and there's no traffic but the
+        // resource is Running, the list badge should render IDLE (not UNKNOWN
+        // and not LOADING…). This pins the wiring between the cache, the
+        // public `badge_for_row`, and `derive`'s decision table.
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        use crate::azure::resource_health::{AvailabilityState, ResourceAvailability};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use crate::ui::theme::Theme;
+        use chrono::{Duration, Utc};
+
+        let mut state = fresh_state();
+        let resource = Resource {
+            id: "/r/idle".into(),
+            name: "quiet-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+        };
+        state.resources = vec![resource.clone()];
+
+        // Synthesize zero-traffic metrics so `derive` finds the series but
+        // the trailing sum is 0 — the IDLE branch.
+        let now = Utc::now();
+        let zero_series = |kind| MetricSeries {
+            kind,
+            label: String::new(),
+            unit: String::new(),
+            points: (0..4)
+                .map(|i| MetricPoint {
+                    ts: now - Duration::minutes(15 * (4 - i)),
+                    value: 0.0,
+                })
+                .collect(),
+        };
+        state.metrics.by_resource.insert(
+            resource.id.clone(),
+            vec![
+                zero_series(MetricKind::Errors),
+                zero_series(MetricKind::Traffic),
+            ],
+        );
+        state.health.by_resource.insert(
+            resource.id.clone(),
+            ResourceAvailability {
+                state: AvailabilityState::Available,
+                reason: None,
+            },
+        );
+
+        let theme = Theme::catppuccin_mocha();
+        let (_, label) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
+        assert_eq!(label.trim(), "IDLE");
+
+        // And with traffic + healthy ratio under Available, we should get HEALTHY.
+        let traffic_series = MetricSeries {
+            kind: MetricKind::Traffic,
+            label: String::new(),
+            unit: String::new(),
+            points: (0..4)
+                .map(|i| MetricPoint {
+                    ts: now - Duration::minutes(15 * (4 - i)),
+                    value: 250.0,
+                })
+                .collect(),
+        };
+        state.metrics.by_resource.insert(
+            resource.id.clone(),
+            vec![zero_series(MetricKind::Errors), traffic_series],
+        );
+        let (_, label) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
+        assert_eq!(label.trim(), "HEALTHY");
     }
 }

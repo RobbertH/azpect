@@ -14,7 +14,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::azure::logs::LogLine;
-use crate::azure::metrics::MetricSeries;
+use crate::azure::metrics::MetricsResult;
 use crate::azure::resources::Resource;
 use crate::azure::subscriptions::Subscription;
 use crate::ui::state::View;
@@ -33,15 +33,23 @@ pub enum AppEvent {
     SubscriptionsLoaded(Result<Vec<Subscription>, String>),
     /// Background load completion: resource list for the active subscription set.
     ResourcesLoaded(Result<Vec<Resource>, String>),
-    /// Background load completion: metrics for a specific resource id.
+    /// Background load completion: metrics for a specific resource id. The
+    /// success payload carries both the loaded series and a per-metric error
+    /// map for ones that the resource's plan doesn't expose.
     MetricsLoaded {
         resource_id: String,
-        result: Result<Vec<MetricSeries>, String>,
+        result: Result<MetricsResult, String>,
     },
     /// Background load completion: logs for a specific resource id.
     LogsLoaded {
         resource_id: String,
         result: Result<Vec<LogLine>, String>,
+    },
+    /// Background load completion: Azure Resource Health availability for a
+    /// specific resource id.
+    HealthLoaded {
+        resource_id: String,
+        result: Result<crate::azure::resource_health::ResourceAvailability, String>,
     },
 }
 
@@ -95,12 +103,17 @@ pub enum Action {
 /// (event loop) holds the chord state and consults [`is_chord_starter`] /
 /// [`resolve_chord`].
 pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
-    // Search-mode capture: input field eats everything except Esc (cancel) and
-    // Enter (apply).
+    // Search-mode capture: the input field eats most keys, but vertical
+    // navigation must continue to drive the underlying list so the user can
+    // pick a row without leaving the search box.
     if search_active {
         return match key.code {
             KeyCode::Esc => Action::Back,
             KeyCode::Enter => Action::OpenSelected,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::PageDown => Action::HalfPageDown,
+            KeyCode::PageUp => Action::HalfPageUp,
             _ => Action::Noop,
         };
     }
@@ -252,6 +265,19 @@ mod tests {
         // Enter applies search → OpenSelected sentinel.
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(key_to_action(enter, v, true), Action::OpenSelected);
+    }
+
+    #[test]
+    fn search_active_lets_arrow_keys_through_for_list_navigation() {
+        let v = View::List;
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let pgdn = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let pgup = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(key_to_action(down, v, true), Action::MoveDown);
+        assert_eq!(key_to_action(up, v, true), Action::MoveUp);
+        assert_eq!(key_to_action(pgdn, v, true), Action::HalfPageDown);
+        assert_eq!(key_to_action(pgup, v, true), Action::HalfPageUp);
     }
 
     #[test]

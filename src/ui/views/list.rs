@@ -20,6 +20,13 @@ const FOOTER_HINT: &str =
 
 const HALF_PAGE: usize = 10;
 
+/// Fixed column widths for the resource list. Hard-coded so that columns
+/// don't jump when the visible window changes which long names are on screen.
+/// Names longer than this get truncated with an ellipsis; shorter names are
+/// space-padded.
+const NAME_COL_WIDTH: usize = 36;
+const RG_COL_WIDTH: usize = 20;
+
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -111,24 +118,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let visible = list_area.height as usize;
         let scroll = scroll_for(cursor, filtered.len(), visible);
 
-        // Compute name column width based on visible rows.
-        let max_name = filtered
-            .iter()
-            .skip(scroll)
-            .take(visible)
-            .map(|r| r.name.chars().count())
-            .max()
-            .unwrap_or(0)
-            .clamp(8, 36);
-
-        let max_rg = filtered
-            .iter()
-            .skip(scroll)
-            .take(visible)
-            .map(|r| r.resource_group.chars().count())
-            .max()
-            .unwrap_or(0)
-            .clamp(6, 24);
+        let max_name = NAME_COL_WIDTH;
+        let max_rg = RG_COL_WIDTH;
 
         let lines: Vec<Line> = filtered
             .iter()
@@ -195,22 +186,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     frame.render_widget(footer, chunks[2]);
 }
 
-fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
+pub(crate) fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
     if state.metrics.failures.contains_key(&r.id) {
         return (theme.critical, "ERROR".to_string());
     }
-    match state.metrics.by_resource.get(&r.id) {
-        Some(metrics) => {
-            let status = derive(metrics, r.state.as_deref());
-            (color_for_health(status, theme), status.label().to_string())
-        }
-        None => (theme.muted, "LOADING…".to_string()),
+    let metrics = state.metrics.by_resource.get(&r.id);
+    let availability = state.health.by_resource.get(&r.id).map(|a| a.state);
+
+    // Both signals still loading: show LOADING. Otherwise feed `derive`
+    // whatever's there and let the decision table take over.
+    if metrics.is_none() && availability.is_none() {
+        return (theme.muted, "LOADING…".to_string());
     }
+
+    let m: &[crate::azure::metrics::MetricSeries] = metrics.map(|v| v.as_slice()).unwrap_or(&[]);
+    let status = derive(m, r.state.as_deref(), availability);
+    (color_for_health(status, theme), status.label().to_string())
 }
 
 fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
     match status {
         HealthStatus::Healthy => theme.healthy,
+        HealthStatus::Idle => theme.idle,
         HealthStatus::Degraded => theme.degraded,
         HealthStatus::Critical => theme.critical,
         HealthStatus::Unknown => theme.unknown,
@@ -255,7 +252,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             Action::OpenSelected => {
                 // Pressing Enter while searching commits the filter and opens.
                 state.list_filter_active = false;
-                if state.selected_resource().is_some() {
+                if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
+                    state.config.last_resource_id = Some(id);
                     state.view_stack.push(state.view);
                     state.view = View::Detail;
                 }
@@ -305,7 +303,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::OpenSelected => {
-            if state.selected_resource().is_some() {
+            if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
+                state.config.last_resource_id = Some(id);
                 state.view_stack.push(state.view);
                 state.view = View::Detail;
             }
@@ -314,6 +313,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::OpenLogs => {
             if let Some(sel) = state.selected_resource() {
                 if supports_logs(sel.kind) {
+                    let id = sel.id.clone();
+                    state.config.last_resource_id = Some(id);
                     state.view_stack.push(state.view);
                     state.view = View::Logs;
                 } else {

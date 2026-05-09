@@ -38,6 +38,19 @@ pub struct MetricsCache {
     pub last_error: Option<String>,
 }
 
+/// Per-resource cached Azure Resource Health availability. Populated by a
+/// background fetch kicked off after `ResourcesLoaded`; consumed by
+/// `azure::health::derive` to outrank the metric-derived heuristic.
+#[derive(Clone, Default)]
+pub struct HealthCache {
+    /// keyed by resource id
+    pub by_resource: HashMap<String, crate::azure::resource_health::ResourceAvailability>,
+    /// IDs whose fetch is currently in-flight, so we don't double-spawn.
+    pub pending: HashSet<String>,
+    /// Per-resource failure messages.
+    pub failures: HashMap<String, String>,
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -73,6 +86,7 @@ pub struct AppState {
     pub loading_resources: bool,
 
     pub metrics: MetricsCache,
+    pub health: HealthCache,
     pub logs: LogsCache,
 
     pub status_message: Option<String>,
@@ -80,10 +94,13 @@ pub struct AppState {
 
     /// Modal flag: when true, a "Are you sure you want to quit?" overlay is
     /// rendered on top of the current view and the event loop short-circuits
-    /// keyboard input to y/n handling. Set via `Action::Back` on an empty view
-    /// stack; cleared by answering 'n' (or any cancel key). Note this is *not*
-    /// a `View` variant — the underlying view keeps rendering behind it.
+    /// keyboard input to the modal handler. Set via `Action::Back` on an empty
+    /// view stack; cleared by answering No (or any cancel key). Note this is
+    /// *not* a `View` variant — the underlying view keeps rendering behind it.
     pub quit_confirm: bool,
+    /// Which button is focused inside the quit modal. `true` = Yes, `false` =
+    /// No. Always reset to `false` (the safer default) when the modal opens.
+    pub quit_confirm_yes: bool,
 
     /// Whether the vim/k9s-style command palette (`:`) is currently capturing
     /// input. While true, raw keystrokes are forwarded into `command_input`
@@ -109,10 +126,12 @@ impl AppState {
             favorites_only: false,
             loading_resources: false,
             metrics: MetricsCache { range, ..Default::default() },
+            health: HealthCache::default(),
             logs: LogsCache { range, ..Default::default() },
             status_message: None,
             should_quit: false,
             quit_confirm: false,
+            quit_confirm_yes: false,
             command_active: false,
             command_input: Input::default(),
             config,
@@ -126,12 +145,58 @@ impl AppState {
     }
 
     /// Apply `list_filter` + `favorites_only` to `resources`.
+    ///
+    /// The filter is a case-insensitive subsequence match: typing `filedev`
+    /// matches `rnd3-filemonitor-dev` because the characters appear in that
+    /// order. This is more forgiving than substring matching and lets users
+    /// pick out resources without remembering exact prefixes.
     pub fn filtered_resources(&self) -> Vec<&Resource> {
         let needle = self.list_filter.value().to_lowercase();
         self.resources
             .iter()
             .filter(|r| !self.favorites_only || self.config.is_favorite(&r.id))
-            .filter(|r| needle.is_empty() || r.name.to_lowercase().contains(&needle))
+            .filter(|r| needle.is_empty() || is_subsequence(&needle, &r.name.to_lowercase()))
             .collect()
+    }
+}
+
+/// Returns true if every character of `needle` appears in `haystack` in order
+/// (not necessarily contiguous). Both inputs are expected to already be in the
+/// same case. Empty needle matches anything.
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut needle_chars = needle.chars().peekable();
+    for h in haystack.chars() {
+        match needle_chars.peek() {
+            Some(&n) if n == h => {
+                needle_chars.next();
+            }
+            Some(_) => {}
+            None => return true,
+        }
+    }
+    needle_chars.peek().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_subsequence;
+
+    #[test]
+    fn subsequence_basic_matches() {
+        assert!(is_subsequence("filedev", "rnd3-filemonitor-dev"));
+        assert!(is_subsequence("abc", "aXbYcZ"));
+        assert!(is_subsequence("", "anything"));
+    }
+
+    #[test]
+    fn subsequence_rejects_wrong_order() {
+        assert!(!is_subsequence("dev-file", "rnd3-filemonitor-dev"));
+        assert!(!is_subsequence("xyz", "abcde"));
+    }
+
+    #[test]
+    fn subsequence_exact_substring_still_matches() {
+        assert!(is_subsequence("file", "filemonitor"));
+        assert!(is_subsequence("monitor", "filemonitor"));
     }
 }

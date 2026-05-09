@@ -19,6 +19,12 @@ pub struct Config {
     #[serde(default)]
     pub last_subscription_id: Option<String>,
 
+    /// Last resource the user opened (Detail or Logs). The TUI restores the
+    /// list cursor to this id when the resource list loads, if the id is
+    /// present in the loaded set.
+    #[serde(default)]
+    pub last_resource_id: Option<String>,
+
     /// Full Azure resource IDs (`/subscriptions/.../resourceGroups/.../providers/...`).
     /// Stored as IDs because they are stable and globally unique.
     #[serde(default)]
@@ -41,6 +47,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             last_subscription_id: None,
+            last_resource_id: None,
             favorites: Vec::new(),
             default_window: TimeRange::default(),
             theme: default_theme(),
@@ -133,6 +140,7 @@ mod tests {
         let parsed: Config = toml::from_str(&serialized).expect("parse default config");
 
         assert_eq!(parsed.last_subscription_id, cfg.last_subscription_id);
+        assert_eq!(parsed.last_resource_id, cfg.last_resource_id);
         assert_eq!(parsed.favorites, cfg.favorites);
         assert_eq!(parsed.default_window, cfg.default_window);
         assert_eq!(parsed.theme, cfg.theme);

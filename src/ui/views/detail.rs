@@ -67,16 +67,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let metrics_opt = state.metrics.by_resource.get(&resource.id);
     let failure = state.metrics.failures.get(&resource.id);
+    let availability = state.health.by_resource.get(&resource.id).map(|a| a.state);
     let (badge_color, badge_label) = if failure.is_some() {
         (theme.critical, "ERROR")
+    } else if metrics_opt.is_none() && availability.is_none() {
+        (theme.muted, "LOADING")
     } else {
-        match metrics_opt {
-            Some(m) => {
-                let h = derive(m, resource.state.as_deref());
-                (color_for_health(h, theme), h.label())
-            }
-            None => (theme.muted, "LOADING"),
-        }
+        let m: &[MetricSeries] = metrics_opt.map(|v| v.as_slice()).unwrap_or(&[]);
+        let h = derive(m, resource.state.as_deref(), availability);
+        (color_for_health(h, theme), h.label())
     };
 
     let second_line_text = match failure {
@@ -128,12 +127,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     .wrap(Wrap { trim: false });
     frame.render_widget(context, body[0]);
 
-    // Sparkline grid: 4 rows, each with a 2-line slot (label/total + bars).
+    // Sparkline grid: 4 rows of equal fixed height (1 label line + 2 bars),
+    // plus a single shared time-axis row at the bottom. All sparklines span
+    // the same window, so one axis serves the whole grid.
     let metric_rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
-        Constraint::Min(0),
+        Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .split(body[1]);
 
@@ -145,7 +147,97 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         render_metric_row(frame, area, *kind, label, metrics_opt, state, theme);
     }
 
+    if metric_rows[4].height > 0 {
+        render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
+    }
+
     render_footer(frame, chunks[2], theme);
+}
+
+/// Render a 1-row time axis aligned under the sparkline grid. Five
+/// evenly-spaced labels are placed by column, marking the window's start, the
+/// three quarter-points, and `now` (right-anchored). For very narrow widths,
+/// degrades to just the start and end labels.
+fn render_time_axis(frame: &mut Frame, area: Rect, range: TimeRange, theme: &Theme) {
+    let line = build_time_axis(range, area.width);
+    let p = Paragraph::new(Line::from(Span::styled(
+        line,
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(p, area);
+}
+
+fn build_time_axis(range: TimeRange, width: u16) -> String {
+    let w = width as usize;
+    if w < 6 {
+        return String::new();
+    }
+    let total_minutes = match range {
+        TimeRange::Day => 24 * 60_i64,
+        TimeRange::Week => 7 * 24 * 60_i64,
+    };
+
+    // Anchor positions at 0, 1/4, 2/4, 3/4 of the width (left-anchored), and
+    // a final "now" right-anchored to the very end. Fall back to two labels on
+    // narrow widths so we never render overlapping garbage.
+    let mut row: Vec<char> = vec![' '; w];
+
+    let place = |row: &mut Vec<char>, start: usize, label: &str| {
+        for (i, c) in label.chars().enumerate() {
+            if start + i < row.len() {
+                row[start + i] = c;
+            }
+        }
+    };
+
+    let now = "now";
+    let now_start = w.saturating_sub(now.chars().count());
+
+    if w >= 40 {
+        let positions = [0usize, w / 4, w / 2, (3 * w) / 4];
+        for p in positions.iter() {
+            let frac = *p as f64 / w as f64;
+            let mins_ago = ((1.0 - frac) * total_minutes as f64).round() as i64;
+            let label = format_relative_minutes(mins_ago);
+            // Don't bleed into the "now" label.
+            let max_label_end = now_start.saturating_sub(1);
+            if *p < max_label_end {
+                let truncated_end = (p + label.chars().count()).min(max_label_end);
+                let trimmed: String = label.chars().take(truncated_end - p).collect();
+                place(&mut row, *p, &trimmed);
+            }
+        }
+    } else {
+        // Just the start label.
+        let label = format_relative_minutes(total_minutes);
+        let max_end = now_start.saturating_sub(1);
+        let trimmed: String = label.chars().take(max_end).collect();
+        place(&mut row, 0, &trimmed);
+    }
+
+    place(&mut row, now_start, now);
+    row.into_iter().collect()
+}
+
+/// Format a "minutes ago" count as a short relative timestamp (`-15m`, `-3h`,
+/// `-2d`). Zero collapses to `now`.
+fn format_relative_minutes(m: i64) -> String {
+    if m <= 0 {
+        return "now".to_string();
+    }
+    if m < 60 {
+        return format!("-{m}m");
+    }
+    if m < 24 * 60 {
+        return format!("-{}h", m / 60);
+    }
+    let days = m / (24 * 60);
+    let rem_h = (m % (24 * 60)) / 60;
+    if rem_h == 0 {
+        format!("-{days}d")
+    } else {
+        format!("-{days}d{rem_h}h")
+    }
 }
 
 /// Approximate how many terminal rows `text` will occupy after Paragraph
@@ -311,6 +403,7 @@ fn color_for_metric(kind: MetricKind, theme: &Theme) -> Color {
 fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
     match status {
         HealthStatus::Healthy => theme.healthy,
+        HealthStatus::Idle => theme.idle,
         HealthStatus::Degraded => theme.degraded,
         HealthStatus::Critical => theme.critical,
         HealthStatus::Unknown => theme.unknown,
@@ -360,6 +453,40 @@ mod tests {
     use chrono::{Duration, Utc};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn relative_minutes_formatting() {
+        assert_eq!(format_relative_minutes(0), "now");
+        assert_eq!(format_relative_minutes(-5), "now");
+        assert_eq!(format_relative_minutes(15), "-15m");
+        assert_eq!(format_relative_minutes(60), "-1h");
+        assert_eq!(format_relative_minutes(150), "-2h");
+        assert_eq!(format_relative_minutes(24 * 60), "-1d");
+        assert_eq!(format_relative_minutes(24 * 60 + 180), "-1d3h");
+        assert_eq!(format_relative_minutes(7 * 24 * 60), "-7d");
+    }
+
+    #[test]
+    fn time_axis_anchors_now_at_right_edge() {
+        let axis = build_time_axis(TimeRange::Day, 60);
+        assert!(axis.ends_with("now"));
+        // Day start label should appear at the very left.
+        assert!(axis.starts_with("-1d") || axis.starts_with("-24h"));
+        // Should be exactly the column width.
+        assert_eq!(axis.chars().count(), 60);
+    }
+
+    #[test]
+    fn time_axis_degrades_on_narrow_widths() {
+        let axis = build_time_axis(TimeRange::Week, 12);
+        assert!(axis.ends_with("now"));
+        assert_eq!(axis.chars().count(), 12);
+    }
+
+    #[test]
+    fn time_axis_returns_empty_below_threshold() {
+        assert_eq!(build_time_axis(TimeRange::Day, 4), "");
+    }
 
     fn r() -> Resource {
         Resource {

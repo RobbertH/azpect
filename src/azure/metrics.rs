@@ -6,6 +6,8 @@
 
 #![allow(dead_code, unused_variables)]
 
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -13,6 +15,16 @@ use serde::{Deserialize, Serialize};
 use crate::azure::auth::AzureAuth;
 use crate::azure::client::ArmClient;
 use crate::azure::resources::{Resource, ResourceKind};
+
+/// Outcome of a per-resource metrics fetch. Carries both the successfully
+/// loaded series and per-metric error messages for ones that 4xx'd or weren't
+/// exposed for the resource's plan (e.g. `CpuTime` doesn't exist on Premium /
+/// App Service-plan Function Apps).
+#[derive(Clone, Debug, Default)]
+pub struct MetricsResult {
+    pub series: Vec<MetricSeries>,
+    pub missing: HashMap<MetricKind, String>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum MetricKind {
@@ -162,120 +174,108 @@ fn aggregation_field(aggregation: &str) -> &'static str {
     }
 }
 
-/// Fetch all relevant metrics for a resource over the given range, in parallel
-/// where possible. Missing metrics (e.g. APIM has no memory) are simply absent
-/// from the returned vec — never an error.
+/// Fetch all relevant metrics for a resource over the given range, one Monitor
+/// call per metric in parallel.
+///
+/// Per-metric calls are deliberate: Monitor's batch endpoint 400s the *whole*
+/// batch when a single name is invalid for the resource's plan (e.g. `CpuTime`
+/// only exists on Consumption Function Apps, not Premium/Dedicated). With
+/// per-metric calls a bad name only loses that one sparkline, the badge still
+/// works from Errors+Traffic, and the user sees partial data rather than an
+/// all-or-nothing failure.
+///
+/// Returns `Err` only if *every* metric call failed; otherwise returns whatever
+/// subset succeeded plus a per-metric error map describing which ones didn't.
 pub async fn fetch(
     auth: &AzureAuth,
     resource: &Resource,
     range: TimeRange,
-) -> anyhow::Result<Vec<MetricSeries>> {
+) -> anyhow::Result<MetricsResult> {
     let client = ArmClient::new(auth.clone())?;
     let mappings = metric_names(resource.kind);
     let timespan = range.timespan();
     let interval = range.interval().to_string();
-
-    // Group 1: regular (non-error-filtered) metrics.
-    // Group 2: error metric for APIM/ContainerApp where a $filter is required.
-    let needs_error_filter = matches!(resource.kind, ResourceKind::Apim | ResourceKind::ContainerApp);
-
-    let regular: Vec<&(MetricKind, &str, &str)> = mappings
-        .iter()
-        .filter(|(k, _, _)| !(needs_error_filter && *k == MetricKind::Errors))
-        .collect();
-    let error_only: Option<&(MetricKind, &str, &str)> = if needs_error_filter {
-        mappings.iter().find(|(k, _, _)| *k == MetricKind::Errors)
-    } else {
-        None
-    };
-
     let path = format!(
         "{}/providers/Microsoft.Insights/metrics",
         resource.id.trim_end_matches('/')
     );
 
-    // Build the parallel futures. We use tokio::spawn so each request is a real task.
-    let mut handles: Vec<tokio::task::JoinHandle<anyhow::Result<Vec<MetricSeries>>>> = Vec::new();
+    let needs_error_filter =
+        matches!(resource.kind, ResourceKind::Apim | ResourceKind::ContainerApp);
 
-    if !regular.is_empty() {
-        let metricnames = regular
-            .iter()
-            .map(|(_, n, _)| *n)
-            .collect::<Vec<_>>()
-            .join(",");
-        let aggregation = regular
-            .iter()
-            .map(|(_, _, a)| *a)
-            .collect::<Vec<_>>()
-            .join(",");
-        let regular_owned: Vec<(MetricKind, String, String)> = regular
-            .iter()
-            .map(|(k, n, a)| (*k, (*n).to_string(), (*a).to_string()))
-            .collect();
-        let path = path.clone();
-        let timespan = timespan.clone();
-        let interval = interval.clone();
-        let resource_kind = resource.kind;
-        let client = client.clone();
-        handles.push(tokio::spawn(async move {
-            let value = client
-                .get(
-                    &path,
-                    &[
-                        ("api-version", "2023-10-01"),
-                        ("timespan", &timespan),
-                        ("interval", &interval),
-                        ("metricnames", &metricnames),
-                        ("aggregation", &aggregation),
-                    ],
-                )
-                .await?;
-            Ok(parse_metrics_response(&value, &regular_owned, resource_kind))
-        }));
-    }
+    let mut handles: Vec<tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>> =
+        Vec::new();
 
-    if let Some((kind, name, agg)) = error_only {
-        let metricnames = (*name).to_string();
-        let aggregation = (*agg).to_string();
-        let filter = match resource.kind {
-            ResourceKind::Apim => "GatewayResponseCodeCategory eq '5xx'".to_string(),
-            ResourceKind::ContainerApp => "statusCode startswith '5'".to_string(),
-            // Function App handled in `regular` group above.
-            ResourceKind::FunctionApp => unreachable!(),
+    for (kind, name, agg) in mappings {
+        let kind = *kind;
+        let name = (*name).to_string();
+        let agg = (*agg).to_string();
+        let filter = if needs_error_filter && kind == MetricKind::Errors {
+            match resource.kind {
+                ResourceKind::Apim => Some("GatewayResponseCodeCategory eq '5xx'".to_string()),
+                ResourceKind::ContainerApp => Some("statusCode startswith '5'".to_string()),
+                ResourceKind::FunctionApp => None,
+            }
+        } else {
+            None
         };
-        let owned = vec![(*kind, metricnames.clone(), aggregation.clone())];
         let path = path.clone();
         let timespan = timespan.clone();
         let interval = interval.clone();
         let resource_kind = resource.kind;
         let client = client.clone();
+
         handles.push(tokio::spawn(async move {
-            let value = client
-                .get(
-                    &path,
-                    &[
-                        ("api-version", "2023-10-01"),
-                        ("timespan", &timespan),
-                        ("interval", &interval),
-                        ("metricnames", &metricnames),
-                        ("aggregation", &aggregation),
-                        ("$filter", &filter),
-                    ],
-                )
-                .await?;
-            Ok(parse_metrics_response(&value, &owned, resource_kind))
+            let mut params: Vec<(&str, &str)> = vec![
+                ("api-version", "2023-10-01"),
+                ("timespan", &timespan),
+                ("interval", &interval),
+                ("metricnames", &name),
+                ("aggregation", &agg),
+            ];
+            if let Some(f) = filter.as_deref() {
+                params.push(("$filter", f));
+            }
+            let res = match client.get(&path, &params).await {
+                Ok(value) => {
+                    let triple = vec![(kind, name, agg)];
+                    let mut series = parse_metrics_response(&value, &triple, resource_kind);
+                    Ok(series.pop())
+                }
+                Err(e) => Err(format!("{e:#}")),
+            };
+            (kind, res)
         }));
     }
 
-    let mut out: Vec<MetricSeries> = Vec::new();
+    let mut series: Vec<MetricSeries> = Vec::new();
+    let mut missing: HashMap<MetricKind, String> = HashMap::new();
+    let mut any_ok = false;
+    let mut errors: Vec<String> = Vec::new();
     for h in handles {
         match h.await {
-            Ok(Ok(mut v)) => out.append(&mut v),
-            Ok(Err(e)) => return Err(e),
-            Err(join_err) => return Err(anyhow!("metrics task join error: {join_err}")),
+            Ok((_, Ok(Some(s)))) => {
+                any_ok = true;
+                series.push(s);
+            }
+            Ok((_, Ok(None))) => {
+                // Metric call returned but had no parseable series. Treat as a
+                // soft success so we don't trigger the all-failed Err path.
+                any_ok = true;
+            }
+            Ok((kind, Err(e))) => {
+                tracing::debug!("metric {kind:?} fetch failed for {}: {e}", resource.id);
+                missing.insert(kind, e.clone());
+                errors.push(e);
+            }
+            Err(join_err) => errors.push(format!("task join: {join_err}")),
         }
     }
-    Ok(out)
+
+    if !any_ok && !errors.is_empty() {
+        return Err(anyhow!("{}", errors.join("; ")));
+    }
+    Ok(MetricsResult { series, missing })
 }
 
 /// Parse a single Monitor metrics response. `requested` carries the

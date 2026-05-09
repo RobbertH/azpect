@@ -5,5 +5,6 @@ pub mod client;
 pub mod health;
 pub mod logs;
 pub mod metrics;
+pub mod resource_health;
 pub mod resources;
 pub mod subscriptions;
