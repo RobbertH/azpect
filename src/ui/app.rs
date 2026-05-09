@@ -295,13 +295,19 @@ async fn event_loop(
                 state.metrics.pending.remove(&resource_id);
                 state.metrics.loading = false;
                 match result {
-                    Ok(series) => {
+                    Ok(r) => {
                         state.metrics.failures.remove(&resource_id);
-                        state.metrics.by_resource.insert(resource_id, series);
+                        if r.missing.is_empty() {
+                            state.metrics.missing.remove(&resource_id);
+                        } else {
+                            state.metrics.missing.insert(resource_id.clone(), r.missing);
+                        }
+                        state.metrics.by_resource.insert(resource_id, r.series);
                         state.metrics.last_error = None;
                     }
                     Err(e) => {
                         state.metrics.by_resource.remove(&resource_id);
+                        state.metrics.missing.remove(&resource_id);
                         state.metrics.failures.insert(resource_id, e.clone());
                         state.metrics.last_error = Some(e);
                     }
@@ -552,6 +558,7 @@ fn kick_off_loads_for_view(
                     // list arrives; in-flight fetches keep their pending entries.
                     state.metrics.by_resource.clear();
                     state.metrics.failures.clear();
+                    state.metrics.missing.clear();
                 }
                 state.loading_resources = true;
                 spawn_load_resources(auth.clone(), sub_ids, tx.clone());

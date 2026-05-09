@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::azure::logs::{LogLevel, LogLine};
@@ -94,17 +94,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if let Some(err) = state.logs.last_error.as_deref() {
         if lines.map(|l| l.is_empty()).unwrap_or(true) {
-            // Heuristic: a "no destination" hint, otherwise the raw error.
-            let msg = if err.to_lowercase().contains("nologdestination")
-                || err.to_lowercase().contains("no log destination")
-                || err.to_lowercase().contains("diagnostic settings")
-            {
-                "No diagnostic settings configured for this resource. \
-                 Forward logs to a Log Analytics workspace to see them here."
-            } else {
-                err
-            };
-            center_message(frame, inner, msg, theme.degraded);
+            let msg = friendly_log_error(err);
+            render_error_message(frame, inner, &msg, theme.degraded);
             render_footer(frame, chunks[2], theme);
             return;
         }
@@ -231,6 +222,75 @@ fn center_message(frame: &mut Frame, area: Rect, msg: &str, color: Color) {
     let p = Paragraph::new(Line::from(Span::styled(msg, Style::default().fg(color))))
         .alignment(ratatui::layout::Alignment::Center);
     frame.render_widget(p, target);
+}
+
+/// Render a (possibly long) error string vertically centered in `area`, with
+/// word wrapping so the user can read past the right margin.
+fn render_error_message(frame: &mut Frame, area: Rect, msg: &str, color: Color) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // Estimate wrapped line count from char width. Over-counts on ASCII-heavy
+    // text (which is fine — we just take a slightly taller block). Leaves a
+    // ~25% horizontal margin so the text doesn't run flush to the borders.
+    let usable_width = area.width.saturating_sub(area.width / 8).max(20) as usize;
+    let est_lines = msg.chars().count().div_ceil(usable_width).max(1);
+    let block_h = (est_lines as u16).min(area.height);
+    let top_pad = (area.height.saturating_sub(block_h)) / 2;
+    let target = Rect {
+        x: area.x,
+        y: area.y + top_pad,
+        width: area.width,
+        height: block_h,
+    };
+    let p = Paragraph::new(msg.to_string())
+        .style(Style::default().fg(color))
+        .alignment(ratatui::layout::Alignment::Center)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(p, target);
+}
+
+/// Turn a raw Azure / Log Analytics error string into something readable.
+///
+/// The transport prefixes errors like `azure api error 400: { ...JSON... }`.
+/// We try to pull `error.message` (and `error.code`) out of the embedded JSON.
+/// Also folds the well-known "no diagnostic settings" variants into a single
+/// actionable hint instead of dumping the raw upstream text.
+fn friendly_log_error(raw: &str) -> String {
+    let body = raw.trim();
+    let lowered = body.to_lowercase();
+
+    // Detect the no-destination signal — Log Analytics sends back several
+    // variants (`NoLogDestination`, `PathNotFoundError`, KQL workspace
+    // resolution failures). They all mean the same thing to the user.
+    let no_destination = lowered.contains("nologdestination")
+        || lowered.contains("no log destination")
+        || lowered.contains("pathnotfounderror")
+        || lowered.contains("workspace not found")
+        || lowered.contains("diagnostic settings");
+
+    if no_destination {
+        return "No diagnostic settings configured for this resource. \
+                Forward logs to a Log Analytics workspace to see them here."
+            .to_string();
+    }
+
+    // Try to extract `error.message` / `error.code` from any embedded JSON.
+    if let Some(start) = body.find('{') {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body[start..]) {
+            let err = v.get("error");
+            let message = err.and_then(|e| e.get("message")).and_then(|m| m.as_str());
+            let code = err.and_then(|e| e.get("code")).and_then(|c| c.as_str());
+            if let Some(message) = message {
+                return match code {
+                    Some(c) => format!("{message} ({c})"),
+                    None => message.to_string(),
+                };
+            }
+        }
+    }
+
+    body.to_string()
 }
 
 fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
@@ -379,6 +439,36 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.to_lowercase().contains("diagnostic"));
+    }
+
+    #[test]
+    fn friendly_log_error_extracts_message_and_code() {
+        let raw = r#"azure api error 400: {"error":{"message":"The request had some invalid properties","code":"BadArgumentError","correlationId":"abc"}}"#;
+        let out = friendly_log_error(raw);
+        assert!(out.contains("The request had some invalid properties"));
+        assert!(out.contains("BadArgumentError"));
+        assert!(!out.contains("correlationId"));
+    }
+
+    #[test]
+    fn friendly_log_error_collapses_no_destination_variants() {
+        for variant in [
+            "NoLogDestination",
+            "azure api error 404: {\"error\":{\"code\":\"PathNotFoundError\"}}",
+            "diagnostic settings missing",
+        ] {
+            let out = friendly_log_error(variant);
+            assert!(
+                out.to_lowercase().contains("diagnostic"),
+                "expected destination hint for {variant:?}, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn friendly_log_error_passes_through_plain_text() {
+        let out = friendly_log_error("connection reset by peer");
+        assert_eq!(out, "connection reset by peer");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use tui_input::Input;
 
 use crate::azure::logs::LogLine;
-use crate::azure::metrics::{MetricSeries, TimeRange};
+use crate::azure::metrics::{MetricKind, MetricSeries, TimeRange};
 use crate::azure::resources::Resource;
 use crate::azure::subscriptions::Subscription;
 use crate::config::Config;
@@ -28,6 +28,11 @@ pub enum View {
 #[derive(Clone, Default)]
 pub struct MetricsCache {
     pub by_resource: HashMap<String, Vec<MetricSeries>>,
+    /// Per-resource, per-metric error messages: which individual metrics didn't
+    /// load even when the overall fetch succeeded (e.g. `CpuTime` doesn't exist
+    /// on Premium / App Service-plan Function Apps). The detail view uses these
+    /// to explain blank sparklines instead of just rendering `—`.
+    pub missing: HashMap<String, HashMap<MetricKind, String>>,
     /// Per-resource failure messages. Mutually exclusive with `by_resource`:
     /// a successful fetch removes the resource from `failures`, and vice versa.
     pub failures: HashMap<String, String>,

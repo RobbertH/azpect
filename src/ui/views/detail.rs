@@ -139,12 +139,23 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ])
     .split(body[1]);
 
+    let missing_for_resource = state.metrics.missing.get(&resource.id);
     for (i, (kind, label)) in ROW_KINDS.iter().enumerate() {
         let area = metric_rows[i];
         if area.height == 0 {
             continue;
         }
-        render_metric_row(frame, area, *kind, label, metrics_opt, state, theme);
+        let missing_reason = missing_for_resource.and_then(|m| m.get(kind));
+        render_metric_row(
+            frame,
+            area,
+            *kind,
+            label,
+            metrics_opt,
+            missing_reason,
+            state,
+            theme,
+        );
     }
 
     if metric_rows[4].height > 0 {
@@ -263,6 +274,7 @@ fn render_metric_row(
     kind: MetricKind,
     label: &str,
     metrics: Option<&Vec<MetricSeries>>,
+    missing_reason: Option<&String>,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -274,6 +286,7 @@ fn render_metric_row(
     let summary = match series {
         Some(s) => summary_for(kind, s),
         None if state.metrics.loading => "loading…".to_string(),
+        None if missing_reason.is_some() => "n/a".to_string(),
         None => "—".to_string(),
     };
 
@@ -298,11 +311,40 @@ fn render_metric_row(
             frame.render_widget(sparkline, parts[1]);
         }
         _ => {
+            let placeholder = match missing_reason {
+                Some(reason) => format!("not available · {}", short_missing_reason(reason)),
+                None => "—".to_string(),
+            };
             let p = Paragraph::new(Line::from(Span::styled(
-                "—",
+                placeholder,
                 Style::default().fg(theme.muted),
-            )));
+            )))
+            .wrap(Wrap { trim: false });
             frame.render_widget(p, parts[1]);
+        }
+    }
+}
+
+/// Translate the raw Azure error into a one-line, plain-language hint. Falls
+/// back to the first chunk of the error if we don't recognise the pattern.
+fn short_missing_reason(reason: &str) -> String {
+    if reason.contains("Failed to find metric configuration") {
+        // The most common case: the metric name doesn't exist for this
+        // resource's plan tier (e.g. CpuTime on a non-Consumption Function App).
+        "metric not exposed for this plan/tier".to_string()
+    } else if reason.contains("403") || reason.contains("Forbidden") {
+        "permission denied (need Monitoring Reader)".to_string()
+    } else if reason.contains("404") {
+        "resource not found".to_string()
+    } else if reason.contains("BadRequest") || reason.contains("400") {
+        "request rejected by Azure".to_string()
+    } else {
+        // Generic fallback: trim to a single line, cap length.
+        let one_line: String = reason.chars().take(80).collect();
+        if reason.chars().count() > 80 {
+            format!("{one_line}…")
+        } else {
+            one_line
         }
     }
 }
@@ -486,6 +528,34 @@ mod tests {
     #[test]
     fn time_axis_returns_empty_below_threshold() {
         assert_eq!(build_time_axis(TimeRange::Day, 4), "");
+    }
+
+    #[test]
+    fn missing_reason_recognises_metric_not_exposed() {
+        let raw = "azure api error 400: {\"code\":\"BadRequest\",\"message\":\
+            \"Failed to find metric configuration for provider: \
+            Microsoft.Web, resource Type: sites, metric: CpuTime, ...\"}";
+        assert_eq!(
+            short_missing_reason(raw),
+            "metric not exposed for this plan/tier"
+        );
+    }
+
+    #[test]
+    fn missing_reason_recognises_permission_denied() {
+        let raw = "azure api error 403: Forbidden";
+        assert_eq!(
+            short_missing_reason(raw),
+            "permission denied (need Monitoring Reader)"
+        );
+    }
+
+    #[test]
+    fn missing_reason_truncates_unknown_errors() {
+        let long = "x".repeat(200);
+        let out = short_missing_reason(&long);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 81);
     }
 
     fn r() -> Resource {
