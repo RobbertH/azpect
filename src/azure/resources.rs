@@ -17,12 +17,12 @@ pub enum ResourceKind {
 }
 
 impl ResourceKind {
-    /// Three-letter tag for the list view: `Func`, `APIM`, `CtrA`.
+    /// Four-letter tag for the list view: `Func`, `APIM`, `Cont`.
     pub fn short_tag(&self) -> &'static str {
         match self {
-            ResourceKind::FunctionApp => "Func",
             ResourceKind::Apim => "APIM",
-            ResourceKind::ContainerApp => "CtrA",
+            ResourceKind::FunctionApp => "Func",
+            ResourceKind::ContainerApp => "Cont",
         }
     }
 }

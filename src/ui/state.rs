@@ -28,6 +28,9 @@ pub enum View {
 #[derive(Clone, Default)]
 pub struct MetricsCache {
     pub by_resource: HashMap<String, Vec<MetricSeries>>,
+    /// Per-resource failure messages. Mutually exclusive with `by_resource`:
+    /// a successful fetch removes the resource from `failures`, and vice versa.
+    pub failures: HashMap<String, String>,
     /// Resource IDs whose metrics fetch is currently in flight.
     pub pending: HashSet<String>,
     pub range: TimeRange,
@@ -75,6 +78,13 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub should_quit: bool,
 
+    /// Modal flag: when true, a "Are you sure you want to quit?" overlay is
+    /// rendered on top of the current view and the event loop short-circuits
+    /// keyboard input to y/n handling. Set via `Action::Back` on an empty view
+    /// stack; cleared by answering 'n' (or any cancel key). Note this is *not*
+    /// a `View` variant — the underlying view keeps rendering behind it.
+    pub quit_confirm: bool,
+
     /// Whether the vim/k9s-style command palette (`:`) is currently capturing
     /// input. While true, raw keystrokes are forwarded into `command_input`
     /// rather than dispatched as actions; Esc cancels, Enter executes.
@@ -102,6 +112,7 @@ impl AppState {
             logs: LogsCache { range, ..Default::default() },
             status_message: None,
             should_quit: false,
+            quit_confirm: false,
             command_active: false,
             command_input: Input::default(),
             config,

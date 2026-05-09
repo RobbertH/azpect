@@ -7,7 +7,7 @@
 #![allow(dead_code, unused_variables)]
 
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::azure::auth::AzureAuth;
@@ -31,10 +31,18 @@ pub enum TimeRange {
 
 impl TimeRange {
     /// ISO-8601 timespan for the Monitor `timespan` query parameter.
+    ///
+    /// Uses `Z` as the UTC marker (not `+00:00`): Azure decodes query strings
+    /// as `application/x-www-form-urlencoded`, which turns an unencoded `+`
+    /// into a space and breaks timestamp parsing on the server.
     pub fn timespan(&self) -> String {
         let end = Utc::now();
         let start = end - self.duration();
-        format!("{}/{}", start.to_rfc3339(), end.to_rfc3339())
+        format!(
+            "{}/{}",
+            start.to_rfc3339_opts(SecondsFormat::Secs, true),
+            end.to_rfc3339_opts(SecondsFormat::Secs, true),
+        )
     }
 
     pub fn duration(&self) -> chrono::Duration {
@@ -341,6 +349,17 @@ fn parse_metrics_response(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn timespan_uses_z_suffix_not_plus_offset() {
+        // `+` in a query string decodes to space under
+        // application/x-www-form-urlencoded, which is how Azure parses these.
+        // We must serialize UTC as `Z` to round-trip correctly.
+        let span = TimeRange::Day.timespan();
+        assert!(!span.contains('+'), "timespan should not contain '+': {span}");
+        assert_eq!(span.matches('Z').count(), 2, "expected two Z markers: {span}");
+        assert!(span.contains('/'), "missing start/end separator: {span}");
+    }
 
     #[test]
     fn parses_function_app_metrics_response() {

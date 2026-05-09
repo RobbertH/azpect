@@ -196,6 +196,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 }
 
 fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
+    if state.metrics.failures.contains_key(&r.id) {
+        return (theme.critical, "ERROR".to_string());
+    }
     match state.metrics.by_resource.get(&r.id) {
         Some(metrics) => {
             let status = derive(metrics, r.state.as_deref());

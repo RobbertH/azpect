@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Sparkline};
+use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Wrap};
 use ratatui::Frame;
 
 use crate::azure::health::{derive, find, HealthStatus};
@@ -65,17 +65,44 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     };
 
-    // Body layout: two sub-rows — context line, then sparkline grid.
-    let body = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
-
     let metrics_opt = state.metrics.by_resource.get(&resource.id);
-    let (badge_color, badge_label) = match metrics_opt {
-        Some(m) => {
-            let h = derive(m, resource.state.as_deref());
-            (color_for_health(h, theme), h.label())
+    let failure = state.metrics.failures.get(&resource.id);
+    let (badge_color, badge_label) = if failure.is_some() {
+        (theme.critical, "ERROR")
+    } else {
+        match metrics_opt {
+            Some(m) => {
+                let h = derive(m, resource.state.as_deref());
+                (color_for_health(h, theme), h.label())
+            }
+            None => (theme.muted, "LOADING"),
         }
-        None => (theme.muted, "LOADING"),
     };
+
+    let second_line_text = match failure {
+        Some(msg) => format!("metrics error: {msg}"),
+        None => resource
+            .state
+            .as_deref()
+            .map(|s| format!("state: {s}"))
+            .unwrap_or_else(|| "state: unknown".to_string()),
+    };
+    let second_line_color = if failure.is_some() { theme.critical } else { theme.muted };
+
+    // Reserve enough rows for the header line + however many rows the second
+    // line needs after wrapping at the available width. Without this, long
+    // error messages get clipped and the user can't read the diagnostic.
+    let context_height = 1 + wrapped_line_count(&second_line_text, inner.width).max(1);
+    let body = Layout::vertical([
+        Constraint::Length(context_height as u16),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    let second_line = Line::from(Span::styled(
+        second_line_text,
+        Style::default().fg(second_line_color),
+    ));
 
     let context = Paragraph::new(vec![
         Line::from(vec![
@@ -96,15 +123,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.muted),
             ),
         ]),
-        Line::from(Span::styled(
-            resource
-                .state
-                .as_deref()
-                .map(|s| format!("state: {s}"))
-                .unwrap_or_else(|| "state: unknown".to_string()),
-            Style::default().fg(theme.muted),
-        )),
-    ]);
+        second_line,
+    ])
+    .wrap(Wrap { trim: false });
     frame.render_widget(context, body[0]);
 
     // Sparkline grid: 4 rows, each with a 2-line slot (label/total + bars).
@@ -125,6 +146,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     render_footer(frame, chunks[2], theme);
+}
+
+/// Approximate how many terminal rows `text` will occupy after Paragraph
+/// wrapping at the given width. Counts by char (close enough for ASCII error
+/// messages; double-width glyphs would slightly over-reserve, which is fine).
+fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let w = width.max(1) as usize;
+    let chars = text.chars().count().max(1);
+    chars.div_ceil(w)
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {

@@ -165,6 +165,26 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
                     continue;
                 }
+                // Quit-confirmation modal takes the highest priority. While
+                // it's up, every key is either yes/no for the dialog or
+                // swallowed — nothing else (command palette, filter,
+                // dispatcher) runs.
+                if state.quit_confirm {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            state.should_quit = true;
+                            break;
+                        }
+                        KeyCode::Char('n')
+                        | KeyCode::Char('N')
+                        | KeyCode::Esc
+                        | KeyCode::Char('q') => {
+                            state.quit_confirm = false;
+                            continue;
+                        }
+                        _ => continue,
+                    }
+                }
                 // Command palette has top priority. While active, all keys
                 // except Esc (cancel) and Enter (execute) flow into the
                 // command input buffer.
@@ -243,14 +263,13 @@ async fn event_loop(
                 state.metrics.loading = false;
                 match result {
                     Ok(series) => {
+                        state.metrics.failures.remove(&resource_id);
                         state.metrics.by_resource.insert(resource_id, series);
                         state.metrics.last_error = None;
                     }
                     Err(e) => {
-                        // Insert empty series so the row renders UNKNOWN rather
-                        // than spinning LOADING forever; keep the diagnostic
-                        // around in `last_error` for the status bar.
-                        state.metrics.by_resource.insert(resource_id, Vec::new());
+                        state.metrics.by_resource.remove(&resource_id);
+                        state.metrics.failures.insert(resource_id, e.clone());
                         state.metrics.last_error = Some(e);
                     }
                 }
@@ -295,6 +314,9 @@ fn should_forward_to_command(state: &AppState, key: crossterm::event::KeyEvent) 
 fn run_command(state: &mut AppState, cmd: &str) {
     let trimmed = cmd.trim();
     match trimmed {
+        // `:q` and friends quit immediately and intentionally bypass the
+        // quit-confirmation modal: typing `:q` is explicit user intent, not
+        // an accidental Esc press.
         "q" | "quit" | "qa" | "qa!" | "quitall" => state.should_quit = true,
         "" => {} // empty: silently ignore
         other => {
@@ -397,7 +419,12 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
         Action::Back => {
             match state.view_stack.pop() {
                 Some(prev) => state.view = prev,
-                None => state.should_quit = true,
+                // Empty stack: open the quit-confirmation modal instead of
+                // hard-quitting. The event loop's top-priority handler
+                // routes y/n until the user resolves it. `:q` and friends in
+                // `run_command` bypass this and quit immediately — that's
+                // explicit intent.
+                None => state.quit_confirm = true,
             }
             true
         }
@@ -467,6 +494,7 @@ fn kick_off_loads_for_view(
                     // Drop cached badges so they refresh once the new resource
                     // list arrives; in-flight fetches keep their pending entries.
                     state.metrics.by_resource.clear();
+                    state.metrics.failures.clear();
                 }
                 state.loading_resources = true;
                 spawn_load_resources(auth.clone(), sub_ids, tx.clone());
@@ -475,7 +503,11 @@ fn kick_off_loads_for_view(
         View::Detail => {
             if let Some(resource) = state.selected_resource().cloned() {
                 if force || !state.metrics.loading {
+                    if force {
+                        state.metrics.failures.remove(&resource.id);
+                    }
                     state.metrics.loading = true;
+                    state.metrics.pending.insert(resource.id.clone());
                     spawn_load_metrics(
                         auth.clone(),
                         resource,
@@ -537,8 +569,82 @@ fn dispatch_view(
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
+    // Quit-confirmation modal overlays the underlying view AND must beat the
+    // command bar to the screen — render it before the command bar. (In
+    // practice both flags can't be true at once given input gating.)
+    if state.quit_confirm {
+        render_quit_modal(f, area, theme);
+    }
+
     if let Some(ca) = command_area {
         render_command_bar(f, ca, state, theme);
+    }
+}
+
+/// Render a small centered "Are you sure you want to quit?" modal over `area`.
+/// Caller is responsible for only invoking this when `state.quit_confirm`.
+fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, theme: &Theme) {
+    use ratatui::layout::Alignment;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let popup = centered_fixed_rect(46, 5, area);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            " quit? ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Layout (5 rows total, borders eat 2 -> inner height 3):
+    //   blank
+    //   "Are you sure you want to quit?"
+    //   blank
+    //   "y / Enter — yes        n / Esc — no"
+    // Paragraph clips the leading blank when inner.height < 4, which is the
+    // normal case at the spec'd size and looks fine.
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Are you sure you want to quit?",
+            Style::default().fg(theme.fg),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "y / Enter \u{2014} yes        n / Esc \u{2014} no",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    f.render_widget(paragraph, inner);
+}
+
+/// Centered rect of a fixed cell size (vs. percentage-based). Clamps to
+/// `area` if the requested size doesn't fit.
+fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
     }
 }
 
@@ -888,8 +994,54 @@ mod tests {
         assert!(state.view_stack.is_empty());
         assert!(!state.should_quit);
 
-        // Back from Subscriptions with empty stack: quits cleanly.
+        // Back from Subscriptions with empty stack: opens the quit-confirm
+        // modal instead of hard-quitting. The user must answer y/Enter (or
+        // type `:q`) for `should_quit` to flip.
         assert!(apply_navigation_action(Action::Back, &mut state));
-        assert!(state.should_quit);
+        assert!(state.quit_confirm);
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn back_with_empty_stack_opens_quit_modal() {
+        let mut state = fresh_state();
+        assert!(state.view_stack.is_empty());
+        assert!(!state.quit_confirm);
+        assert!(!state.should_quit);
+
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert!(state.quit_confirm, "Back on empty stack opens the modal");
+        assert!(
+            !state.should_quit,
+            "Back on empty stack does NOT quit directly — modal first"
+        );
+    }
+
+    #[test]
+    fn back_with_nonempty_stack_does_not_open_modal() {
+        let mut state = fresh_state();
+        // Start in List with Subscriptions on the stack (typical after Open).
+        state.view = View::List;
+        state.view_stack.push(View::Subscriptions);
+
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert_eq!(state.view, View::Subscriptions, "Back popped the stack");
+        assert!(state.view_stack.is_empty());
+        assert!(
+            !state.quit_confirm,
+            "popping a non-empty stack must not open the quit modal"
+        );
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn command_q_bypasses_modal() {
+        let mut state = fresh_state();
+        run_command(&mut state, "q");
+        assert!(state.should_quit, ":q quits immediately");
+        assert!(
+            !state.quit_confirm,
+            ":q is explicit intent and must not open the modal"
+        );
     }
 }
