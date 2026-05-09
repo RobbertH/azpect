@@ -18,7 +18,7 @@ use crate::ui::state::View;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k scroll  e errors-only  d 1d  w 7d  Esc back  q quit";
+const FOOTER_HINT: &str = "j/k scroll  y yank  e errors-only  d 1d  w 7d  Esc back  q quit";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -253,16 +253,15 @@ fn render_error_message(frame: &mut Frame, area: Rect, msg: &str, color: Color) 
 /// Turn a raw Azure / Log Analytics error string into something readable.
 ///
 /// The transport prefixes errors like `azure api error 400: { ...JSON... }`.
-/// We try to pull `error.message` (and `error.code`) out of the embedded JSON.
-/// Also folds the well-known "no diagnostic settings" variants into a single
-/// actionable hint instead of dumping the raw upstream text.
-fn friendly_log_error(raw: &str) -> String {
+/// Log Analytics nests its real diagnostic inside an `innererror` chain whose
+/// deepest entry names the actual problem (missing column, malformed timespan,
+/// etc.) — so we walk the chain and surface the deepest message rather than
+/// the generic outer one. Also folds the well-known "no diagnostic settings"
+/// variants into a single actionable hint.
+pub fn friendly_log_error(raw: &str) -> String {
     let body = raw.trim();
     let lowered = body.to_lowercase();
 
-    // Detect the no-destination signal — Log Analytics sends back several
-    // variants (`NoLogDestination`, `PathNotFoundError`, KQL workspace
-    // resolution failures). They all mean the same thing to the user.
     let no_destination = lowered.contains("nologdestination")
         || lowered.contains("no log destination")
         || lowered.contains("pathnotfounderror")
@@ -275,22 +274,40 @@ fn friendly_log_error(raw: &str) -> String {
             .to_string();
     }
 
-    // Try to extract `error.message` / `error.code` from any embedded JSON.
     if let Some(start) = body.find('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body[start..]) {
-            let err = v.get("error");
-            let message = err.and_then(|e| e.get("message")).and_then(|m| m.as_str());
-            let code = err.and_then(|e| e.get("code")).and_then(|c| c.as_str());
-            if let Some(message) = message {
-                return match code {
-                    Some(c) => format!("{message} ({c})"),
-                    None => message.to_string(),
-                };
+            if let Some(err) = v.get("error") {
+                let (message, code) = deepest_error(err);
+                if let Some(message) = message {
+                    return match code {
+                        Some(c) => format!("{message} ({c})"),
+                        None => message,
+                    };
+                }
             }
         }
     }
 
     body.to_string()
+}
+
+/// Walk the `innererror` chain and return the deepest available
+/// `(message, code)`. Falls back to the outer level if no inner entry has
+/// a message.
+fn deepest_error(err: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let mut current = err;
+    let mut best_message = current.get("message").and_then(|m| m.as_str()).map(str::to_owned);
+    let mut best_code = current.get("code").and_then(|c| c.as_str()).map(str::to_owned);
+    while let Some(inner) = current.get("innererror").or_else(|| current.get("innerError")) {
+        if let Some(msg) = inner.get("message").and_then(|m| m.as_str()) {
+            best_message = Some(msg.to_string());
+        }
+        if let Some(code) = inner.get("code").and_then(|c| c.as_str()) {
+            best_code = Some(code.to_string());
+        }
+        current = inner;
+    }
+    (best_message, best_code)
 }
 
 fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
@@ -448,6 +465,19 @@ mod tests {
         assert!(out.contains("The request had some invalid properties"));
         assert!(out.contains("BadArgumentError"));
         assert!(!out.contains("correlationId"));
+    }
+
+    #[test]
+    fn friendly_log_error_walks_innererror_chain_for_real_diagnostic() {
+        // Real Log Analytics shape: outer "BadArgumentError" is generic; the
+        // useful detail lives in the deepest innererror.message.
+        let raw = r#"azure api error 400: {"error":{"message":"The request had some invalid properties","code":"BadArgumentError","innererror":{"code":"SyntaxError","message":"A recognition error occurred","innererror":{"code":"SEM0100","message":"'where' operator: Failed to resolve column or table 'Success'"}}}}"#;
+        let out = friendly_log_error(raw);
+        assert!(
+            out.contains("Failed to resolve column or table 'Success'"),
+            "expected deepest message, got {out:?}",
+        );
+        assert!(out.contains("SEM0100"), "expected deepest code, got {out:?}");
     }
 
     #[test]

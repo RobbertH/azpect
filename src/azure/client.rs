@@ -30,7 +30,7 @@ pub const LOGS_BASE: &str = "https://api.loganalytics.io";
 const BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000];
 
 /// Maximum number of bytes from an error response body included in the error message.
-const ERROR_BODY_EXCERPT: usize = 500;
+const ERROR_BODY_EXCERPT: usize = 4096;
 
 #[derive(Clone)]
 pub struct ArmClient {

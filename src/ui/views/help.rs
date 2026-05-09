@@ -48,6 +48,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Global",
         &[
             ("r", "refresh"),
+            ("y", "yank to clipboard"),
             ("?", "toggle help"),
             ("q", "quit"),
         ],

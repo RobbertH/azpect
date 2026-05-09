@@ -464,7 +464,66 @@ fn global_handle(
         state.command_input.reset();
         return;
     }
+    if let Action::Yank = action {
+        do_yank(state);
+    }
     // Otherwise: unhandled — view ignored it, nothing to do.
+}
+
+/// Compute the contextual yank target for the current view, copy it to the
+/// system clipboard via OSC52, and post a status hint. No-op (with a status
+/// hint) if there's nothing meaningful to copy.
+fn do_yank(state: &mut AppState) {
+    let target = yank_target(state);
+    let Some(text) = target else {
+        state.status_message = Some("nothing to copy".to_string());
+        return;
+    };
+    match crate::ui::clipboard::copy(&text) {
+        Ok(n) => {
+            state.status_message = Some(format!("copied {n} bytes to clipboard"));
+        }
+        Err(e) => {
+            state.status_message = Some(format!("clipboard write failed: {e}"));
+        }
+    }
+}
+
+/// Resolve what `y` should copy from the currently-visible view. The logs
+/// view prefers the displayed error (when the table is empty / the error
+/// banner is showing) and otherwise the highlighted log line.
+fn yank_target(state: &AppState) -> Option<String> {
+    match state.view {
+        View::Logs => yank_from_logs(state),
+        View::List | View::Detail => state.selected_resource().map(|r| r.id.clone()),
+        View::Subscriptions => state
+            .subscriptions
+            .get(state.subscription_cursor)
+            .map(|s| s.id.clone()),
+        View::Help => None,
+    }
+}
+
+fn yank_from_logs(state: &AppState) -> Option<String> {
+    let resource = state.selected_resource()?;
+    let lines = state.logs.by_resource.get(&resource.id);
+    let empty = lines.map(|l| l.is_empty()).unwrap_or(true);
+    // Error banner is showing iff there's an error AND no rows to display.
+    if empty {
+        if let Some(err) = state.logs.last_error.as_deref() {
+            return Some(crate::ui::views::logs::friendly_log_error(err));
+        }
+    }
+    let lines = lines?;
+    let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
+    let line = lines.get(cursor)?;
+    Some(format!(
+        "{}  {:?}  {}  {}",
+        line.ts.format("%Y-%m-%dT%H:%M:%SZ"),
+        line.level,
+        line.source,
+        line.message
+    ))
 }
 
 /// Pure navigation/quit subset of `global_handle`. Touches only `state`, so it
@@ -1242,5 +1301,65 @@ mod tests {
         );
         let (_, label) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
         assert_eq!(label.trim(), "HEALTHY");
+    }
+
+    #[test]
+    fn yank_in_logs_prefers_error_when_table_empty() {
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/one".into(),
+            name: "alpha-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        state.logs.last_error = Some(
+            r#"azure api error 400: {"error":{"message":"outer","code":"BadArgumentError","innererror":{"code":"SEM0100","message":"column X not found"}}}"#
+                .into(),
+        );
+
+        let yanked = yank_target(&state).expect("error banner should yield text");
+        assert!(yanked.contains("column X not found"));
+    }
+
+    #[test]
+    fn yank_in_logs_returns_selected_line_when_rows_present() {
+        use crate::azure::logs::{LogLevel, LogLine};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{TimeZone, Utc};
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/one".into(),
+            name: "alpha-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        let ts = Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).single().unwrap();
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![LogLine {
+                ts,
+                level: LogLevel::Error,
+                source: "AppExceptions".into(),
+                message: "kaboom".into(),
+            }],
+        );
+
+        let yanked = yank_target(&state).expect("selected line should yield text");
+        assert!(yanked.contains("AppExceptions"));
+        assert!(yanked.contains("kaboom"));
+        assert!(yanked.contains("2026-05-10T12:00:00Z"));
     }
 }

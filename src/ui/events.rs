@@ -83,6 +83,9 @@ pub enum Action {
     Help,
     /// Open the vim/k9s-style command palette (`:`).
     StartCommand,
+    /// Vim-style yank: copy something contextual (selected log line, displayed
+    /// error, selected resource id, …) to the system clipboard via OSC52.
+    Yank,
     /// Sentinel emitted on the *first* `g` of a `g g` chord. The event loop
     /// stashes pending state and waits for the second key. Also returned for
     /// any key the input handler doesn't recognise.
@@ -169,6 +172,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('w') => Action::SetWindowWeek,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char(':') => Action::StartCommand,
+        KeyCode::Char('y') => Action::Yank,
         KeyCode::Char('q') => Action::Back,
 
         _ => Action::Noop,
