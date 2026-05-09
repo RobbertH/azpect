@@ -144,7 +144,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let _ = action;
-    let target = state.previous_view.take().unwrap_or(View::List);
+    let target = state.view_stack.pop().unwrap_or(View::List);
     state.view = target;
     true
 }
@@ -173,34 +173,34 @@ mod tests {
     fn handle_dismisses_to_previous_view() {
         let mut state = AppState::new(Config::default());
         state.view = View::Help;
-        state.previous_view = Some(View::Detail);
+        state.view_stack.push(View::Detail);
         assert!(handle(Action::Back, &mut state));
         assert_eq!(state.view, View::Detail);
-        assert_eq!(state.previous_view, None);
+        assert!(state.view_stack.is_empty());
     }
 
     #[test]
     fn handle_falls_back_to_list() {
         let mut state = AppState::new(Config::default());
         state.view = View::Help;
-        state.previous_view = None;
+        assert!(state.view_stack.is_empty());
         assert!(handle(Action::Help, &mut state));
         assert_eq!(state.view, View::List);
-        assert_eq!(state.previous_view, None);
+        assert!(state.view_stack.is_empty());
     }
 
     #[test]
     fn handle_does_not_bounce_back_into_help() {
         // Simulates: start in List -> ? to Help -> key to dismiss.
-        // After dismiss, previous_view must be None so a subsequent Esc/q
-        // from List does not warp the user back into Help.
+        // After dismiss, the stack must not contain Help so a subsequent
+        // Esc/q from List does not warp the user back into Help.
         let mut state = AppState::new(Config::default());
         state.view = View::Help;
-        state.previous_view = Some(View::List);
+        state.view_stack.push(View::List);
         assert!(handle(Action::Back, &mut state));
         assert_eq!(state.view, View::List);
-        assert_ne!(state.previous_view, Some(View::Help));
-        assert_eq!(state.previous_view, None);
+        assert!(!state.view_stack.contains(&View::Help));
+        assert!(state.view_stack.is_empty());
     }
 
     #[test]

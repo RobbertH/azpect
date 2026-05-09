@@ -154,7 +154,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(sub) = state.subscriptions.get(state.subscription_cursor) {
                 state.selected_subscription = Some(sub.id.clone());
                 state.config.last_subscription_id = Some(sub.id.clone());
-                state.previous_view = Some(state.view);
+                state.view_stack.push(state.view);
                 state.view = View::List;
                 state.list_cursor = 0;
                 state.resources.clear();

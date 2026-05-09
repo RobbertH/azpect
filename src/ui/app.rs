@@ -165,6 +165,33 @@ async fn event_loop(
                 if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
                     continue;
                 }
+                // Command palette has top priority. While active, all keys
+                // except Esc (cancel) and Enter (execute) flow into the
+                // command input buffer.
+                if state.command_active {
+                    if should_forward_to_command(state, key) {
+                        state.command_input.handle_event(&CtEvent::Key(key));
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Esc => {
+                            state.command_active = false;
+                            state.command_input.reset();
+                            continue;
+                        }
+                        KeyCode::Enter => {
+                            let cmd = state.command_input.value().to_string();
+                            run_command(state, &cmd);
+                            state.command_active = false;
+                            state.command_input.reset();
+                            if state.should_quit {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 // When the list filter input has focus, forward raw keystrokes
                 // into the `tui_input::Input` widget. `Esc` and `Enter` still
                 // flow through the action dispatcher so they can cancel/apply.
@@ -206,18 +233,26 @@ async fn event_loop(
                         if state.list_cursor >= state.resources.len() {
                             state.list_cursor = state.resources.len().saturating_sub(1);
                         }
+                        spawn_missing_list_metrics(state, auth, tx);
                     }
                     Err(e) => state.status_message = Some(format!("resources: {e}")),
                 }
             }
             AppEvent::MetricsLoaded { resource_id, result } => {
+                state.metrics.pending.remove(&resource_id);
                 state.metrics.loading = false;
                 match result {
                     Ok(series) => {
                         state.metrics.by_resource.insert(resource_id, series);
                         state.metrics.last_error = None;
                     }
-                    Err(e) => state.metrics.last_error = Some(e),
+                    Err(e) => {
+                        // Insert empty series so the row renders UNKNOWN rather
+                        // than spinning LOADING forever; keep the diagnostic
+                        // around in `last_error` for the status bar.
+                        state.metrics.by_resource.insert(resource_id, Vec::new());
+                        state.metrics.last_error = Some(e);
+                    }
                 }
             }
             AppEvent::LogsLoaded { resource_id, result } => {
@@ -246,6 +281,26 @@ async fn event_loop(
 fn should_forward_to_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
     state.list_filter_active
         && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
+/// True when the command palette is active *and* the key is something the
+/// input widget should consume. `Esc` (cancel) and `Enter` (execute) are
+/// reserved and handled directly by the event loop.
+fn should_forward_to_command(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.command_active && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
+/// Parse and execute a command palette buffer. Unknown commands surface a
+/// status message instead of crashing; empty input is silently ignored.
+fn run_command(state: &mut AppState, cmd: &str) {
+    let trimmed = cmd.trim();
+    match trimmed {
+        "q" | "quit" | "qa" | "qa!" | "quitall" => state.should_quit = true,
+        "" => {} // empty: silently ignore
+        other => {
+            state.status_message = Some(format!("unknown command: :{other}"));
+        }
+    }
 }
 
 /// Run the key event through the chord state machine and the per-view +
@@ -314,32 +369,53 @@ fn global_handle(
     auth: &AzureAuth,
     tx: &UnboundedSender<AppEvent>,
 ) {
+    if apply_navigation_action(action, state) {
+        return;
+    }
+    if let Action::Refresh = action {
+        // Refresh the visible view's primary data.
+        kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        return;
+    }
+    if let Action::StartCommand = action {
+        state.command_active = true;
+        state.command_input.reset();
+        return;
+    }
+    // Otherwise: unhandled — view ignored it, nothing to do.
+}
+
+/// Pure navigation/quit subset of `global_handle`. Touches only `state`, so it
+/// can be unit-tested without constructing `AzureAuth` or an event channel.
+/// Returns `true` if the action was handled here.
+fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
     match action {
-        Action::Quit => state.should_quit = true,
-        Action::Back => match state.previous_view {
-            Some(prev) => {
-                state.view = prev;
-                state.previous_view = None;
+        Action::Quit => {
+            state.should_quit = true;
+            true
+        }
+        Action::Back => {
+            match state.view_stack.pop() {
+                Some(prev) => state.view = prev,
+                None => state.should_quit = true,
             }
-            None => state.should_quit = true,
-        },
+            true
+        }
         Action::Help => {
             if state.view != View::Help {
-                state.previous_view = Some(state.view);
+                state.view_stack.push(state.view);
                 state.view = View::Help;
             }
+            true
         }
         Action::SwitchSubscription => {
             if state.view != View::Subscriptions {
-                state.previous_view = Some(state.view);
+                state.view_stack.push(state.view);
                 state.view = View::Subscriptions;
             }
+            true
         }
-        Action::Refresh => {
-            // Refresh the visible view's primary data.
-            kick_off_loads_for_view(state, auth, tx, /* force */ true);
-        }
-        _ => { /* unhandled — view ignored it, nothing to do */ }
+        _ => false,
     }
 }
 
@@ -387,6 +463,11 @@ fn kick_off_loads_for_view(
                     Some(id) => vec![id.clone()],
                     None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
                 };
+                if force {
+                    // Drop cached badges so they refresh once the new resource
+                    // list arrives; in-flight fetches keep their pending entries.
+                    state.metrics.by_resource.clear();
+                }
                 state.loading_resources = true;
                 spawn_load_resources(auth.clone(), sub_ids, tx.clone());
             }
@@ -428,13 +509,57 @@ fn dispatch_view(
     state: &AppState,
     theme: &Theme,
 ) {
+    // When the command palette is active, reserve the bottom row for the bar
+    // and render the underlying view into the area above it.
+    let (view_area, command_area) = if state.command_active && area.height > 0 {
+        let view_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height - 1,
+        };
+        let command_area = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+        (view_area, Some(command_area))
+    } else {
+        (area, None)
+    };
+
     match state.view {
-        View::Subscriptions => crate::ui::views::subscriptions::render(f, area, state, theme),
-        View::List => crate::ui::views::list::render(f, area, state, theme),
-        View::Detail => crate::ui::views::detail::render(f, area, state, theme),
-        View::Logs => crate::ui::views::logs::render(f, area, state, theme),
-        View::Help => crate::ui::views::help::render(f, area, state, theme),
+        View::Subscriptions => crate::ui::views::subscriptions::render(f, view_area, state, theme),
+        View::List => crate::ui::views::list::render(f, view_area, state, theme),
+        View::Detail => crate::ui::views::detail::render(f, view_area, state, theme),
+        View::Logs => crate::ui::views::logs::render(f, view_area, state, theme),
+        View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
+
+    if let Some(ca) = command_area {
+        render_command_bar(f, ca, state, theme);
+    }
+}
+
+/// Render the one-line command palette at `area`, styled like the search
+/// input but with a `:` prompt instead of `>`.
+fn render_command_bar(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+) {
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    let p = Paragraph::new(Line::from(vec![
+        Span::styled(":", Style::default().fg(theme.accent)),
+        Span::styled(state.command_input.value(), Style::default().fg(theme.fg)),
+        Span::styled("█", Style::default().fg(theme.accent)),
+    ]));
+    f.render_widget(p, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +640,30 @@ fn spawn_load_metrics(
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::MetricsLoaded { resource_id, result });
     });
+}
+
+/// Kick off a metrics fetch for every resource whose health badge is unknown
+/// and not already in flight. Used after `ResourcesLoaded` to populate the
+/// list view's per-row badges without waiting for the user to enter Detail.
+fn spawn_missing_list_metrics(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let range = state.metrics.range;
+    let to_fetch: Vec<Resource> = state
+        .resources
+        .iter()
+        .filter(|r| {
+            !state.metrics.by_resource.contains_key(&r.id)
+                && !state.metrics.pending.contains(&r.id)
+        })
+        .cloned()
+        .collect();
+    for resource in to_fetch {
+        state.metrics.pending.insert(resource.id.clone());
+        spawn_load_metrics(auth.clone(), resource, range, tx.clone());
+    }
 }
 
 fn spawn_load_logs(
@@ -608,5 +757,139 @@ mod tests {
         };
         input.maybe_expire(Instant::now());
         assert!(input.pending_chord.is_none());
+    }
+
+    #[test]
+    fn command_mode_q_quits() {
+        let mut state = fresh_state();
+        state.command_active = true;
+        // Simulate the user having typed "q" into the buffer.
+        state.command_input = state.command_input.clone().with_value("q".to_string());
+        let buf = state.command_input.value().to_string();
+        run_command(&mut state, &buf);
+        assert!(state.should_quit);
+        assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn command_mode_unknown_sets_status() {
+        let mut state = fresh_state();
+        state.command_active = true;
+        run_command(&mut state, "foo");
+        assert!(!state.should_quit);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("unknown command: :foo")
+        );
+    }
+
+    #[test]
+    fn command_mode_quit_aliases_all_quit() {
+        for cmd in ["q", "quit", "qa", "qa!", "quitall"] {
+            let mut state = fresh_state();
+            run_command(&mut state, cmd);
+            assert!(state.should_quit, "{cmd} should set should_quit");
+            assert!(state.status_message.is_none(), "{cmd} should not set status");
+        }
+    }
+
+    #[test]
+    fn command_mode_empty_is_silent() {
+        let mut state = fresh_state();
+        run_command(&mut state, "");
+        run_command(&mut state, "   ");
+        assert!(!state.should_quit);
+        assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn command_mode_forwarding_gating() {
+        let mut state = fresh_state();
+
+        // Command palette inactive: nothing forwards, even printable keys.
+        assert!(!should_forward_to_command(&state, k('a')));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!should_forward_to_command(&state, esc));
+        assert!(!should_forward_to_command(&state, enter));
+
+        // Command palette active: printable keys forward; Esc/Enter still
+        // reach the event loop directly so they can cancel/execute.
+        state.command_active = true;
+        assert!(should_forward_to_command(&state, k('a')));
+        assert!(should_forward_to_command(&state, k('q')));
+        assert!(should_forward_to_command(&state, k(':')));
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(should_forward_to_command(&state, backspace));
+        assert!(!should_forward_to_command(&state, esc));
+        assert!(!should_forward_to_command(&state, enter));
+    }
+
+    #[test]
+    fn back_navigation_unwinds_full_stack_without_bouncing() {
+        // Regression: previous_view was a single-slot stack of depth 1, so
+        // Subs -> List -> Detail -> Esc landed in List with previous_view set
+        // to Detail; the next Esc warped back into Detail. With view_stack
+        // (Vec<View>) the breadcrumb chain is preserved and Back unwinds it.
+        use crate::azure::resources::{Resource, ResourceKind};
+        use crate::azure::subscriptions::Subscription;
+
+        let mut state = fresh_state();
+        // Seed minimal data so view-local handlers actually transition.
+        state.subscriptions = vec![Subscription {
+            id: "sub-1".into(),
+            display_name: "alpha".into(),
+            state: "Enabled".into(),
+            tenant_id: "t".into(),
+        }];
+        let resource = Resource {
+            id: "/r/one".into(),
+            name: "alpha-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub-1".into(),
+            state: Some("Running".into()),
+        };
+        state.view = View::Subscriptions;
+
+        // Forward: Subs -> List
+        assert!(crate::ui::views::subscriptions::handle(
+            Action::OpenSelected,
+            &mut state,
+        ));
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.view_stack, vec![View::Subscriptions]);
+
+        // The subs handler clears resources to force a fresh load — re-seed for
+        // the next forward step.
+        state.resources = vec![resource];
+
+        // Forward: List -> Detail
+        assert!(crate::ui::views::list::handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::Detail);
+        assert_eq!(state.view_stack, vec![View::Subscriptions, View::List]);
+
+        // Back from Detail: view-local handler must NOT consume it; global pops List.
+        assert!(!crate::ui::views::detail::handle(Action::Back, &mut state));
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert_eq!(state.view, View::List, "first Esc lands in List");
+        assert_eq!(state.view_stack, vec![View::Subscriptions]);
+        assert!(!state.should_quit);
+
+        // Back from List: pops Subscriptions — must NOT bounce back into Detail.
+        assert!(!crate::ui::views::list::handle(Action::Back, &mut state));
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert_eq!(
+            state.view,
+            View::Subscriptions,
+            "second Esc lands in Subscriptions, never Detail"
+        );
+        assert!(state.view_stack.is_empty());
+        assert!(!state.should_quit);
+
+        // Back from Subscriptions with empty stack: quits cleanly.
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert!(state.should_quit);
     }
 }

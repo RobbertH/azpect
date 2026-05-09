@@ -3,7 +3,7 @@
 
 #![allow(dead_code, unused_variables)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tui_input::Input;
 
@@ -28,6 +28,8 @@ pub enum View {
 #[derive(Clone, Default)]
 pub struct MetricsCache {
     pub by_resource: HashMap<String, Vec<MetricSeries>>,
+    /// Resource IDs whose metrics fetch is currently in flight.
+    pub pending: HashSet<String>,
     pub range: TimeRange,
     pub loading: bool,
     pub last_error: Option<String>,
@@ -50,7 +52,10 @@ pub struct LogsCache {
 pub struct AppState {
     pub config: Config,
     pub view: View,
-    pub previous_view: Option<View>,
+    /// Stack of views the user has navigated through. Pushed on every forward
+    /// transition (e.g. Subs -> List -> Detail -> Logs); `Action::Back` pops.
+    /// Empty stack + Back triggers a quit.
+    pub view_stack: Vec<View>,
 
     pub subscriptions: Vec<Subscription>,
     pub selected_subscription: Option<String>,
@@ -69,6 +74,12 @@ pub struct AppState {
 
     pub status_message: Option<String>,
     pub should_quit: bool,
+
+    /// Whether the vim/k9s-style command palette (`:`) is currently capturing
+    /// input. While true, raw keystrokes are forwarded into `command_input`
+    /// rather than dispatched as actions; Esc cancels, Enter executes.
+    pub command_active: bool,
+    pub command_input: Input,
 }
 
 impl AppState {
@@ -76,7 +87,7 @@ impl AppState {
         let range = config.default_window;
         Self {
             view: View::Subscriptions,
-            previous_view: None,
+            view_stack: Vec::new(),
             subscriptions: Vec::new(),
             selected_subscription: config.last_subscription_id.clone(),
             subscription_cursor: 0,
@@ -91,6 +102,8 @@ impl AppState {
             logs: LogsCache { range, ..Default::default() },
             status_message: None,
             should_quit: false,
+            command_active: false,
+            command_input: Input::default(),
             config,
         }
     }

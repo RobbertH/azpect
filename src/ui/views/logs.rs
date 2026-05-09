@@ -13,7 +13,9 @@ use crate::azure::logs::{LogLevel, LogLine};
 use crate::azure::metrics::TimeRange;
 use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+#[cfg(test)]
+use crate::ui::state::View;
+use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str = "j/k scroll  e errors-only  d 1d  w 7d  Esc back  q quit";
@@ -249,11 +251,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         .unwrap_or(0);
 
     match action {
-        Action::Back => {
-            state.previous_view = Some(state.view);
-            state.view = View::Detail;
-            true
-        }
         Action::ToggleErrorsOnly => {
             state.logs.errors_only = !state.logs.errors_only;
             if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
@@ -418,10 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn back_returns_to_detail() {
+    fn back_is_not_consumed_by_view() {
+        // Logs view must NOT consume Action::Back — it falls through to the
+        // global handler which pops the view_stack. Consuming it here would
+        // re-introduce bug_009: an explicit "back to Detail" arm overwrites
+        // any older breadcrumb on the stack.
         let mut state = fixture(ResourceKind::FunctionApp);
-        assert!(handle(Action::Back, &mut state));
-        assert_eq!(state.view, View::Detail);
+        assert!(!handle(Action::Back, &mut state));
+        assert_eq!(state.view, View::Logs, "view-local handler must not transition on Back");
     }
 
     #[test]

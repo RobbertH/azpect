@@ -289,11 +289,6 @@ fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     match action {
-        Action::Back => {
-            state.previous_view = Some(state.view);
-            state.view = View::List;
-            true
-        }
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::OpenLogs => {
@@ -302,7 +297,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .map(|r| supports_logs(r.kind))
                 .unwrap_or(false);
             if supports {
-                state.previous_view = Some(state.view);
+                state.view_stack.push(state.view);
                 state.view = View::Logs;
             } else {
                 state.status_message =
@@ -401,10 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn back_returns_to_list() {
+    fn back_is_not_consumed_by_view() {
+        // Detail view must NOT consume Action::Back — it falls through to the
+        // global handler which pops the view_stack. Consuming it here would
+        // re-introduce bug_009: stamping previous_view = Some(Detail) when
+        // leaving Detail caused the next Esc to bounce right back in.
         let mut state = fixture_no_metrics();
-        assert!(handle(Action::Back, &mut state));
-        assert_eq!(state.view, View::List);
+        assert!(!handle(Action::Back, &mut state));
+        assert_eq!(state.view, View::Detail, "view-local handler must not transition on Back");
     }
 
     #[test]

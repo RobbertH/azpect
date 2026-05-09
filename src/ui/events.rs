@@ -73,6 +73,8 @@ pub enum Action {
     SetWindowDay,
     SetWindowWeek,
     Help,
+    /// Open the vim/k9s-style command palette (`:`).
+    StartCommand,
     /// Sentinel emitted on the *first* `g` of a `g g` chord. The event loop
     /// stashes pending state and waits for the second key. Also returned for
     /// any key the input handler doesn't recognise.
@@ -153,6 +155,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('d') if !ctrl => Action::SetWindowDay,
         KeyCode::Char('w') => Action::SetWindowWeek,
         KeyCode::Char('?') => Action::Help,
+        KeyCode::Char(':') => Action::StartCommand,
         KeyCode::Char('q') => Action::Back,
 
         _ => Action::Noop,
@@ -277,6 +280,7 @@ mod tests {
         assert_eq!(key_to_action(key('r'), v, false), Action::Refresh);
         assert_eq!(key_to_action(key('w'), v, false), Action::SetWindowWeek);
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
+        assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
         assert_eq!(key_to_action(key('q'), v, false), Action::Back);
     }
 

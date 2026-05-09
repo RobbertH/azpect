@@ -253,7 +253,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 // Pressing Enter while searching commits the filter and opens.
                 state.list_filter_active = false;
                 if state.selected_resource().is_some() {
-                    state.previous_view = Some(state.view);
+                    state.view_stack.push(state.view);
                     state.view = View::Detail;
                 }
                 return true;
@@ -303,7 +303,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::OpenSelected => {
             if state.selected_resource().is_some() {
-                state.previous_view = Some(state.view);
+                state.view_stack.push(state.view);
                 state.view = View::Detail;
             }
             true
@@ -311,7 +311,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::OpenLogs => {
             if let Some(sel) = state.selected_resource() {
                 if supports_logs(sel.kind) {
-                    state.previous_view = Some(state.view);
+                    state.view_stack.push(state.view);
                     state.view = View::Logs;
                 } else {
                     state.status_message =
