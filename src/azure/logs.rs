@@ -40,14 +40,24 @@ pub fn supports_logs(kind: ResourceKind) -> bool {
 }
 
 /// KQL templates per resource type. Lane 2 appends the errors-only filter when requested.
+///
+/// `isfuzzy=true` makes Log Analytics skip tables that don't exist in the
+/// workspace instead of hard-failing with SEM0100. The union mixes the
+/// workspace-based Application Insights tables (`AppTraces`, `AppExceptions`,
+/// `AppRequests`) with `FunctionAppLogs`, which is what the Function App
+/// resource ships when only diagnostic settings are configured (no AI, or
+/// classic AI). At least one of the four must resolve or KQL returns SEM0529.
 pub const KQL_FUNCTION_APP: &str = r#"
-union AppTraces, AppExceptions, AppRequests
+union isfuzzy=true AppTraces, AppExceptions, AppRequests, FunctionAppLogs
 | order by TimeGenerated desc
 | take 200
 "#;
 
+/// `Level` covers `FunctionAppLogs`; `SeverityLevel`/`itemType`/`Success` cover
+/// the workspace-based AI tables. Missing columns evaluate to null in a fuzzy
+/// union, so each clause only matches rows from the table that actually has it.
 pub const KQL_FUNCTION_APP_ERRORS_FILTER: &str = r#"
-| where SeverityLevel >= 3 or (Success == false and itemType == "request") or itemType == "exception"
+| where SeverityLevel >= 3 or (Success == false and itemType == "request") or itemType == "exception" or Level in ("Error", "Critical")
 "#;
 
 pub const KQL_CONTAINER_APP: &str = r#"
@@ -204,6 +214,17 @@ fn parse_function_app_row(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // FunctionAppLogs rows have `Level` (string) and no `itemType`. Detect
+    // them and route to a dedicated extractor so we don't lose the level
+    // signal or display them as generic "AppLogs".
+    let level_str = cell(columns, cells, "Level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if item_type.is_empty() && !level_str.is_empty() {
+        return parse_function_app_logs_row(columns, cells, level_str);
+    }
+
     let severity = cell(columns, cells, "SeverityLevel")
         .and_then(|v| v.as_i64())
         .unwrap_or(1);
@@ -244,6 +265,37 @@ fn parse_function_app_row(
                 .map(|s| s.to_string())
         })
         .unwrap_or_default();
+
+    (level, source, message)
+}
+
+/// Extract a row that came from the `FunctionAppLogs` diagnostic-settings
+/// table. Schema: `Level` (string), `Message`, `FunctionName`, `Category`.
+fn parse_function_app_logs_row(
+    columns: &[&str],
+    cells: &[serde_json::Value],
+    level_str: &str,
+) -> (LogLevel, String, String) {
+    let level = match level_str {
+        "Critical" | "Error" => LogLevel::Error,
+        "Warning" => LogLevel::Warn,
+        "Trace" | "Debug" => LogLevel::Trace,
+        _ => LogLevel::Info,
+    };
+
+    let function_name = cell(columns, cells, "FunctionName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let source = if function_name.is_empty() {
+        "FunctionAppLogs".to_string()
+    } else {
+        format!("FunctionAppLogs/{function_name}")
+    };
+
+    let message = cell(columns, cells, "Message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     (level, source, message)
 }
@@ -328,6 +380,49 @@ mod tests {
             .downcast_ref::<AzpectError>()
             .map(|e| matches!(e, AzpectError::NoLogDestination))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn parses_function_app_logs_row_when_only_level_present() {
+        // FunctionAppLogs schema: Level + Message + FunctionName, no itemType.
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Level", "type": "string" },
+                    { "name": "Message", "type": "string" },
+                    { "name": "FunctionName", "type": "string" }
+                ],
+                "rows": [
+                    [ "2026-01-01T00:00:00Z", "Error", "kaboom in handler", "ProcessOrder" ],
+                    [ "2026-01-01T00:01:00Z", "Information", "started", "" ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::FunctionApp).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].level, LogLevel::Error);
+        assert_eq!(lines[0].source, "FunctionAppLogs/ProcessOrder");
+        assert_eq!(lines[0].message, "kaboom in handler");
+        assert_eq!(lines[1].level, LogLevel::Info);
+        assert_eq!(lines[1].source, "FunctionAppLogs");
+    }
+
+    #[test]
+    fn errors_filter_includes_function_app_logs_level() {
+        let kql = build_kql(ResourceKind::FunctionApp, true).unwrap();
+        assert!(
+            kql.contains(r#"Level in ("Error", "Critical")"#),
+            "errors-only filter must catch FunctionAppLogs Error/Critical rows"
+        );
+    }
+
+    #[test]
+    fn function_app_kql_uses_fuzzy_union_with_function_app_logs() {
+        let kql = build_kql(ResourceKind::FunctionApp, false).unwrap();
+        assert!(kql.contains("isfuzzy=true"));
+        assert!(kql.contains("FunctionAppLogs"));
     }
 
     #[test]
