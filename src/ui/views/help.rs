@@ -49,6 +49,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("r", "refresh"),
             ("y", "yank to clipboard"),
+            ("o", "open in Azure Portal"),
             ("?", "toggle help"),
             ("q", "quit"),
         ],

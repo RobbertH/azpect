@@ -600,6 +600,9 @@ fn global_handle(
     if let Action::Yank = action {
         do_yank(state);
     }
+    if let Action::OpenInBrowser = action {
+        do_open_in_browser(state);
+    }
     // Otherwise: unhandled — view ignored it, nothing to do.
 }
 
@@ -619,6 +622,35 @@ fn do_yank(state: &mut AppState) {
         Err(e) => {
             state.status_message = Some(format!("clipboard write failed: {e}"));
         }
+    }
+}
+
+/// Compute the contextual portal URL for the current view and hand it to the
+/// system default browser. Posts a status hint on success or failure.
+fn do_open_in_browser(state: &mut AppState) {
+    let Some(url) = portal_url_for(state) else {
+        state.status_message = Some("nothing to open".to_string());
+        return;
+    };
+    match open::that_detached(&url) {
+        Ok(()) => state.status_message = Some(format!("opened {url}")),
+        Err(e) => state.status_message = Some(format!("failed to open browser: {e}")),
+    }
+}
+
+/// Resolve what `o` should open. List/Detail/Logs open the selected resource's
+/// portal blade; Subscriptions opens the highlighted subscription's overview.
+fn portal_url_for(state: &AppState) -> Option<String> {
+    const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
+    match state.view {
+        View::List | View::Detail | View::Logs => state
+            .selected_resource()
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        View::Subscriptions => state
+            .subscriptions
+            .get(state.subscription_cursor)
+            .map(|s| format!("{PORTAL_BASE}/subscriptions/{}/overview", s.id)),
+        View::Help => None,
     }
 }
 
@@ -1068,7 +1100,10 @@ fn render_auth_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme
                 Line::from(""),
                 Line::from(vec![
                     Span::raw(mark(state.auth_menu_focus, AuthMenuFocus::Browser)),
-                    Span::styled("[L] browser login        az login", style_for(AuthMenuFocus::Browser)),
+                    Span::styled(
+                        "[L] browser login        az login",
+                        style_for(AuthMenuFocus::Browser),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::raw(mark(state.auth_menu_focus, AuthMenuFocus::DeviceCode)),
@@ -1113,10 +1148,7 @@ fn render_auth_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme
                     Span::styled("█", Style::default().fg(theme.accent)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "Enter accept · Esc cancel",
-                    muted,
-                )),
+                Line::from(Span::styled("Enter accept · Esc cancel", muted)),
             ];
             let p = Paragraph::new(lines).alignment(Alignment::Left);
             f.render_widget(p, inner);

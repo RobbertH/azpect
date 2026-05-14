@@ -33,6 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tui-input = "0.14"
 nucleo-matcher = "0.3"
 futures = "0.3"
+open = "5"
 
 [profile.release]
 lto = "thin"

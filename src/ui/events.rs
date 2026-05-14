@@ -86,6 +86,9 @@ pub enum Action {
     /// Vim-style yank: copy something contextual (selected log line, displayed
     /// error, selected resource id, …) to the system clipboard via OSC52.
     Yank,
+    /// Open the contextual target (selected resource / subscription) in the
+    /// Azure Portal in the system default browser.
+    OpenInBrowser,
     /// Sentinel emitted on the *first* `g` of a `g g` chord. The event loop
     /// stashes pending state and waits for the second key. Also returned for
     /// any key the input handler doesn't recognise.
@@ -173,6 +176,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char(':') => Action::StartCommand,
         KeyCode::Char('y') => Action::Yank,
+        KeyCode::Char('o') => Action::OpenInBrowser,
         KeyCode::Char('q') => Action::Back,
 
         _ => Action::Noop,
@@ -312,6 +316,7 @@ mod tests {
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
         assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
         assert_eq!(key_to_action(key('q'), v, false), Action::Back);
+        assert_eq!(key_to_action(key('o'), v, false), Action::OpenInBrowser);
     }
 
     #[test]

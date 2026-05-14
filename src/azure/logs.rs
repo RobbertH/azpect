@@ -54,10 +54,16 @@ union isfuzzy=true AppTraces, AppExceptions, AppRequests, FunctionAppLogs
 "#;
 
 /// `Level` covers `FunctionAppLogs`; `SeverityLevel`/`itemType`/`Success` cover
-/// the workspace-based AI tables. Missing columns evaluate to null in a fuzzy
-/// union, so each clause only matches rows from the table that actually has it.
+/// the workspace-based AI tables. `column_ifexists` is required because when
+/// none of the AI tables resolve (e.g. a Function App that only ships
+/// `FunctionAppLogs`), referencing `SeverityLevel`/`Success`/`itemType`
+/// directly fails the whole query with SEM0100 — the columns exist on no
+/// resolved source. `column_ifexists` substitutes a default in that case.
 pub const KQL_FUNCTION_APP_ERRORS_FILTER: &str = r#"
-| where SeverityLevel >= 3 or (Success == false and itemType == "request") or itemType == "exception" or Level in ("Error", "Critical")
+| where column_ifexists("SeverityLevel", int(0)) >= 3
+     or (column_ifexists("Success", true) == false and column_ifexists("itemType", "") == "request")
+     or column_ifexists("itemType", "") == "exception"
+     or column_ifexists("Level", "") in ("Error", "Critical")
 "#;
 
 pub const KQL_CONTAINER_APP: &str = r#"
@@ -346,7 +352,9 @@ mod tests {
     fn errors_filter_inserted_before_order_by() {
         let kql = build_kql(ResourceKind::FunctionApp, true).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
-        let filter_idx = kql.find("SeverityLevel >= 3").expect("filter present");
+        let filter_idx = kql
+            .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
+            .expect("filter present");
         assert!(filter_idx < order_idx, "filter must come before order by");
     }
 
@@ -413,7 +421,7 @@ mod tests {
     fn errors_filter_includes_function_app_logs_level() {
         let kql = build_kql(ResourceKind::FunctionApp, true).unwrap();
         assert!(
-            kql.contains(r#"Level in ("Error", "Critical")"#),
+            kql.contains(r#"column_ifexists("Level", "") in ("Error", "Critical")"#),
             "errors-only filter must catch FunctionAppLogs Error/Critical rows"
         );
     }
