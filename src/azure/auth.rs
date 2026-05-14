@@ -81,6 +81,13 @@ impl AzureAuth {
         })
     }
 
+    /// Drop every cached token. Call after a re-auth (e.g. `az login`) so the
+    /// next request acquires a fresh token reflecting the new identity/tenant
+    /// instead of returning the previous user's still-valid bearer.
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+    }
+
     /// Acquire (and cache) a bearer token for `scope`.
     pub async fn token(&self, scope: &str) -> anyhow::Result<String> {
         let now = Utc::now();
@@ -99,11 +106,9 @@ impl AzureAuth {
 
         // Slow path: request a new token. Do this without holding any lock so
         // concurrent requests for *different* scopes aren't serialized.
-        let access_token = self
-            .credential
-            .get_token(&[scope], None)
-            .await
-            .context("failed to acquire Azure access token; try `az login` or check your environment")?;
+        let access_token = self.credential.get_token(&[scope], None).await.context(
+            "failed to acquire Azure access token; try `az login` or check your environment",
+        )?;
 
         let token_string = access_token.token.secret().to_string();
         let expires_at = offset_datetime_to_chrono(access_token.expires_on);
@@ -112,7 +117,9 @@ impl AzureAuth {
         // Re-check: another task may have populated the cache while we awaited
         // the network round-trip. Prefer the freshest entry.
         if let Some(existing) = cache.get(scope) {
-            if existing.expires_at >= expires_at && existing.expires_at - refresh_before > Utc::now() {
+            if existing.expires_at >= expires_at
+                && existing.expires_at - refresh_before > Utc::now()
+            {
                 return Ok(existing.token.clone());
             }
         }

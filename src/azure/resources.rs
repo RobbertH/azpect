@@ -104,7 +104,11 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
     };
 
     let id = v.get("id")?.as_str()?.to_string();
-    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
     let location = v
         .get("location")
         .and_then(|n| n.as_str())

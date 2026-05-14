@@ -106,7 +106,10 @@ impl MetricSeries {
     }
 
     pub fn max(&self) -> f64 {
-        self.points.iter().map(|p| p.value).fold(f64::NEG_INFINITY, f64::max)
+        self.points
+            .iter()
+            .map(|p| p.value)
+            .fold(f64::NEG_INFINITY, f64::max)
     }
 }
 
@@ -200,11 +203,13 @@ pub async fn fetch(
         resource.id.trim_end_matches('/')
     );
 
-    let needs_error_filter =
-        matches!(resource.kind, ResourceKind::Apim | ResourceKind::ContainerApp);
+    let needs_error_filter = matches!(
+        resource.kind,
+        ResourceKind::Apim | ResourceKind::ContainerApp
+    );
 
-    let mut handles: Vec<tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>> =
-        Vec::new();
+    type Handle = tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>;
+    let mut handles: Vec<Handle> = Vec::new();
 
     for (kind, name, agg) in mappings {
         let kind = *kind;
@@ -324,7 +329,9 @@ fn parse_metrics_response(
                     data.iter()
                         .filter_map(|d| {
                             let ts_str = d.get("timeStamp").and_then(|t| t.as_str())?;
-                            let ts = DateTime::parse_from_rfc3339(ts_str).ok()?.with_timezone(&Utc);
+                            let ts = DateTime::parse_from_rfc3339(ts_str)
+                                .ok()?
+                                .with_timezone(&Utc);
                             let v = d.get(agg_field).and_then(|x| x.as_f64()).unwrap_or(0.0);
                             Some(MetricPoint { ts, value: v })
                         })
@@ -356,8 +363,15 @@ mod tests {
         // application/x-www-form-urlencoded, which is how Azure parses these.
         // We must serialize UTC as `Z` to round-trip correctly.
         let span = TimeRange::Day.timespan();
-        assert!(!span.contains('+'), "timespan should not contain '+': {span}");
-        assert_eq!(span.matches('Z').count(), 2, "expected two Z markers: {span}");
+        assert!(
+            !span.contains('+'),
+            "timespan should not contain '+': {span}"
+        );
+        assert_eq!(
+            span.matches('Z').count(),
+            2,
+            "expected two Z markers: {span}"
+        );
         assert!(span.contains('/'), "missing start/end separator: {span}");
     }
 
@@ -398,20 +412,34 @@ mod tests {
         });
 
         let requested = vec![
-            (MetricKind::Errors, "Http5xx".to_string(), "Total".to_string()),
-            (MetricKind::Traffic, "Requests".to_string(), "Total".to_string()),
+            (
+                MetricKind::Errors,
+                "Http5xx".to_string(),
+                "Total".to_string(),
+            ),
+            (
+                MetricKind::Traffic,
+                "Requests".to_string(),
+                "Total".to_string(),
+            ),
         ];
 
         let series = parse_metrics_response(&payload, &requested, ResourceKind::FunctionApp);
         assert_eq!(series.len(), 2);
 
-        let errors = series.iter().find(|s| s.kind == MetricKind::Errors).unwrap();
+        let errors = series
+            .iter()
+            .find(|s| s.kind == MetricKind::Errors)
+            .unwrap();
         assert_eq!(errors.label, "Http 5xx");
         assert_eq!(errors.unit, "count");
         assert_eq!(errors.points.len(), 2);
         assert_eq!(errors.points[1].value, 3.0);
 
-        let traffic = series.iter().find(|s| s.kind == MetricKind::Traffic).unwrap();
+        let traffic = series
+            .iter()
+            .find(|s| s.kind == MetricKind::Traffic)
+            .unwrap();
         assert_eq!(traffic.points.len(), 2);
         assert_eq!(traffic.sum(), 300.0);
     }
@@ -428,9 +456,11 @@ mod tests {
             ]
         });
 
-        let requested = vec![
-            (MetricKind::Traffic, "Requests".to_string(), "Total".to_string()),
-        ];
+        let requested = vec![(
+            MetricKind::Traffic,
+            "Requests".to_string(),
+            "Total".to_string(),
+        )];
         let series = parse_metrics_response(&payload, &requested, ResourceKind::Apim);
         assert_eq!(series.len(), 1);
         assert!(series[0].points.is_empty());

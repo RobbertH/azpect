@@ -189,10 +189,7 @@ mod tests {
             series(MetricKind::Errors, &[0.0, 0.0, 0.0, 0.0]),
             series(MetricKind::Traffic, &[0.0, 0.0, 0.0, 0.0]),
         ];
-        assert_eq!(
-            derive(&metrics, Some("Running"), None),
-            HealthStatus::Idle
-        );
+        assert_eq!(derive(&metrics, Some("Running"), None), HealthStatus::Idle);
     }
 
     #[test]
@@ -253,7 +250,11 @@ mod tests {
             series(MetricKind::Traffic, &[100.0, 100.0, 100.0, 100.0]),
         ];
         assert_eq!(
-            derive(&metrics, Some("Running"), Some(AvailabilityState::Unavailable)),
+            derive(
+                &metrics,
+                Some("Running"),
+                Some(AvailabilityState::Unavailable)
+            ),
             HealthStatus::Critical
         );
     }
@@ -343,11 +344,7 @@ mod tests {
             series(MetricKind::Traffic, &[0.0, 0.0, 0.0, 0.0]),
         ];
         assert_eq!(
-            derive(
-                &metrics,
-                Some("Running"),
-                Some(AvailabilityState::Unknown)
-            ),
+            derive(&metrics, Some("Running"), Some(AvailabilityState::Unknown)),
             HealthStatus::Idle
         );
     }

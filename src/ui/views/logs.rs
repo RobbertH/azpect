@@ -13,9 +13,9 @@ use crate::azure::logs::{LogLevel, LogLine};
 use crate::azure::metrics::TimeRange;
 use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
+use crate::ui::state::AppState;
 #[cfg(test)]
 use crate::ui::state::View;
-use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str = "j/k scroll  y yank  e errors-only  d 1d  w 7d  Esc back  q quit";
@@ -34,7 +34,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Header
     let mut header_spans = vec![Span::styled(
         " logs ",
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     )];
     if let Some(r) = selected {
         header_spans.push(Span::styled(&r.name, Style::default().fg(theme.fg)));
@@ -120,13 +122,7 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(p, area);
 }
 
-fn render_table(
-    frame: &mut Frame,
-    area: Rect,
-    lines: &[LogLine],
-    state: &AppState,
-    theme: &Theme,
-) {
+fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppState, theme: &Theme) {
     let visible = area.height as usize;
     let scroll = scroll_for(state.logs.scroll, lines.len(), visible);
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
@@ -147,7 +143,10 @@ fn render_table(
                     l.source.clone(),
                     Style::default().fg(theme.accent),
                 )),
-                Cell::from(Span::styled(l.message.clone(), Style::default().fg(theme.fg))),
+                Cell::from(Span::styled(
+                    l.message.clone(),
+                    Style::default().fg(theme.fg),
+                )),
             ]);
             if selected {
                 row.style(theme.selection())
@@ -167,8 +166,11 @@ fn render_table(
         ],
     )
     .header(
-        Row::new(vec!["time", "lvl", "source", "message"])
-            .style(Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)),
+        Row::new(vec!["time", "lvl", "source", "message"]).style(
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .column_spacing(2);
     frame.render_widget(table, area);
@@ -296,9 +298,18 @@ pub fn friendly_log_error(raw: &str) -> String {
 /// a message.
 fn deepest_error(err: &serde_json::Value) -> (Option<String>, Option<String>) {
     let mut current = err;
-    let mut best_message = current.get("message").and_then(|m| m.as_str()).map(str::to_owned);
-    let mut best_code = current.get("code").and_then(|c| c.as_str()).map(str::to_owned);
-    while let Some(inner) = current.get("innererror").or_else(|| current.get("innerError")) {
+    let mut best_message = current
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_owned);
+    let mut best_code = current
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(str::to_owned);
+    while let Some(inner) = current
+        .get("innererror")
+        .or_else(|| current.get("innerError"))
+    {
         if let Some(msg) = inner.get("message").and_then(|m| m.as_str()) {
             best_message = Some(msg.to_string());
         }
@@ -477,7 +488,10 @@ mod tests {
             out.contains("Failed to resolve column or table 'Success'"),
             "expected deepest message, got {out:?}",
         );
-        assert!(out.contains("SEM0100"), "expected deepest code, got {out:?}");
+        assert!(
+            out.contains("SEM0100"),
+            "expected deepest code, got {out:?}"
+        );
     }
 
     #[test]
@@ -542,7 +556,11 @@ mod tests {
         // any older breadcrumb on the stack.
         let mut state = fixture(ResourceKind::FunctionApp);
         assert!(!handle(Action::Back, &mut state));
-        assert_eq!(state.view, View::Logs, "view-local handler must not transition on Back");
+        assert_eq!(
+            state.view,
+            View::Logs,
+            "view-local handler must not transition on Back"
+        );
     }
 
     #[test]

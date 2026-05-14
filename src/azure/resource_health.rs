@@ -36,9 +36,8 @@ pub struct ResourceAvailability {
 
 pub async fn fetch(auth: &AzureAuth, resource_id: &str) -> anyhow::Result<ResourceAvailability> {
     let client = ArmClient::new(auth.clone())?;
-    let path = format!(
-        "{resource_id}/providers/Microsoft.ResourceHealth/availabilityStatuses/current"
-    );
+    let path =
+        format!("{resource_id}/providers/Microsoft.ResourceHealth/availabilityStatuses/current");
     let resp = client
         .get(&path, &[("api-version", "2022-10-01")])
         .await

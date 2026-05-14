@@ -64,7 +64,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .border_style(Style::default().fg(theme.border))
         .title(Span::styled(
             " help ",
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme.bg).fg(theme.fg));
     let inner = block.inner(popup);
@@ -75,8 +77,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     // Two-column layout: left = first two sections, right = last two.
-    let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(inner);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
 
     let left_lines = lines_for(&[SECTIONS[0], SECTIONS[1]], theme);
     let right_lines = lines_for(&[SECTIONS[2], SECTIONS[3]], theme);

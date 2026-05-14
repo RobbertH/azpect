@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use anyhow::anyhow;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 
 use crate::azure::auth::{AzureAuth, SCOPE_ARM, SCOPE_LOGS};
@@ -173,17 +173,27 @@ impl ArmClient {
 
     /// `GET https://management.azure.com{path}` with bearer for ARM scope.
     /// Caller passes `path` starting with `/`. Handles 429 + 5xx with bounded backoff.
-    pub async fn get(&self, path: &str, query: &[(&str, &str)]) -> anyhow::Result<serde_json::Value> {
+    pub async fn get(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{ARM_BASE}{path}");
-        let query_owned: Vec<(String, String)> =
-            query.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let query_owned: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
             http.request(Method::GET, &url).query(&query_owned)
         })
         .await
     }
 
-    pub async fn post(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    pub async fn post(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let url = format!("{ARM_BASE}{path}");
         send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
             http.request(Method::POST, &url)
@@ -202,7 +212,12 @@ impl LogsClient {
         })
     }
 
-    pub async fn query(&self, resource_id: &str, kql: &str, timespan: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn query(
+        &self,
+        resource_id: &str,
+        kql: &str,
+        timespan: &str,
+    ) -> anyhow::Result<serde_json::Value> {
         // Resource IDs always start with `/`.
         let url = format!("{LOGS_BASE}/v1{resource_id}/query");
         let body = serde_json::json!({

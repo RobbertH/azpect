@@ -27,15 +27,15 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tui_input::backend::crossterm::EventHandler as _;
+use tui_input::Input;
 
 use crate::azure::auth::AzureAuth;
+use crate::azure::az_login::{self, AzLoginOptions};
 use crate::azure::metrics::TimeRange;
 use crate::azure::resources::Resource;
 use crate::config::Config;
-use crate::ui::events::{
-    is_chord_starter, key_to_action, resolve_chord, Action, AppEvent,
-};
-use crate::ui::state::{AppState, View};
+use crate::ui::events::{is_chord_starter, key_to_action, resolve_chord, Action, AppEvent};
+use crate::ui::state::{AppState, AuthMenuFocus, AuthPrompt, PendingLogin, View};
 use crate::ui::theme::Theme;
 
 /// How often the tick task fires. Drives spinner refresh, chord timeout, etc.
@@ -70,6 +70,26 @@ impl TerminalGuard {
         // unwinding and the terminal will be in a bad state regardless.
         let _ = execute!(stdout(), LeaveAlternateScreen);
         let _ = disable_raw_mode();
+    }
+
+    /// Temporarily hand the terminal back to the parent shell so a child
+    /// process (e.g. `az login`) can interact with the user. Pair with
+    /// [`Self::resume`]. Idempotent if already suspended.
+    fn suspend(&mut self) {
+        self.leave();
+    }
+
+    /// Re-enter the alternate screen + raw mode after a [`Self::suspend`].
+    /// Errors here propagate so the caller can decide whether to abort —
+    /// continuing without raw mode would leave the TUI in a broken state.
+    fn resume(&mut self) -> std::io::Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        enable_raw_mode()?;
+        execute!(stdout(), EnterAlternateScreen)?;
+        self.active = true;
+        Ok(())
     }
 }
 
@@ -121,7 +141,16 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
     // Kick off subscriptions load.
     spawn_load_subscriptions(auth.clone(), tx.clone());
 
-    let result = event_loop(&mut terminal, &mut state, &theme, &auth, &tx, &mut rx).await;
+    let result = event_loop(
+        &mut terminal,
+        &mut guard,
+        &mut state,
+        &theme,
+        &auth,
+        &tx,
+        &mut rx,
+    )
+    .await;
 
     // Restore terminal *before* trying to write the config or print errors.
     guard.leave();
@@ -137,6 +166,7 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
 
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &mut TerminalGuard,
     state: &mut AppState,
     theme: &Theme,
     auth: &AzureAuth,
@@ -164,6 +194,12 @@ async fn event_loop(
                 // Only react to *press* events. Some terminals (kitty, win-pty)
                 // emit Release/Repeat which would otherwise double-fire.
                 if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+                    continue;
+                }
+                // Auth-prompt modal takes priority over quit-confirm so its
+                // Esc dismisses the prompt instead of opening the quit dialog.
+                if state.auth_prompt != AuthPrompt::Hidden {
+                    handle_auth_prompt_key(state, key);
                     continue;
                 }
                 // Quit-confirmation modal takes the highest priority. While
@@ -253,18 +289,34 @@ async fn event_loop(
                 state.loading_subscriptions = false;
                 match res {
                     Ok(subs) => {
+                        let was_empty = subs.is_empty();
                         state.subscriptions = subs;
                         // Restore last-used subscription cursor if possible.
                         if let Some(last) = state.selected_subscription.clone() {
-                            if let Some(idx) =
-                                state.subscriptions.iter().position(|s| s.id == last)
+                            if let Some(idx) = state.subscriptions.iter().position(|s| s.id == last)
                             {
                                 state.subscription_cursor = idx;
                             }
                         }
+                        // No subs visible to this credential is almost always
+                        // an auth/tenant problem — surface the login modal.
+                        if was_empty
+                            && state.view == View::Subscriptions
+                            && state.auth_prompt == AuthPrompt::Hidden
+                        {
+                            open_auth_prompt(state, None);
+                        }
                     }
                     Err(e) => {
-                        state.status_message = Some(format!("subscriptions: {e}"));
+                        let msg = e.to_string();
+                        state.status_message = Some(format!("subscriptions: {msg}"));
+                        // Same treatment for outright failures: the chain may
+                        // simply have no usable credential.
+                        if state.view == View::Subscriptions
+                            && state.auth_prompt == AuthPrompt::Hidden
+                        {
+                            open_auth_prompt(state, Some(msg));
+                        }
                     }
                 }
             }
@@ -276,9 +328,7 @@ async fn event_loop(
                         // Restore the cursor to the last-selected resource if
                         // it's still in the loaded set; otherwise clamp.
                         if let Some(last) = state.config.last_resource_id.as_deref() {
-                            if let Some(idx) =
-                                state.resources.iter().position(|r| r.id == last)
-                            {
+                            if let Some(idx) = state.resources.iter().position(|r| r.id == last) {
                                 state.list_cursor = idx;
                             }
                         }
@@ -291,7 +341,10 @@ async fn event_loop(
                     Err(e) => state.status_message = Some(format!("resources: {e}")),
                 }
             }
-            AppEvent::MetricsLoaded { resource_id, result } => {
+            AppEvent::MetricsLoaded {
+                resource_id,
+                result,
+            } => {
                 state.metrics.pending.remove(&resource_id);
                 state.metrics.loading = false;
                 match result {
@@ -313,7 +366,10 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::LogsLoaded { resource_id, result } => {
+            AppEvent::LogsLoaded {
+                resource_id,
+                result,
+            } => {
                 state.logs.loading = false;
                 match result {
                     Ok(lines) => {
@@ -323,7 +379,10 @@ async fn event_loop(
                     Err(e) => state.logs.last_error = Some(e),
                 }
             }
-            AppEvent::HealthLoaded { resource_id, result } => {
+            AppEvent::HealthLoaded {
+                resource_id,
+                result,
+            } => {
                 state.health.pending.remove(&resource_id);
                 match result {
                     Ok(avail) => {
@@ -337,12 +396,86 @@ async fn event_loop(
             }
         }
 
+        // Drain a pending login request: the modal handler set it on Enter,
+        // and now we own the terminal so we can suspend safely.
+        if let Some(req) = state.pending_login.take() {
+            run_pending_login(terminal, guard, state, auth, tx, req).await;
+        }
+
         if state.should_quit {
             break;
         }
     }
 
     Ok(())
+}
+
+/// Suspend the TUI, run `az login`, restore the TUI, clear the auth cache,
+/// and trigger a fresh subscriptions load. All errors are captured into
+/// `state.auth_last_error` and surfaced via the modal on the next frame.
+async fn run_pending_login(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &mut TerminalGuard,
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    req: PendingLogin,
+) {
+    guard.suspend();
+
+    // Surface what we're about to do on the parent shell so the user sees
+    // context before az takes over the terminal.
+    {
+        use std::io::Write as _;
+        let mut out = stdout();
+        let mut hint = String::from("\nazpect: launching `az login`");
+        if let Some(t) = req.tenant.as_deref() {
+            hint.push_str(&format!(" --tenant {t}"));
+        }
+        if req.use_device_code {
+            hint.push_str(" --use-device-code");
+        }
+        hint.push_str("\n\n");
+        let _ = out.write_all(hint.as_bytes());
+        let _ = out.flush();
+    }
+
+    let opts = AzLoginOptions {
+        tenant: req.tenant,
+        use_device_code: req.use_device_code,
+    };
+    let outcome = az_login::run(opts).await;
+
+    // Always try to restore the TUI — even on login failure the user is
+    // sitting in a bare shell and expects the app back.
+    if let Err(e) = guard.resume() {
+        // If we can't re-enter the alt screen, bail. Bubbling this up via a
+        // status message would never be visible.
+        tracing::error!("failed to resume terminal after az login: {e}");
+        state.should_quit = true;
+        return;
+    }
+    let _ = terminal.clear();
+
+    match outcome {
+        Ok(()) => {
+            state.auth_prompt = AuthPrompt::Hidden;
+            state.auth_last_error = None;
+            // The previous user's bearer is now stale; drop it before we
+            // refetch subscriptions or any other ARM call would still go out
+            // under the old identity.
+            auth.clear_cache().await;
+            state.loading_subscriptions = true;
+            state.subscriptions.clear();
+            spawn_load_subscriptions(auth.clone(), tx.clone());
+            state.status_message = Some("logged in via az".to_string());
+        }
+        Err(e) => {
+            // Stay on the menu so the user can retry / pick a different mode.
+            state.auth_prompt = AuthPrompt::Menu;
+            state.auth_last_error = Some(format!("{e}"));
+        }
+    }
 }
 
 /// True when the list filter is active *and* the key is something the input
@@ -631,12 +764,7 @@ fn kick_off_loads_for_view(
                     }
                     state.metrics.loading = true;
                     state.metrics.pending.insert(resource.id.clone());
-                    spawn_load_metrics(
-                        auth.clone(),
-                        resource,
-                        state.metrics.range,
-                        tx.clone(),
-                    );
+                    spawn_load_metrics(auth.clone(), resource, state.metrics.range, tx.clone());
                 }
             }
         }
@@ -658,12 +786,7 @@ fn kick_off_loads_for_view(
     }
 }
 
-fn dispatch_view(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    state: &AppState,
-    theme: &Theme,
-) {
+fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
     // When the command palette is active, reserve the bottom row for the bar
     // and render the underlying view into the area above it.
     let (view_area, command_area) = if state.command_active && area.height > 0 {
@@ -697,6 +820,9 @@ fn dispatch_view(
     // practice both flags can't be true at once given input gating.)
     if state.quit_confirm {
         render_quit_modal(f, area, state, theme);
+    }
+    if state.auth_prompt != AuthPrompt::Hidden {
+        render_auth_modal(f, area, state, theme);
     }
 
     if let Some(ca) = command_area {
@@ -771,6 +897,247 @@ fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme
     f.render_widget(paragraph, inner);
 }
 
+/// Open the auth prompt, optionally with a pre-populated error message that
+/// the menu will surface so the user understands why it appeared.
+fn open_auth_prompt(state: &mut AppState, error: Option<String>) {
+    state.auth_prompt = AuthPrompt::Menu;
+    state.auth_menu_focus = AuthMenuFocus::Browser;
+    state.auth_last_error = error;
+}
+
+/// Key handler invoked while `auth_prompt != Hidden`. Mirrors the quit-modal
+/// short-circuit: every key is either consumed by the modal or swallowed.
+fn handle_auth_prompt_key(state: &mut AppState, key: crossterm::event::KeyEvent) {
+    match state.auth_prompt {
+        AuthPrompt::Hidden => {}
+        AuthPrompt::Menu => match key.code {
+            KeyCode::Esc => {
+                state.auth_prompt = AuthPrompt::Hidden;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                state.auth_menu_focus = match state.auth_menu_focus {
+                    AuthMenuFocus::Browser => AuthMenuFocus::Tenant,
+                    AuthMenuFocus::DeviceCode => AuthMenuFocus::Browser,
+                    AuthMenuFocus::Tenant => AuthMenuFocus::DeviceCode,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                state.auth_menu_focus = match state.auth_menu_focus {
+                    AuthMenuFocus::Browser => AuthMenuFocus::DeviceCode,
+                    AuthMenuFocus::DeviceCode => AuthMenuFocus::Tenant,
+                    AuthMenuFocus::Tenant => AuthMenuFocus::Browser,
+                };
+            }
+            // Direct shortcuts.
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                state.pending_login = Some(PendingLogin {
+                    tenant: state.auth_tenant.clone(),
+                    use_device_code: false,
+                });
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                state.pending_login = Some(PendingLogin {
+                    tenant: state.auth_tenant.clone(),
+                    use_device_code: true,
+                });
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                state.auth_prompt = AuthPrompt::TenantInput;
+                // Pre-fill with the existing tenant so editing is easy.
+                let initial = state.auth_tenant.clone().unwrap_or_default();
+                state.auth_tenant_input = Input::default().with_value(initial);
+            }
+            KeyCode::Enter => match state.auth_menu_focus {
+                AuthMenuFocus::Browser => {
+                    state.pending_login = Some(PendingLogin {
+                        tenant: state.auth_tenant.clone(),
+                        use_device_code: false,
+                    });
+                }
+                AuthMenuFocus::DeviceCode => {
+                    state.pending_login = Some(PendingLogin {
+                        tenant: state.auth_tenant.clone(),
+                        use_device_code: true,
+                    });
+                }
+                AuthMenuFocus::Tenant => {
+                    state.auth_prompt = AuthPrompt::TenantInput;
+                    let initial = state.auth_tenant.clone().unwrap_or_default();
+                    state.auth_tenant_input = Input::default().with_value(initial);
+                }
+            },
+            _ => {}
+        },
+        AuthPrompt::TenantInput => match key.code {
+            KeyCode::Esc => {
+                state.auth_prompt = AuthPrompt::Menu;
+            }
+            KeyCode::Enter => {
+                let v = state.auth_tenant_input.value().trim().to_string();
+                state.auth_tenant = if v.is_empty() { None } else { Some(v) };
+                state.auth_prompt = AuthPrompt::Menu;
+            }
+            _ => {
+                state.auth_tenant_input.handle_event(&CtEvent::Key(key));
+            }
+        },
+    }
+}
+
+/// Render the in-app `az login` modal. Two states: the menu (with three
+/// focusable rows + last error if any) and the tenant-input field.
+fn render_auth_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use ratatui::layout::Alignment;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let height: u16 = match state.auth_prompt {
+        AuthPrompt::Menu => {
+            // Title + 3 option rows + tenant summary + hint + optional 2-line error.
+            let base = 11u16;
+            if state.auth_last_error.is_some() {
+                base + 2
+            } else {
+                base
+            }
+        }
+        AuthPrompt::TenantInput => 9,
+        AuthPrompt::Hidden => return,
+    };
+    let popup = centered_fixed_rect(64, height, area);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, popup);
+
+    let title = match state.auth_prompt {
+        AuthPrompt::TenantInput => " az login · tenant ",
+        _ => " az login ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let focused = Style::default()
+        .bg(theme.accent)
+        .fg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+    let unfocused = Style::default().fg(theme.fg);
+    let muted = Style::default().fg(theme.muted);
+
+    match state.auth_prompt {
+        AuthPrompt::Menu => {
+            let mark = |f: AuthMenuFocus, want: AuthMenuFocus| {
+                if f == want {
+                    " ▍ "
+                } else {
+                    "   "
+                }
+            };
+            let style_for = |want: AuthMenuFocus| {
+                if state.auth_menu_focus == want {
+                    focused
+                } else {
+                    unfocused
+                }
+            };
+            let tenant_label = state
+                .auth_tenant
+                .as_deref()
+                .map(|t| format!("[T] tenant…              {t}"))
+                .unwrap_or_else(|| "[T] tenant…              (default)".to_string());
+
+            let mut lines: Vec<Line> = vec![
+                Line::from(Span::styled(
+                    "no subscriptions visible · choose a login flow",
+                    muted,
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw(mark(state.auth_menu_focus, AuthMenuFocus::Browser)),
+                    Span::styled("[L] browser login        az login", style_for(AuthMenuFocus::Browser)),
+                ]),
+                Line::from(vec![
+                    Span::raw(mark(state.auth_menu_focus, AuthMenuFocus::DeviceCode)),
+                    Span::styled(
+                        "[D] device code          az login --use-device-code",
+                        style_for(AuthMenuFocus::DeviceCode),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw(mark(state.auth_menu_focus, AuthMenuFocus::Tenant)),
+                    Span::styled(tenant_label, style_for(AuthMenuFocus::Tenant)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "↑/↓ choose · Enter run · L/D shortcuts · T set tenant · Esc cancel",
+                    muted,
+                )),
+            ];
+
+            if let Some(err) = state.auth_last_error.as_deref() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    truncate_error(err, inner.width as usize),
+                    Style::default().fg(theme.degraded),
+                )));
+            }
+
+            let p = Paragraph::new(lines).alignment(Alignment::Left);
+            f.render_widget(p, inner);
+        }
+        AuthPrompt::TenantInput => {
+            let value = state.auth_tenant_input.value();
+            let lines = vec![
+                Line::from(Span::styled(
+                    "tenant id or domain (blank = default tenant)",
+                    muted,
+                )),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent)),
+                    Span::styled(value.to_string(), Style::default().fg(theme.fg)),
+                    Span::styled("█", Style::default().fg(theme.accent)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter accept · Esc cancel",
+                    muted,
+                )),
+            ];
+            let p = Paragraph::new(lines).alignment(Alignment::Left);
+            f.render_widget(p, inner);
+        }
+        AuthPrompt::Hidden => {}
+    }
+}
+
+fn truncate_error(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let take = width.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
 /// Centered rect of a fixed cell size (vs. percentage-based). Clamps to
 /// `area` if the requested size doesn't fit.
 fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -786,12 +1153,7 @@ fn centered_fixed_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 /// Render the one-line command palette at `area`, styled like the search
 /// input but with a `:` prompt instead of `>`.
-fn render_command_bar(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    state: &AppState,
-    theme: &Theme,
-) {
+fn render_command_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
@@ -819,7 +1181,13 @@ fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
                     }
                 }
                 Ok(CtEvent::Resize(w, h)) => {
-                    if tx.send(AppEvent::Resize { width: w, height: h }).is_err() {
+                    if tx
+                        .send(AppEvent::Resize {
+                            width: w,
+                            height: h,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -856,11 +1224,7 @@ fn spawn_load_subscriptions(auth: AzureAuth, tx: UnboundedSender<AppEvent>) {
     });
 }
 
-fn spawn_load_resources(
-    auth: AzureAuth,
-    sub_ids: Vec<String>,
-    tx: UnboundedSender<AppEvent>,
-) {
+fn spawn_load_resources(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = crate::azure::resources::list(&auth, &sub_ids)
             .await
@@ -880,7 +1244,10 @@ fn spawn_load_metrics(
         let result = crate::azure::metrics::fetch(&auth, &resource, range)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::MetricsLoaded { resource_id, result });
+        let _ = tx.send(AppEvent::MetricsLoaded {
+            resource_id,
+            result,
+        });
     });
 }
 
@@ -897,8 +1264,7 @@ fn spawn_missing_list_metrics(
         .resources
         .iter()
         .filter(|r| {
-            !state.metrics.by_resource.contains_key(&r.id)
-                && !state.metrics.pending.contains(&r.id)
+            !state.metrics.by_resource.contains_key(&r.id) && !state.metrics.pending.contains(&r.id)
         })
         .cloned()
         .collect();
@@ -908,16 +1274,15 @@ fn spawn_missing_list_metrics(
     }
 }
 
-fn spawn_load_health(
-    auth: AzureAuth,
-    resource_id: String,
-    tx: UnboundedSender<AppEvent>,
-) {
+fn spawn_load_health(auth: AzureAuth, resource_id: String, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         let result = crate::azure::resource_health::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::HealthLoaded { resource_id, result });
+        let _ = tx.send(AppEvent::HealthLoaded {
+            resource_id,
+            result,
+        });
     });
 }
 
@@ -932,8 +1297,7 @@ fn spawn_missing_list_health(
         .resources
         .iter()
         .filter(|r| {
-            !state.health.by_resource.contains_key(&r.id)
-                && !state.health.pending.contains(&r.id)
+            !state.health.by_resource.contains_key(&r.id) && !state.health.pending.contains(&r.id)
         })
         .map(|r| r.id.clone())
         .collect();
@@ -955,7 +1319,10 @@ fn spawn_load_logs(
         let result = crate::azure::logs::fetch(&auth, &resource, range, errors_only)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::LogsLoaded { resource_id, result });
+        let _ = tx.send(AppEvent::LogsLoaded {
+            resource_id,
+            result,
+        });
     });
 }
 
@@ -1076,7 +1443,10 @@ mod tests {
             let mut state = fresh_state();
             run_command(&mut state, cmd);
             assert!(state.should_quit, "{cmd} should set should_quit");
-            assert!(state.status_message.is_none(), "{cmd} should not set status");
+            assert!(
+                state.status_message.is_none(),
+                "{cmd} should not set status"
+            );
         }
     }
 
@@ -1153,7 +1523,10 @@ mod tests {
         state.resources = vec![resource];
 
         // Forward: List -> Detail
-        assert!(crate::ui::views::list::handle(Action::OpenSelected, &mut state));
+        assert!(crate::ui::views::list::handle(
+            Action::OpenSelected,
+            &mut state
+        ));
         assert_eq!(state.view, View::Detail);
         assert_eq!(state.view_stack, vec![View::Subscriptions, View::List]);
 
@@ -1346,7 +1719,10 @@ mod tests {
         }];
         state.list_cursor = 0;
         state.view = View::Logs;
-        let ts = Utc.with_ymd_and_hms(2026, 5, 10, 12, 0, 0).single().unwrap();
+        let ts = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .unwrap();
         state.logs.by_resource.insert(
             "/r/one".into(),
             vec![LogLine {

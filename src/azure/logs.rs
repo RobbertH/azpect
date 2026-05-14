@@ -113,7 +113,10 @@ fn build_kql(kind: ResourceKind, errors_only: bool) -> anyhow::Result<String> {
     }
 }
 
-fn parse_logs_response(value: &serde_json::Value, kind: ResourceKind) -> anyhow::Result<Vec<LogLine>> {
+fn parse_logs_response(
+    value: &serde_json::Value,
+    kind: ResourceKind,
+) -> anyhow::Result<Vec<LogLine>> {
     let table = value
         .get("tables")
         .and_then(|t| t.as_array())
@@ -160,13 +163,22 @@ fn parse_logs_response(value: &serde_json::Value, kind: ResourceKind) -> anyhow:
     Ok(out)
 }
 
-fn cell<'a>(columns: &[&str], cells: &'a [serde_json::Value], name: &str) -> Option<&'a serde_json::Value> {
-    columns.iter().position(|c| *c == name).and_then(|i| cells.get(i))
+fn cell<'a>(
+    columns: &[&str],
+    cells: &'a [serde_json::Value],
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    columns
+        .iter()
+        .position(|c| *c == name)
+        .and_then(|i| cells.get(i))
 }
 
 fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) -> Option<LogLine> {
     let ts_str = cell(columns, cells, "TimeGenerated").and_then(|v| v.as_str())?;
-    let ts = DateTime::parse_from_rfc3339(ts_str).ok()?.with_timezone(&Utc);
+    let ts = DateTime::parse_from_rfc3339(ts_str)
+        .ok()?
+        .with_timezone(&Utc);
 
     let (level, source, message) = match kind {
         ResourceKind::FunctionApp => parse_function_app_row(columns, cells),
@@ -184,7 +196,10 @@ fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) 
     })
 }
 
-fn parse_function_app_row(columns: &[&str], cells: &[serde_json::Value]) -> (LogLevel, String, String) {
+fn parse_function_app_row(
+    columns: &[&str],
+    cells: &[serde_json::Value],
+) -> (LogLevel, String, String) {
     let item_type = cell(columns, cells, "itemType")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -233,7 +248,10 @@ fn parse_function_app_row(columns: &[&str], cells: &[serde_json::Value]) -> (Log
     (level, source, message)
 }
 
-fn parse_container_app_row(columns: &[&str], cells: &[serde_json::Value]) -> (LogLevel, String, String) {
+fn parse_container_app_row(
+    columns: &[&str],
+    cells: &[serde_json::Value],
+) -> (LogLevel, String, String) {
     let log = cell(columns, cells, "Log_s")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -243,7 +261,11 @@ fn parse_container_app_row(columns: &[&str], cells: &[serde_json::Value]) -> (Lo
     let is_error = ["error", "exception", "fatal", "panic"]
         .iter()
         .any(|kw| lower.contains(kw));
-    let level = if is_error { LogLevel::Error } else { LogLevel::Info };
+    let level = if is_error {
+        LogLevel::Error
+    } else {
+        LogLevel::Info
+    };
 
     let source = "ContainerAppConsoleLogs_CL".to_string();
     (level, source, log)
@@ -302,7 +324,10 @@ mod tests {
     fn missing_tables_yields_no_log_destination() {
         let payload = json!({});
         let err = parse_logs_response(&payload, ResourceKind::FunctionApp).unwrap_err();
-        assert!(err.downcast_ref::<AzpectError>().map(|e| matches!(e, AzpectError::NoLogDestination)).unwrap_or(false));
+        assert!(err
+            .downcast_ref::<AzpectError>()
+            .map(|e| matches!(e, AzpectError::NoLogDestination))
+            .unwrap_or(false));
     }
 
     #[test]

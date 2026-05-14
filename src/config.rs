@@ -169,7 +169,10 @@ mod tests {
     #[test]
     fn config_path_is_under_azpect_directory() {
         let path = config_path().expect("resolve config path");
-        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("config.toml"));
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("config.toml")
+        );
         let dir = path
             .parent()
             .and_then(|p| p.file_name())

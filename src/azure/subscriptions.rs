@@ -30,12 +30,13 @@ pub async fn list(auth: &AzureAuth) -> anyhow::Result<Vec<Subscription>> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("subscriptions response missing 'value' array"))?;
 
-    let mut subs: Vec<Subscription> = value
-        .iter()
-        .filter_map(parse_subscription)
-        .collect();
+    let mut subs: Vec<Subscription> = value.iter().filter_map(parse_subscription).collect();
 
-    subs.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    subs.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
     Ok(subs)
 }
 
@@ -94,7 +95,11 @@ mod tests {
             .iter()
             .filter_map(parse_subscription)
             .collect();
-        subs.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+        subs.sort_by(|a, b| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        });
 
         assert_eq!(subs.len(), 2);
         assert_eq!(subs[0].display_name, "alpha");

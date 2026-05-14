@@ -23,6 +23,36 @@ pub enum View {
     Help,
 }
 
+/// Modal overlay for in-app `az login`. Hidden by default; surfaced when the
+/// subscription list comes back empty or with an auth-shaped error so the user
+/// can re-authenticate without leaving the TUI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum AuthPrompt {
+    #[default]
+    Hidden,
+    Menu,
+    /// Tenant-id capture step — invoked from `Menu` via `T`. On Enter we go
+    /// back to `Menu` with the tenant pre-filled in `auth_tenant`.
+    TenantInput,
+}
+
+/// Which option is focused in the auth menu. Drives both highlight and Enter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum AuthMenuFocus {
+    #[default]
+    Browser,
+    DeviceCode,
+    Tenant,
+}
+
+/// Captured intent to run `az login`. The event loop drains this between
+/// frames, suspends the TUI, runs `az login`, then clears the slot.
+#[derive(Clone, Debug)]
+pub struct PendingLogin {
+    pub tenant: Option<String>,
+    pub use_device_code: bool,
+}
+
 /// Per-resource cached metrics. The detail view reads these; the loader writes
 /// them when a `MetricsReady` event arrives.
 #[derive(Clone, Default)]
@@ -112,6 +142,23 @@ pub struct AppState {
     /// rather than dispatched as actions; Esc cancels, Enter executes.
     pub command_active: bool,
     pub command_input: Input,
+
+    /// In-app `az login` modal state. See [`AuthPrompt`].
+    pub auth_prompt: AuthPrompt,
+    /// Currently-focused option inside the auth menu.
+    pub auth_menu_focus: AuthMenuFocus,
+    /// Tenant-id buffer captured via the `T` step. `None` ⇒ use the
+    /// signed-in account's default tenant.
+    pub auth_tenant: Option<String>,
+    /// Working buffer while the user is typing in the tenant input.
+    pub auth_tenant_input: Input,
+    /// Last error from a finished `az login` attempt, if any. Rendered inside
+    /// the menu so the user knows why the previous try failed.
+    pub auth_last_error: Option<String>,
+    /// Set to `Some` by the modal handler when the user confirms a login.
+    /// The event loop takes ownership, suspends the TUI, runs `az login`,
+    /// clears the auth cache, and triggers a subscriptions reload.
+    pub pending_login: Option<PendingLogin>,
 }
 
 impl AppState {
@@ -130,15 +177,27 @@ impl AppState {
             list_filter_active: false,
             favorites_only: false,
             loading_resources: false,
-            metrics: MetricsCache { range, ..Default::default() },
+            metrics: MetricsCache {
+                range,
+                ..Default::default()
+            },
             health: HealthCache::default(),
-            logs: LogsCache { range, ..Default::default() },
+            logs: LogsCache {
+                range,
+                ..Default::default()
+            },
             status_message: None,
             should_quit: false,
             quit_confirm: false,
             quit_confirm_yes: false,
             command_active: false,
             command_input: Input::default(),
+            auth_prompt: AuthPrompt::Hidden,
+            auth_menu_focus: AuthMenuFocus::Browser,
+            auth_tenant: None,
+            auth_tenant_input: Input::default(),
+            auth_last_error: None,
+            pending_login: None,
             config,
         }
     }

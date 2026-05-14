@@ -39,10 +39,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let title = Paragraph::new(Line::from(vec![
         Span::styled(
             " detail ",
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            selected.map(|r| r.name.as_str()).unwrap_or("(no selection)"),
+            selected
+                .map(|r| r.name.as_str())
+                .unwrap_or("(no selection)"),
             Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -86,7 +90,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             .map(|s| format!("state: {s}"))
             .unwrap_or_else(|| "state: unknown".to_string()),
     };
-    let second_line_color = if failure.is_some() { theme.critical } else { theme.muted };
+    let second_line_color = if failure.is_some() {
+        theme.critical
+    } else {
+        theme.muted
+    };
 
     // Reserve enough rows for the header line + however many rows the second
     // line needs after wrapping at the available width. Without this, long
@@ -118,7 +126,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.fg),
             ),
             Span::styled(
-                if state.metrics.loading { "  · refreshing…" } else { "" },
+                if state.metrics.loading {
+                    "  · refreshing…"
+                } else {
+                    ""
+                },
                 Style::default().fg(theme.muted),
             ),
         ]),
@@ -268,6 +280,7 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(p, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_metric_row(
     frame: &mut Frame,
     area: Rect,
@@ -630,7 +643,11 @@ mod tests {
         // leaving Detail caused the next Esc to bounce right back in.
         let mut state = fixture_no_metrics();
         assert!(!handle(Action::Back, &mut state));
-        assert_eq!(state.view, View::Detail, "view-local handler must not transition on Back");
+        assert_eq!(
+            state.view,
+            View::Detail,
+            "view-local handler must not transition on Back"
+        );
     }
 
     #[test]

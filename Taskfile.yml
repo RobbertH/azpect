@@ -1,0 +1,90 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  check:
+    desc: fmt + clippy + test (what CI runs)
+    cmds:
+      - cargo fmt --all -- --check
+      - cargo clippy --all-targets --all-features -- -D warnings
+      - cargo test --locked
+
+  build:
+    desc: Release build
+    cmds:
+      - cargo build --release --locked
+
+  release-minor:
+    desc: Bump the minor version (X.Y.Z -> X.(Y+1).0) and release.
+    cmds:
+      - cmd: |
+          CURRENT=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          BASE="${CURRENT%%-*}"
+          IFS='.' read -r MAJOR MINOR _PATCH <<< "$BASE"
+          NEW="${MAJOR}.$((MINOR + 1)).0"
+          echo "current: $CURRENT  ->  new: $NEW"
+          exec task release -- "$NEW"
+
+  release:
+    desc: 'Cut a new release. Usage: task release -- 0.2.0  (or 0.2.0-rc1 for prerelease)'
+    cmds:
+      - cmd: |
+          VERSION="{{.CLI_ARGS}}"
+
+          if [ -z "$VERSION" ]; then
+              echo "error: pass a version. Example: task release -- 0.2.0" >&2
+              exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+              echo "error: version '$VERSION' is not in X.Y.Z[-pre] form" >&2
+              exit 1
+          fi
+
+          BRANCH=$(git symbolic-ref --short HEAD)
+          if [ "$BRANCH" != "main" ]; then
+              echo "error: must be on main (currently on $BRANCH)" >&2
+              exit 1
+          fi
+          if ! git diff-index --quiet HEAD --; then
+              echo "error: working tree is dirty — commit or stash first" >&2
+              exit 1
+          fi
+
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+              echo "error: local main is not in sync with origin/main" >&2
+              exit 1
+          fi
+
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+              echo "error: tag v$VERSION already exists" >&2
+              exit 1
+          fi
+
+          task check
+
+          sed -i.bak -E "s/^version = \"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+          rm Cargo.toml.bak
+          cargo update -p azpect
+
+          git --no-pager diff Cargo.toml Cargo.lock
+          echo
+          read -r -p "Tag v$VERSION and push? [y/N] " ANSWER
+          if [[ "$ANSWER" != "y" && "$ANSWER" != "Y" ]]; then
+              echo "aborted; reverting Cargo.toml and Cargo.lock"
+              git checkout -- Cargo.toml Cargo.lock
+              exit 1
+          fi
+
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: release v$VERSION"
+          git tag "v$VERSION"
+          git push origin main "v$VERSION"
+
+          echo
+          echo "pushed v$VERSION — GitHub Actions takes over from here."
+          echo "watch: gh run watch --repo RobbertH/azpect"

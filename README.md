@@ -60,6 +60,17 @@ or chords avoid clobbering cursor movement.
 | `?`                  | Help overlay                                   |
 | `q` / `Esc`          | Back / quit                                    |
 
+## Releasing
+
+1. Bump `version` in `Cargo.toml`.
+2. `cargo update -p azpect` to refresh `Cargo.lock`.
+3. Commit on `main` (e.g. `chore: release vX.Y.Z`).
+4. `git tag vX.Y.Z && git push --tags` — the GitHub Actions release workflow
+   builds Linux x86_64 and macOS (aarch64 + x86_64) archives, creates a
+   GitHub Release, and publishes to crates.io.
+
+Tags containing a hyphen (e.g. `v0.2.0-rc1`) are marked as prereleases.
+
 ## License
 
 MIT OR Apache-2.0.

@@ -38,16 +38,16 @@ impl Theme {
     pub fn catppuccin_mocha() -> Theme {
         Theme {
             bg: Color::Reset,
-            fg: Color::Rgb(0xcd, 0xd6, 0xf4),       // text
-            muted: Color::Rgb(0x6c, 0x70, 0x86),    // overlay0
-            accent: Color::Rgb(0xcb, 0xa6, 0xf7),   // mauve
-            favorite: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
-            healthy: Color::Rgb(0xa6, 0xe3, 0xa1),  // green
-            idle: Color::Rgb(0x89, 0xb4, 0xfa),     // blue
-            degraded: Color::Rgb(0xf9, 0xe2, 0xaf), // yellow
-            critical: Color::Rgb(0xf3, 0x8b, 0xa8), // red
-            unknown: Color::Rgb(0x6c, 0x70, 0x86),  // overlay0
-            border: Color::Rgb(0x45, 0x47, 0x5a),   // surface1
+            fg: Color::Rgb(0xcd, 0xd6, 0xf4),           // text
+            muted: Color::Rgb(0x6c, 0x70, 0x86),        // overlay0
+            accent: Color::Rgb(0xcb, 0xa6, 0xf7),       // mauve
+            favorite: Color::Rgb(0xf9, 0xe2, 0xaf),     // yellow
+            healthy: Color::Rgb(0xa6, 0xe3, 0xa1),      // green
+            idle: Color::Rgb(0x89, 0xb4, 0xfa),         // blue
+            degraded: Color::Rgb(0xf9, 0xe2, 0xaf),     // yellow
+            critical: Color::Rgb(0xf3, 0x8b, 0xa8),     // red
+            unknown: Color::Rgb(0x6c, 0x70, 0x86),      // overlay0
+            border: Color::Rgb(0x45, 0x47, 0x5a),       // surface1
             selection_bg: Color::Rgb(0x31, 0x32, 0x44), // surface0
         }
     }
@@ -57,16 +57,16 @@ impl Theme {
     pub fn catppuccin_latte() -> Theme {
         Theme {
             bg: Color::Reset,
-            fg: Color::Rgb(0x4c, 0x4f, 0x69),       // text
-            muted: Color::Rgb(0x9c, 0xa0, 0xb0),    // overlay0
-            accent: Color::Rgb(0x88, 0x39, 0xef),   // mauve
-            favorite: Color::Rgb(0xdf, 0x8e, 0x1d), // yellow
-            healthy: Color::Rgb(0x40, 0xa0, 0x2b),  // green
-            idle: Color::Rgb(0x1e, 0x66, 0xf5),     // blue
-            degraded: Color::Rgb(0xdf, 0x8e, 0x1d), // yellow
-            critical: Color::Rgb(0xd2, 0x0f, 0x39), // red
-            unknown: Color::Rgb(0x9c, 0xa0, 0xb0),  // overlay0
-            border: Color::Rgb(0xbc, 0xc0, 0xcc),   // surface1
+            fg: Color::Rgb(0x4c, 0x4f, 0x69),           // text
+            muted: Color::Rgb(0x9c, 0xa0, 0xb0),        // overlay0
+            accent: Color::Rgb(0x88, 0x39, 0xef),       // mauve
+            favorite: Color::Rgb(0xdf, 0x8e, 0x1d),     // yellow
+            healthy: Color::Rgb(0x40, 0xa0, 0x2b),      // green
+            idle: Color::Rgb(0x1e, 0x66, 0xf5),         // blue
+            degraded: Color::Rgb(0xdf, 0x8e, 0x1d),     // yellow
+            critical: Color::Rgb(0xd2, 0x0f, 0x39),     // red
+            unknown: Color::Rgb(0x9c, 0xa0, 0xb0),      // overlay0
+            border: Color::Rgb(0xbc, 0xc0, 0xcc),       // surface1
             selection_bg: Color::Rgb(0xcc, 0xd0, 0xda), // surface0
         }
     }
@@ -109,6 +109,8 @@ impl Theme {
     }
 
     pub fn selection(&self) -> Style {
-        Style::default().bg(self.selection_bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(self.selection_bg)
+            .add_modifier(Modifier::BOLD)
     }
 }

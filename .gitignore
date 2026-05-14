@@ -2,3 +2,4 @@
 /.worktrees
 **/*.rs.bk
 Cargo.lock.bak
+*.tar.gz

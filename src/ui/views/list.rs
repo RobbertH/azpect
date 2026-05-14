@@ -38,7 +38,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Header line with mode chips.
     let mut header_spans = vec![Span::styled(
         " APIs ",
-        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
     )];
     if state.favorites_only {
         header_spans.push(Span::styled(

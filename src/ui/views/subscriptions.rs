@@ -24,7 +24,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     // Header
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" subscriptions ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " subscriptions ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("· {}", state.subscriptions.len()),
             Style::default().fg(theme.muted),

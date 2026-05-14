@@ -325,13 +325,7 @@ mod tests {
 
     #[test]
     fn help_view_dismisses_on_any_key() {
-        assert_eq!(
-            key_to_action(key('x'), View::Help, false),
-            Action::Back
-        );
-        assert_eq!(
-            key_to_action(key('?'), View::Help, false),
-            Action::Back
-        );
+        assert_eq!(key_to_action(key('x'), View::Help, false), Action::Back);
+        assert_eq!(key_to_action(key('?'), View::Help, false), Action::Back);
     }
 }
