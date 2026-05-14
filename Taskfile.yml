@@ -29,6 +29,17 @@ tasks:
           echo "current: $CURRENT  ->  new: $NEW"
           exec task release -- "$NEW"
 
+  release-patch:
+    desc: Bump the patch version (X.Y.Z -> X.Y.(Z+1)) and release.
+    cmds:
+      - cmd: |
+          CURRENT=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          BASE="${CURRENT%%-*}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+          NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "current: $CURRENT  ->  new: $NEW"
+          exec task release -- "$NEW"
+
   release:
     desc: 'Cut a new release. Usage: task release -- 0.2.0  (or 0.2.0-rc1 for prerelease)'
     cmds:
