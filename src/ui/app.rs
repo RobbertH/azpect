@@ -185,7 +185,16 @@ async fn event_loop(
 
         match event {
             AppEvent::Tick => {
-                input.maybe_expire(Instant::now());
+                let now = Instant::now();
+                input.maybe_expire(now);
+                // Auto-clear the bottom status hint once its deadline passes
+                // so transient messages ("copied 245 bytes…") don't stick.
+                if let Some(deadline) = state.status_message_until {
+                    if now >= deadline {
+                        state.status_message = None;
+                        state.status_message_until = None;
+                    }
+                }
             }
             AppEvent::Resize { .. } => {
                 // ratatui re-measures on next draw. Nothing to do.
@@ -309,7 +318,7 @@ async fn event_loop(
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        state.status_message = Some(format!("subscriptions: {msg}"));
+                        state.set_status(format!("subscriptions: {msg}"));
                         // Same treatment for outright failures: the chain may
                         // simply have no usable credential.
                         if state.view == View::Subscriptions
@@ -338,7 +347,7 @@ async fn event_loop(
                         spawn_missing_list_metrics(state, auth, tx);
                         spawn_missing_list_health(state, auth, tx);
                     }
-                    Err(e) => state.status_message = Some(format!("resources: {e}")),
+                    Err(e) => state.set_status(format!("resources: {e}")),
                 }
             }
             AppEvent::MetricsLoaded {
@@ -468,7 +477,7 @@ async fn run_pending_login(
             state.loading_subscriptions = true;
             state.subscriptions.clear();
             spawn_load_subscriptions(auth.clone(), tx.clone());
-            state.status_message = Some("logged in via az".to_string());
+            state.set_status("logged in via az");
         }
         Err(e) => {
             // Stay on the menu so the user can retry / pick a different mode.
@@ -513,7 +522,7 @@ fn run_command(state: &mut AppState, cmd: &str) {
         "q" | "quit" | "qa" | "qa!" | "quitall" => state.should_quit = true,
         "" => {} // empty: silently ignore
         other => {
-            state.status_message = Some(format!("unknown command: :{other}"));
+            state.set_status(format!("unknown command: :{other}"));
         }
     }
 }
@@ -613,15 +622,15 @@ fn global_handle(
 fn do_yank(state: &mut AppState) {
     let target = yank_target(state);
     let Some(text) = target else {
-        state.status_message = Some("nothing to copy".to_string());
+        state.set_status("nothing to copy");
         return;
     };
     match crate::ui::clipboard::copy(&text) {
         Ok(n) => {
-            state.status_message = Some(format!("copied {n} bytes to clipboard"));
+            state.set_status(format!("copied {n} bytes to clipboard"));
         }
         Err(e) => {
-            state.status_message = Some(format!("clipboard write failed: {e}"));
+            state.set_status(format!("clipboard write failed: {e}"));
         }
     }
 }
@@ -630,12 +639,12 @@ fn do_yank(state: &mut AppState) {
 /// system default browser. Posts a status hint on success or failure.
 fn do_open_in_browser(state: &mut AppState) {
     let Some(url) = portal_url_for(state) else {
-        state.status_message = Some("nothing to open".to_string());
+        state.set_status("nothing to open");
         return;
     };
     match open::that_detached(&url) {
-        Ok(()) => state.status_message = Some(format!("opened {url}")),
-        Err(e) => state.status_message = Some(format!("failed to open browser: {e}")),
+        Ok(()) => state.set_status(format!("opened {url}")),
+        Err(e) => state.set_status(format!("failed to open browser: {e}")),
     }
 }
 
@@ -823,25 +832,25 @@ fn kick_off_loads_for_view(
 }
 
 fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
-    // When the command palette is active, reserve the bottom row for the bar
-    // and render the underlying view into the area above it.
-    let (view_area, command_area) = if state.command_active && area.height > 0 {
-        let view_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: area.height - 1,
-        };
-        let command_area = Rect {
-            x: area.x,
-            y: area.y + area.height - 1,
-            width: area.width,
-            height: 1,
-        };
-        (view_area, Some(command_area))
+    // Reserve bottom rows for, in order from the bottom up: the command bar
+    // (when active) and the status hint (whenever `status_message` is set).
+    // Both shrink the view area so the underlying view never overlaps them.
+    let mut remaining = area;
+    let command_area = if state.command_active && remaining.height > 0 {
+        let (above, row) = split_off_bottom_row(remaining);
+        remaining = above;
+        Some(row)
     } else {
-        (area, None)
+        None
     };
+    let status_area = if state.status_message.is_some() && remaining.height > 0 {
+        let (above, row) = split_off_bottom_row(remaining);
+        remaining = above;
+        Some(row)
+    } else {
+        None
+    };
+    let view_area = remaining;
 
     match state.view {
         View::Subscriptions => crate::ui::views::subscriptions::render(f, view_area, state, theme),
@@ -862,9 +871,49 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         render_auth_modal(f, area, state, theme);
     }
 
+    if let Some(sa) = status_area {
+        render_status_row(f, sa, state, theme);
+    }
     if let Some(ca) = command_area {
         render_command_bar(f, ca, state, theme);
     }
+}
+
+/// Split a single-row strip off the bottom of `area`, returning the area
+/// above and the row itself. Assumes `area.height >= 1`.
+fn split_off_bottom_row(area: Rect) -> (Rect, Rect) {
+    let row = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    let above = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height - 1,
+    };
+    (above, row)
+}
+
+/// Render the auto-expiring bottom-row status hint (set via
+/// [`AppState::set_status`]). Caller has already confirmed
+/// `state.status_message.is_some()`.
+fn render_status_row(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    let Some(msg) = state.status_message.as_deref() else {
+        return;
+    };
+    let p = Paragraph::new(Line::from(Span::styled(
+        format!(" {msg} "),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(p, area);
 }
 
 /// Render a centered "Are you sure you want to quit?" modal with focusable
@@ -1775,5 +1824,67 @@ mod tests {
         assert!(yanked.contains("AppExceptions"));
         assert!(yanked.contains("kaboom"));
         assert!(yanked.contains("2026-05-10T12:00:00Z"));
+    }
+
+    #[test]
+    fn yank_in_log_detail_returns_full_record_with_fields() {
+        use crate::azure::logs::{LogLevel, LogLine};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{TimeZone, Utc};
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/one".into(),
+            name: "alpha-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+        }];
+        state.list_cursor = 0;
+        state.view = View::LogDetail;
+        let ts = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .unwrap();
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![LogLine {
+                ts,
+                level: LogLevel::Error,
+                source: "FunctionAppLogs/http_app_func".into(),
+                message: "Executed (Failed, Id=abc)".into(),
+                fields: vec![
+                    ("FunctionInvocationId".into(), "abc-123".into()),
+                    ("OperationId".into(), "op-456".into()),
+                ],
+            }],
+        );
+
+        let yanked = yank_target(&state).expect("log detail should yield text");
+        assert!(yanked.contains("Executed (Failed, Id=abc)"));
+        assert!(yanked.contains("FunctionInvocationId: abc-123"));
+        assert!(yanked.contains("OperationId: op-456"));
+    }
+
+    #[test]
+    fn portal_url_in_log_detail_points_to_resource_blade() {
+        use crate::azure::resources::{Resource, ResourceKind};
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Web/sites/alpha".into(),
+            name: "alpha".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "X".into(),
+            state: Some("Running".into()),
+        }];
+        state.list_cursor = 0;
+        state.view = View::LogDetail;
+        let url = portal_url_for(&state).expect("log detail should yield a portal URL");
+        assert!(url.contains("portal.azure.com"));
+        assert!(url.contains("/sites/alpha"));
     }
 }

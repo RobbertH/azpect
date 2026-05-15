@@ -478,8 +478,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.view_stack.push(state.view);
                 state.view = View::Logs;
             } else {
-                state.status_message =
-                    Some("logs are not supported for this resource type".to_string());
+                state.set_status("logs are not supported for this resource type");
             }
             true
         }

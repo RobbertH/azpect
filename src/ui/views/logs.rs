@@ -154,11 +154,10 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
         .map(|(off, l)| {
             let i = start + off;
             let selected = i == cursor;
-            let ts = l
-                .ts
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string();
+            let ts =
+                l.ts.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string();
             let (lvl_text, lvl_color) = level_cell(l, theme);
             let (source_text, source_lines) = cell_text(&l.source, source_w, wrap, theme.accent);
             let (message_text, message_lines) = cell_text(&l.message, msg_w, wrap, theme.fg);
@@ -791,12 +790,20 @@ mod tests {
         let long = "Executed Functions.http_app_func (Failed, Id=385960) ".repeat(2);
         state.logs.by_resource.insert(
             "/r/one".into(),
-            vec![line(1, LogLevel::Error, "FunctionAppLogs/FunctionAppLogs", &long)],
+            vec![line(
+                1,
+                LogLevel::Error,
+                "FunctionAppLogs/FunctionAppLogs",
+                &long,
+            )],
         );
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         // The end of the second copy should be visible after wrapping, which
         // it would not be when the row is truncated to a single line.
-        assert!(s.contains("Id=385960"), "expected wrapped content, got:\n{s}");
+        assert!(
+            s.contains("Id=385960"),
+            "expected wrapped content, got:\n{s}"
+        );
     }
 }

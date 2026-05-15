@@ -15,7 +15,7 @@ use crate::ui::events::Action;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k scroll  y yank  Esc back  q quit";
+const FOOTER_HINT: &str = "j/k scroll  y yank  o open in portal  Esc back  q quit";
 const HALF_PAGE: u16 = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -52,7 +52,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if let Some(line) = selected_line(state) {
         let body = build_body(line, theme);
-        let scroll = state.logs.detail_scroll;
+        // Clamp scroll to keep the last logical row aligned with the bottom of
+        // the panel. ratatui 0.29's Paragraph overflows when `scroll.0 +
+        // area.height` exceeds u16::MAX (paragraph.rs:483), so we must cap
+        // detail_scroll at a sane value before passing it in. `body.len()` is
+        // an unwrapped lower bound on wrapped line count; using it as the
+        // ceiling lets the user scroll a little past the content but never
+        // anywhere near u16::MAX.
+        let total = body.len() as u16;
+        let max_scroll = total.saturating_sub(inner.height.max(1).saturating_sub(1));
+        let scroll = state.logs.detail_scroll.min(max_scroll);
         let p = Paragraph::new(body)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
@@ -179,10 +188,7 @@ fn push_field(out: &mut Vec<Line<'static>>, key: &str, value: &str, label_w: usi
 /// every column we kept.
 pub fn yank_text(line: &LogLine) -> String {
     let mut s = String::new();
-    s.push_str(&format!(
-        "time: {}\n",
-        line.ts.format("%Y-%m-%dT%H:%M:%SZ")
-    ));
+    s.push_str(&format!("time: {}\n", line.ts.format("%Y-%m-%dT%H:%M:%SZ")));
     s.push_str(&format!("level: {:?}\n", line.level));
     s.push_str(&format!("source: {}\n", line.source));
     s.push_str(&format!("message: {}\n", line.message));
@@ -192,8 +198,14 @@ pub fn yank_text(line: &LogLine) -> String {
     s
 }
 
+/// Sentinel "go to bottom" value. Must be small enough that
+/// `scroll + terminal_height` does not overflow u16 (ratatui 0.29's Paragraph
+/// adds them without saturation), and large enough to exceed any realistic
+/// log-detail body. A log row's body is at most a few hundred lines even with
+/// long stack traces, so 10_000 leaves comfortable headroom on both sides.
+const GOTO_BOTTOM_SENTINEL: u16 = 10_000;
+
 pub fn handle(action: Action, state: &mut AppState) -> bool {
-    let max_scroll = u16::MAX;
     match action {
         Action::MoveDown => {
             state.logs.detail_scroll = state.logs.detail_scroll.saturating_add(1);
@@ -216,10 +228,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::GotoBottom => {
-            // Real bottom depends on wrapped line count which we don't know
-            // without recomputing layout; saturate to a very large value and
-            // ratatui will clamp the visible scroll to the last full row.
-            state.logs.detail_scroll = max_scroll;
+            // Render clamps this to the actual content height so the bottom
+            // row aligns with the bottom of the panel.
+            state.logs.detail_scroll = GOTO_BOTTOM_SENTINEL;
             true
         }
         _ => false,
@@ -262,7 +273,10 @@ mod tests {
             fields: vec![
                 ("FunctionInvocationId".into(), "abc-123".into()),
                 ("OperationId".into(), "op-456".into()),
-                ("ExceptionDetails".into(), "stack line 1\nstack line 2".into()),
+                (
+                    "ExceptionDetails".into(),
+                    "stack line 1\nstack line 2".into(),
+                ),
             ],
         }
     }
@@ -301,6 +315,25 @@ mod tests {
         assert!(t.contains("source: FunctionAppLogs/http_app_func"));
         assert!(t.contains("FunctionInvocationId: abc-123"));
         assert!(t.contains("OperationId: op-456"));
+    }
+
+    #[test]
+    fn render_survives_goto_bottom_sentinel() {
+        // Regression: capital G used to set detail_scroll to u16::MAX, which
+        // overflowed ratatui 0.29's Paragraph (paragraph.rs:483 does scroll +
+        // area.height without saturation) and crashed the binary. The render
+        // path must clamp scroll to the content length.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.logs.by_resource.insert("/r/one".into(), vec![line()]);
+        // Both the sentinel value and the historical overflow value must be
+        // safe to render.
+        for s in [GOTO_BOTTOM_SENTINEL, u16::MAX] {
+            state.logs.detail_scroll = s;
+            term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        }
     }
 
     #[test]

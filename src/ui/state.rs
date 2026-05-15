@@ -133,6 +133,11 @@ pub struct AppState {
     pub logs: LogsCache,
 
     pub status_message: Option<String>,
+    /// When set, the status bar auto-clears at this point in time. The event
+    /// loop's tick handler is responsible for the clearing — see the `Tick`
+    /// arm in `app.rs`. Stored as `std::time::Instant` so the field doesn't
+    /// take a Serialize bound for the rest of the struct.
+    pub status_message_until: Option<std::time::Instant>,
     pub should_quit: bool,
 
     /// Modal flag: when true, a "Are you sure you want to quit?" overlay is
@@ -195,6 +200,7 @@ impl AppState {
                 ..Default::default()
             },
             status_message: None,
+            status_message_until: None,
             should_quit: false,
             quit_confirm: false,
             quit_confirm_yes: false,
@@ -214,6 +220,15 @@ impl AppState {
     pub fn selected_resource(&self) -> Option<&Resource> {
         // Lane 3/4 will likely want a filtered iterator helper; this naive impl is a placeholder.
         self.filtered_resources().get(self.list_cursor).copied()
+    }
+
+    /// Set the bottom-row status hint with the standard auto-clear window.
+    /// Use this instead of writing to `status_message` directly so the message
+    /// gets a deadline (currently 4 seconds) the tick handler can act on.
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_message_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
     }
 
     /// Apply `list_filter` + `favorites_only` to `resources`.

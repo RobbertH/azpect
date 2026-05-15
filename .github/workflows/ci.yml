@@ -48,9 +48,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          key: ${{ matrix.os }}
+          toolchain: stable
+          cache-key: ${{ matrix.os }}
       - run: cargo build --verbose --locked
       - run: cargo test --verbose --locked
