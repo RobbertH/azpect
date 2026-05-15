@@ -32,6 +32,12 @@ pub struct LogLine {
     /// `ContainerAppConsoleLogs_CL`.
     pub source: String,
     pub message: String,
+    /// Every (column, value) pair from the originating Log Analytics row.
+    /// Preserves response order so the log-detail view can render columns
+    /// in a stable, predictable layout. Empty values are dropped at parse
+    /// time to avoid cluttering the detail view with blank entries.
+    #[serde(default)]
+    pub fields: Vec<(String, String)>,
 }
 
 /// Whether we know how to query logs for this resource type. APIM is `false` in v1.
@@ -203,13 +209,39 @@ fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) 
     };
 
     let message = truncate(message, MESSAGE_TRUNCATE);
+    let fields = collect_fields(columns, cells);
 
     Some(LogLine {
         ts,
         level,
         source,
         message,
+        fields,
     })
+}
+
+/// Capture every non-empty (column, value) pair from the row, skipping the
+/// timestamp column (already exposed as `LogLine::ts`). JSON booleans and
+/// numbers are stringified so the detail view can render them uniformly.
+fn collect_fields(columns: &[&str], cells: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(columns.len());
+    for (name, value) in columns.iter().zip(cells.iter()) {
+        if name.is_empty() || *name == "TimeGenerated" {
+            continue;
+        }
+        let s = match value {
+            serde_json::Value::Null => continue,
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            other => other.to_string(),
+        };
+        if s.trim().is_empty() {
+            continue;
+        }
+        out.push(((*name).to_string(), s));
+    }
+    out
 }
 
 fn parse_function_app_row(

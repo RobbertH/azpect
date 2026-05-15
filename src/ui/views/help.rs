@@ -17,7 +17,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Navigation",
         &[
             ("j / k", "down / up"),
-            ("h / l", "left / right"),
+            ("h", "left"),
             ("g g", "go to top"),
             ("G", "go to bottom"),
             ("Ctrl-d / Ctrl-u", "half page down / up"),
@@ -28,7 +28,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Resources",
         &[
             ("Enter", "open detail"),
-            ("L", "open logs"),
+            ("l", "open logs"),
             ("f", "toggle favorite"),
             ("F", "favorites only"),
             ("/", "search"),
@@ -38,11 +38,12 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Detail / Logs",
         &[
+            ("Enter", "log line detail (logs)"),
             ("1", "window 1d"),
             ("7", "window 7d"),
             ("w", "wrap (logs)"),
             ("e", "errors only (logs)"),
-            ("L", "open logs (detail)"),
+            ("l", "open logs (detail)"),
         ],
     ),
     (

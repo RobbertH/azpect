@@ -573,6 +573,7 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::List => crate::ui::views::list::handle(action, state),
         View::Detail => crate::ui::views::detail::handle(action, state),
         View::Logs => crate::ui::views::logs::handle(action, state),
+        View::LogDetail => crate::ui::views::logs_detail::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -643,7 +644,7 @@ fn do_open_in_browser(state: &mut AppState) {
 fn portal_url_for(state: &AppState) -> Option<String> {
     const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
     match state.view {
-        View::List | View::Detail | View::Logs => state
+        View::List | View::Detail | View::Logs | View::LogDetail => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         View::Subscriptions => state
@@ -660,6 +661,8 @@ fn portal_url_for(state: &AppState) -> Option<String> {
 fn yank_target(state: &AppState) -> Option<String> {
     match state.view {
         View::Logs => yank_from_logs(state),
+        View::LogDetail => crate::ui::views::logs_detail::selected_line(state)
+            .map(crate::ui::views::logs_detail::yank_text),
         View::List | View::Detail => state.selected_resource().map(|r| r.id.clone()),
         View::Subscriptions => state
             .subscriptions
@@ -814,7 +817,8 @@ fn kick_off_loads_for_view(
                 }
             }
         }
-        View::Help => {}
+        // LogDetail is a pure-view-over-state screen; nothing to load.
+        View::LogDetail | View::Help => {}
     }
 }
 
@@ -844,6 +848,7 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::List => crate::ui::views::list::render(f, view_area, state, theme),
         View::Detail => crate::ui::views::detail::render(f, view_area, state, theme),
         View::Logs => crate::ui::views::logs::render(f, view_area, state, theme),
+        View::LogDetail => crate::ui::views::logs_detail::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -1762,6 +1767,7 @@ mod tests {
                 level: LogLevel::Error,
                 source: "AppExceptions".into(),
                 message: "kaboom".into(),
+                fields: Vec::new(),
             }],
         );
 

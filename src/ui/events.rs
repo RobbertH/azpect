@@ -3,10 +3,11 @@
 //!
 //! ## Vim-flavored input model
 //!
-//! Cursor movement uses `h j k l` and chords like `g g`. Single-letter actions
-//! (`L` for logs, `f` favorite, `s` subscription, `r` refresh, `1/7` window,
-//! `w` wrap, `e` errors-only, `q` quit) are **uppercase or distinct from hjkl**
-//! so they never clobber navigation. Lane 3 is responsible for the chord state
+//! Cursor movement uses `h j k` and chords like `g g`. Vertical movement is
+//! the only direction the views use, so `l` is repurposed (k9s-style) to open
+//! the logs view. Single-letter actions (`l` logs, `f` favorite, `s`
+//! subscription, `r` refresh, `1/7` window, `w` wrap, `e` errors-only, `q`
+//! quit) avoid clobbering `j`/`k`. Lane 3 is responsible for the chord state
 //! machine (e.g. tracking the first `g` of `g g`).
 
 #![allow(dead_code, unused_variables)]
@@ -144,7 +145,8 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('h') if !ctrl => Action::MoveLeft,
         KeyCode::Char('j') if !ctrl => Action::MoveDown,
         KeyCode::Char('k') if !ctrl => Action::MoveUp,
-        KeyCode::Char('l') if !ctrl => Action::MoveRight,
+        // `l` is intentionally NOT bound to MoveRight: k9s-style, lowercase `l`
+        // opens the logs view (see the `Char('l')` arm further down).
         KeyCode::Down => Action::MoveDown,
         KeyCode::Up => Action::MoveUp,
         KeyCode::Left => Action::MoveLeft,
@@ -166,7 +168,15 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
 
         KeyCode::Enter => Action::OpenSelected,
 
-        // Action keys (uppercase or distinct from hjkl)
+        // Action keys (uppercase or distinct from hjkl).
+        // Lowercase `l` opens the logs view (k9s-style), but when the user is
+        // *already* inside the logs/log-detail view we fall back to vim-style
+        // MoveRight so the key isn't a no-op there. Uppercase `L` is kept as
+        // a universal alias for muscle memory.
+        KeyCode::Char('l') if !ctrl => match view {
+            View::Logs | View::LogDetail => Action::MoveRight,
+            _ => Action::OpenLogs,
+        },
         KeyCode::Char('L') => Action::OpenLogs,
         KeyCode::Char('e') => Action::ToggleErrorsOnly,
         KeyCode::Char('f') => Action::ToggleFavorite,
@@ -221,12 +231,22 @@ mod tests {
     }
 
     #[test]
-    fn hjkl_maps_to_directions() {
+    fn hjk_maps_to_directions_and_l_opens_logs() {
+        // Lowercase `l` opens logs from non-logs views; inside the logs view
+        // itself it falls back to MoveRight so it isn't a no-op there.
         let v = View::List;
         assert_eq!(key_to_action(key('h'), v, false), Action::MoveLeft);
         assert_eq!(key_to_action(key('j'), v, false), Action::MoveDown);
         assert_eq!(key_to_action(key('k'), v, false), Action::MoveUp);
-        assert_eq!(key_to_action(key('l'), v, false), Action::MoveRight);
+        assert_eq!(key_to_action(key('l'), v, false), Action::OpenLogs);
+        assert_eq!(
+            key_to_action(key('l'), View::Logs, false),
+            Action::MoveRight
+        );
+        assert_eq!(
+            key_to_action(key('l'), View::LogDetail, false),
+            Action::MoveRight
+        );
     }
 
     #[test]
@@ -239,10 +259,11 @@ mod tests {
     }
 
     #[test]
-    fn capital_l_opens_logs_lowercase_l_moves_right() {
+    fn both_cases_of_l_open_logs() {
+        // Lowercase mimics k9s; uppercase is kept as an alias for muscle memory.
         let v = View::Detail;
         assert_eq!(key_to_action(key_shift('L'), v, false), Action::OpenLogs);
-        assert_eq!(key_to_action(key('l'), v, false), Action::MoveRight);
+        assert_eq!(key_to_action(key('l'), v, false), Action::OpenLogs);
     }
 
     #[test]

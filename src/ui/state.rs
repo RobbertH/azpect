@@ -20,6 +20,9 @@ pub enum View {
     List,
     Detail,
     Logs,
+    /// Full-screen detail panel for a single log line. Opened with Enter from
+    /// the logs table; reads `LogsCache::scroll` to pick the line.
+    LogDetail,
     Help,
 }
 
@@ -100,6 +103,8 @@ pub struct LogsCache {
     /// When true, render the source and message columns as multi-line wrapped
     /// text so long values are fully visible (row heights expand). Toggled with `w`.
     pub wrap: bool,
+    /// Vertical scroll offset (in lines) for the log-detail view.
+    pub detail_scroll: u16,
 }
 
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.

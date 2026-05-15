@@ -5,4 +5,5 @@ pub mod detail;
 pub mod help;
 pub mod list;
 pub mod logs;
+pub mod logs_detail;
 pub mod subscriptions;

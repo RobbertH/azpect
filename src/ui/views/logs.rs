@@ -21,7 +21,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  Enter detail  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
 const HALF_PAGE: usize = 10;
 const TIME_COL: u16 = 19;
 const LVL_COL: u16 = 5;
@@ -490,6 +490,16 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.logs.wrap = !state.logs.wrap;
             true
         }
+        Action::OpenSelected => {
+            // Enter opens the per-line detail view. Only meaningful when at
+            // least one log line is rendered.
+            if lines_len > 0 {
+                state.view_stack.push(crate::ui::state::View::Logs);
+                state.view = crate::ui::state::View::LogDetail;
+                state.logs.detail_scroll = 0;
+            }
+            true
+        }
         Action::MoveDown => {
             if lines_len > 0 {
                 state.logs.scroll = (state.logs.scroll + 1).min(lines_len - 1);
@@ -564,6 +574,7 @@ mod tests {
             level,
             source: source.into(),
             message: msg.into(),
+            fields: Vec::new(),
         }
     }
 
