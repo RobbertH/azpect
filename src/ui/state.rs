@@ -97,6 +97,9 @@ pub struct LogsCache {
     /// Scroll offset/cursor inside the logs table.
     /// Kept separate from `AppState::list_cursor` so navigating logs does not corrupt the resource selection in the List view.
     pub scroll: usize,
+    /// When true, render the source and message columns as multi-line wrapped
+    /// text so long values are fully visible (row heights expand). Toggled with `w`.
+    pub wrap: bool,
 }
 
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.

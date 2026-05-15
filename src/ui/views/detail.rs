@@ -16,7 +16,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "d 1d  w 7d  L logs  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str = "1 1d  7 7d  L logs  Esc back  r refresh  ? help  q quit";
 
 const ROW_KINDS: [(MetricKind, &str); 4] = [
     (MetricKind::Traffic, "Requests"),

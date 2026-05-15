@@ -4,10 +4,10 @@
 //! ## Vim-flavored input model
 //!
 //! Cursor movement uses `h j k l` and chords like `g g`. Single-letter actions
-//! (`L` for logs, `f` favorite, `s` subscription, `r` refresh, `d/w` window,
-//! `e` errors-only, `q` quit) are **uppercase or distinct from hjkl** so they
-//! never clobber navigation. Lane 3 is responsible for the chord state machine
-//! (e.g. tracking the first `g` of `g g`).
+//! (`L` for logs, `f` favorite, `s` subscription, `r` refresh, `1/7` window,
+//! `w` wrap, `e` errors-only, `q` quit) are **uppercase or distinct from hjkl**
+//! so they never clobber navigation. Lane 3 is responsible for the chord state
+//! machine (e.g. tracking the first `g` of `g g`).
 
 #![allow(dead_code, unused_variables)]
 
@@ -80,6 +80,9 @@ pub enum Action {
     Refresh,
     SetWindowDay,
     SetWindowWeek,
+    /// Toggle word-wrap in the logs view so long source/message cells render
+    /// as multi-line rows instead of being truncated. Bound to `w`.
+    ToggleWrap,
     Help,
     /// Open the vim/k9s-style command palette (`:`).
     StartCommand,
@@ -171,8 +174,9 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::SwitchSubscription,
         KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Char('d') if !ctrl => Action::SetWindowDay,
-        KeyCode::Char('w') => Action::SetWindowWeek,
+        KeyCode::Char('1') => Action::SetWindowDay,
+        KeyCode::Char('7') => Action::SetWindowWeek,
+        KeyCode::Char('w') => Action::ToggleWrap,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char(':') => Action::StartCommand,
         KeyCode::Char('y') => Action::Yank,
@@ -293,8 +297,10 @@ mod tests {
         let v = View::List;
         assert_eq!(key_to_action(key_ctrl('d'), v, false), Action::HalfPageDown);
         assert_eq!(key_to_action(key_ctrl('u'), v, false), Action::HalfPageUp);
-        // Lowercase `d` without ctrl is the day-window action, not half-page.
-        assert_eq!(key_to_action(key('d'), v, false), Action::SetWindowDay);
+        // Lowercase `d` without ctrl is no longer bound — `1` is the day-window
+        // action now that `w` is repurposed for wrap.
+        assert_eq!(key_to_action(key('d'), v, false), Action::Noop);
+        assert_eq!(key_to_action(key('1'), v, false), Action::SetWindowDay);
     }
 
     #[test]
@@ -312,7 +318,8 @@ mod tests {
             Action::SwitchSubscription
         );
         assert_eq!(key_to_action(key('r'), v, false), Action::Refresh);
-        assert_eq!(key_to_action(key('w'), v, false), Action::SetWindowWeek);
+        assert_eq!(key_to_action(key('7'), v, false), Action::SetWindowWeek);
+        assert_eq!(key_to_action(key('w'), v, false), Action::ToggleWrap);
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
         assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
         assert_eq!(key_to_action(key('q'), v, false), Action::Back);

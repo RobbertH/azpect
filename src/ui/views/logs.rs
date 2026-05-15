@@ -1,11 +1,13 @@
 //! Logs view: scrollable table of recent log lines for the selected resource,
-//! with an errors-only toggle and the same `d/w` window control as the detail view.
+//! with an errors-only toggle, a wrap toggle, and the same `1/7` window
+//! control as the detail view.
 
 #![allow(dead_code, unused_variables)]
 
+use chrono::Offset;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
@@ -18,8 +20,13 @@ use crate::ui::state::AppState;
 use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k scroll  y yank  e errors-only  d 1d  w 7d  Esc back  q quit";
+const FOOTER_HINT: &str =
+    "j/k scroll  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
 const HALF_PAGE: usize = 10;
+const TIME_COL: u16 = 19;
+const LVL_COL: u16 = 5;
+const SOURCE_COL: u16 = 32;
+const COLUMN_SPACING: u16 = 2;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -123,31 +130,48 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppState, theme: &Theme) {
-    let visible = area.height as usize;
-    let scroll = scroll_for(state.logs.scroll, lines.len(), visible);
+    let wrap = state.logs.wrap;
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
 
-    let rows: Vec<Row> = lines
+    // Header is rendered above the data rows by the Table widget, so the
+    // available data rows occupy `area.height - 1` cells of vertical space.
+    let data_height = (area.height as usize).saturating_sub(1).max(1);
+
+    // Width available for the message column after fixed columns and spacing.
+    let used = TIME_COL + LVL_COL + SOURCE_COL + 3 * COLUMN_SPACING;
+    let msg_w = (area.width.saturating_sub(used)).max(20) as usize;
+    let source_w = SOURCE_COL as usize;
+
+    // Pick the slice of rows to render. In non-wrap mode every row is height 1
+    // so this collapses to "as many rows as fit". In wrap mode each row may
+    // span multiple cells; visible_range walks both directions from the cursor
+    // until the cumulative height fills the area.
+    let (start, end) = visible_range(lines, cursor, data_height, wrap, source_w, msg_w);
+
+    let rows: Vec<Row> = lines[start..=end]
         .iter()
         .enumerate()
-        .skip(scroll)
-        .take(visible.max(1))
-        .map(|(i, l)| {
+        .map(|(off, l)| {
+            let i = start + off;
             let selected = i == cursor;
-            let ts = l.ts.format("%H:%M:%S").to_string();
+            let ts = l
+                .ts
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
             let (lvl_text, lvl_color) = level_cell(l, theme);
+            let (source_text, source_lines) = cell_text(&l.source, source_w, wrap, theme.accent);
+            let (message_text, message_lines) = cell_text(&l.message, msg_w, wrap, theme.fg);
+            let row_h = source_lines.max(message_lines).max(1) as u16;
+
             let row = Row::new(vec![
                 Cell::from(Span::styled(ts, Style::default().fg(theme.muted))),
                 Cell::from(Span::styled(lvl_text, Style::default().fg(lvl_color))),
-                Cell::from(Span::styled(
-                    l.source.clone(),
-                    Style::default().fg(theme.accent),
-                )),
-                Cell::from(Span::styled(
-                    l.message.clone(),
-                    Style::default().fg(theme.fg),
-                )),
-            ]);
+                Cell::from(source_text),
+                Cell::from(message_text),
+            ])
+            .height(row_h);
+
             if selected {
                 row.style(theme.selection())
             } else {
@@ -156,24 +180,147 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
         })
         .collect();
 
+    let time_header = format!("time ({})", local_tz_label());
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),
-            Constraint::Length(5),
-            Constraint::Length(22),
+            Constraint::Length(TIME_COL),
+            Constraint::Length(LVL_COL),
+            Constraint::Length(SOURCE_COL),
             Constraint::Min(20),
         ],
     )
     .header(
-        Row::new(vec!["time", "lvl", "source", "message"]).style(
+        Row::new(vec![
+            time_header,
+            "lvl".to_string(),
+            "source".to_string(),
+            "message".to_string(),
+        ])
+        .style(
             Style::default()
                 .fg(theme.muted)
                 .add_modifier(Modifier::BOLD),
         ),
     )
-    .column_spacing(2);
+    .column_spacing(COLUMN_SPACING);
     frame.render_widget(table, area);
+}
+
+/// Build a cell's text content. In wrap mode the value is split into multiple
+/// lines at the given character width; otherwise it is returned as a single
+/// line and ratatui will truncate to fit the column.
+fn cell_text(value: &str, width: usize, wrap: bool, color: Color) -> (Text<'static>, usize) {
+    if !wrap || width == 0 {
+        let t = Text::from(Span::styled(value.to_string(), Style::default().fg(color)));
+        return (t, 1);
+    }
+    let parts = wrap_chars(value, width);
+    let count = parts.len().max(1);
+    let lines: Vec<Line<'static>> = parts
+        .into_iter()
+        .map(|s| Line::from(Span::styled(s, Style::default().fg(color))))
+        .collect();
+    (Text::from(lines), count)
+}
+
+/// Hard-wrap on character boundaries. Logs commonly contain long unbroken
+/// identifiers (request ids, URLs), so word-wrapping would leave huge ragged
+/// edges; chunked char-wrap keeps the column dense.
+fn wrap_chars(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::with_capacity(chars.len().div_ceil(width));
+    let mut i = 0;
+    while i < chars.len() {
+        let end = (i + width).min(chars.len());
+        out.push(chars[i..end].iter().collect());
+        i = end;
+    }
+    out
+}
+
+/// Height (in terminal rows) a single log line will occupy.
+fn line_height(l: &LogLine, wrap: bool, source_w: usize, msg_w: usize) -> usize {
+    if !wrap {
+        return 1;
+    }
+    let s = wrap_chars(&l.source, source_w).len().max(1);
+    let m = wrap_chars(&l.message, msg_w).len().max(1);
+    s.max(m)
+}
+
+/// Choose the [start, end] index range of log lines to render so that the
+/// `cursor` row is visible and the rendered rows together fit within
+/// `data_height` cells of vertical space.
+fn visible_range(
+    lines: &[LogLine],
+    cursor: usize,
+    data_height: usize,
+    wrap: bool,
+    source_w: usize,
+    msg_w: usize,
+) -> (usize, usize) {
+    if lines.is_empty() {
+        return (0, 0);
+    }
+    let cursor = cursor.min(lines.len() - 1);
+    // Walk backwards from the cursor accumulating heights until we've filled
+    // the visible area, then walk forward to extend if there's slack left.
+    let mut used = line_height(&lines[cursor], wrap, source_w, msg_w);
+    let mut start = cursor;
+    while start > 0 {
+        let h = line_height(&lines[start - 1], wrap, source_w, msg_w);
+        if used + h > data_height {
+            break;
+        }
+        used += h;
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end + 1 < lines.len() {
+        let h = line_height(&lines[end + 1], wrap, source_w, msg_w);
+        if used + h > data_height {
+            break;
+        }
+        used += h;
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Best-effort IANA timezone name (e.g. `Europe/Brussels`) for the header.
+///
+/// Falls back through `$TZ`, `/etc/timezone`, then a `/etc/localtime` symlink
+/// resolve, and finally a `UTC±HH:MM` offset string when nothing else works.
+fn local_tz_label() -> String {
+    if let Ok(tz) = std::env::var("TZ") {
+        let t = tz.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/etc/timezone") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let s = link.to_string_lossy().to_string();
+        if let Some(idx) = s.find("zoneinfo/") {
+            return s[idx + "zoneinfo/".len()..].to_string();
+        }
+    }
+    let secs = chrono::Local::now().offset().fix().local_minus_utc();
+    let sign = if secs >= 0 { '+' } else { '-' };
+    let abs = secs.unsigned_abs();
+    format!("UTC{}{:02}:{:02}", sign, abs / 3600, (abs % 3600) / 60)
 }
 
 fn level_cell(line: &LogLine, theme: &Theme) -> (String, Color) {
@@ -321,16 +468,6 @@ fn deepest_error(err: &serde_json::Value) -> (Option<String>, Option<String>) {
     (best_message, best_code)
 }
 
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
-}
-
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let lines_len = state
         .selected_resource()
@@ -349,6 +486,10 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
+        Action::ToggleWrap => {
+            state.logs.wrap = !state.logs.wrap;
+            true
+        }
         Action::MoveDown => {
             if lines_len > 0 {
                 state.logs.scroll = (state.logs.scroll + 1).min(lines_len - 1);
@@ -584,5 +725,67 @@ mod tests {
         assert_eq!(extract_status("200 OK"), Some(200));
         assert_eq!(extract_status(" 404 Not Found"), Some(404));
         assert_eq!(extract_status("hello"), None);
+    }
+
+    #[test]
+    fn toggle_wrap_flips_flag() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        assert!(!state.logs.wrap);
+        assert!(handle(Action::ToggleWrap, &mut state));
+        assert!(state.logs.wrap);
+        assert!(handle(Action::ToggleWrap, &mut state));
+        assert!(!state.logs.wrap);
+    }
+
+    #[test]
+    fn wrap_chars_chunks_long_strings() {
+        let out = wrap_chars("abcdefghij", 4);
+        assert_eq!(out, vec!["abcd", "efgh", "ij"]);
+        let out = wrap_chars("short", 10);
+        assert_eq!(out, vec!["short"]);
+        let out = wrap_chars("", 4);
+        assert_eq!(out, vec![""]);
+    }
+
+    #[test]
+    fn line_height_is_one_without_wrap() {
+        let l = line(0, LogLevel::Info, "src", &"x".repeat(200));
+        assert_eq!(line_height(&l, false, 32, 40), 1);
+        // With wrap on, a 200-char message in a 40-wide column takes 5 rows.
+        assert_eq!(line_height(&l, true, 32, 40), 5);
+    }
+
+    #[test]
+    fn visible_range_anchors_on_cursor_in_wrap_mode() {
+        // Three lines: a, big, c. With wrap and a small viewport, the cursor
+        // row must stay visible even if it pushes neighbours out.
+        let lines = vec![
+            line(1, LogLevel::Info, "s", "a"),
+            line(2, LogLevel::Info, "s", &"x".repeat(80)),
+            line(3, LogLevel::Info, "s", "c"),
+        ];
+        // 20-wide message column → middle row is 4 cells tall; data_height 4
+        // forces it to be the only row.
+        let (start, end) = visible_range(&lines, 1, 4, true, 32, 20);
+        assert_eq!((start, end), (1, 1));
+    }
+
+    #[test]
+    fn renders_wrapped_message() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.wrap = true;
+        let long = "Executed Functions.http_app_func (Failed, Id=385960) ".repeat(2);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![line(1, LogLevel::Error, "FunctionAppLogs/FunctionAppLogs", &long)],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        // The end of the second copy should be visible after wrapping, which
+        // it would not be when the row is truncated to a single line.
+        assert!(s.contains("Id=385960"), "expected wrapped content, got:\n{s}");
     }
 }
