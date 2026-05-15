@@ -298,12 +298,30 @@ fn parse_function_app_logs_row(
         format!("FunctionAppLogs/{function_name}")
     };
 
-    let message = cell(columns, cells, "Message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // For exception rows the runtime leaves `Message` empty and writes the
+    // real detail to `ExceptionMessage` (one-liner) or `ExceptionDetails`
+    // (full stack trace). Fall back through them in order of usefulness so an
+    // empty Message doesn't hide the actual error.
+    let message = first_non_empty(
+        columns,
+        cells,
+        &["Message", "ExceptionMessage", "ExceptionDetails"],
+    );
 
     (level, source, message)
+}
+
+/// Return the first non-empty string value across the given column names.
+fn first_non_empty(columns: &[&str], cells: &[serde_json::Value], names: &[&str]) -> String {
+    for name in names {
+        if let Some(s) = cell(columns, cells, name).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn parse_container_app_row(
@@ -415,6 +433,41 @@ mod tests {
         assert_eq!(lines[0].message, "kaboom in handler");
         assert_eq!(lines[1].level, LogLevel::Info);
         assert_eq!(lines[1].source, "FunctionAppLogs");
+    }
+
+    #[test]
+    fn function_app_logs_falls_back_to_exception_fields_when_message_is_empty() {
+        // Real Azure shape for a Function App invocation failure: the runtime
+        // writes the summary into one row (Message populated) and the actual
+        // exception into a sibling row where Message is empty and the body
+        // lives in ExceptionMessage / ExceptionDetails.
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Level", "type": "string" },
+                    { "name": "Message", "type": "string" },
+                    { "name": "ExceptionMessage", "type": "string" },
+                    { "name": "ExceptionDetails", "type": "string" },
+                    { "name": "FunctionName", "type": "string" }
+                ],
+                "rows": [
+                    // Has ExceptionMessage but Message is empty
+                    [ "2026-01-01T00:00:00Z", "Error", "", "Null reference at line 42", "stack…", "http_app_func" ],
+                    // Both empty except ExceptionDetails
+                    [ "2026-01-01T00:00:01Z", "Error", "   ", "", "System.IO.IOException: file locked\n  at …", "http_app_func" ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::FunctionApp).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].message, "Null reference at line 42");
+        assert!(
+            lines[1].message.starts_with("System.IO.IOException"),
+            "ExceptionDetails should be used when Message and ExceptionMessage are blank, got {:?}",
+            lines[1].message,
+        );
     }
 
     #[test]
