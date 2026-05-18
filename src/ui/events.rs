@@ -77,6 +77,11 @@ pub enum Action {
     ToggleFavorite,
     ToggleFavoritesOnly,
     StartSearch,
+    /// Jump cursor to the next/previous log line whose source or message
+    /// contains `state.logs.search_input` (case-insensitive). Only meaningful
+    /// in the logs view; no-op elsewhere.
+    NextMatch,
+    PrevMatch,
     SwitchSubscription,
     Refresh,
     SetWindowDay,
@@ -161,6 +166,10 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // Top / bottom. `g` alone is a chord starter; the caller resolves `g g`.
         KeyCode::Char('G') => Action::GotoBottom,
         KeyCode::Char('g') => Action::Noop, // chord starter — handled by caller
+
+        // Search match navigation (logs view consumes; other views ignore).
+        KeyCode::Char('n') => Action::NextMatch,
+        KeyCode::Char('N') => Action::PrevMatch,
 
         // Panel cycling
         KeyCode::Tab => Action::NextPanel,

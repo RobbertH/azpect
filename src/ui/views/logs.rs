@@ -21,7 +21,8 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  Enter detail  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
+const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const TIME_COL: u16 = 19;
 const LVL_COL: u16 = 5;
@@ -61,6 +62,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.degraded),
             ));
         }
+        if state.logs.search_active || !state.logs.search_input.value().is_empty() {
+            header_spans.push(Span::styled(
+                format!("· /{} ", state.logs.search_input.value()),
+                Style::default().fg(theme.fg),
+            ));
+        }
     } else {
         header_spans.push(Span::styled(
             "(no selection)",
@@ -69,61 +76,93 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
     frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
+    let title = if state.logs.search_active {
+        " recent (search) "
+    } else {
+        " recent "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" recent ", Style::default().fg(theme.fg)));
+        .title(Span::styled(title, Style::default().fg(theme.fg)));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
+    // When the search input has focus, peel a single row off the top of the
+    // bordered area for the live query — the table renders below it. The box
+    // disappears on Esc/Enter; the committed query stays in the header chip.
+    let (search_area, body) = if state.logs.search_active {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, inner)
+    };
+    if let Some(sa) = search_area {
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled("/", Style::default().fg(theme.accent)),
+            Span::styled(
+                state.logs.search_input.value().to_string(),
+                Style::default().fg(theme.fg),
+            ),
+            Span::styled("█", Style::default().fg(theme.accent)),
+        ]));
+        frame.render_widget(p, sa);
+    }
+
+    let footer_text = if state.logs.search_active {
+        FOOTER_HINT_SEARCH
+    } else {
+        FOOTER_HINT
+    };
+
     let Some(resource) = selected else {
-        center_message(frame, inner, "no resource selected.", theme.muted);
-        render_footer(frame, chunks[2], theme);
+        center_message(frame, body, "no resource selected.", theme.muted);
+        render_footer(frame, chunks[2], theme, footer_text);
         return;
     };
 
     if matches!(resource.kind, ResourceKind::Apim) {
         center_message(
             frame,
-            inner,
+            body,
             "Logs are not supported for APIM in v1.",
             theme.muted,
         );
-        render_footer(frame, chunks[2], theme);
+        render_footer(frame, chunks[2], theme, footer_text);
         return;
     }
 
     let lines = state.logs.by_resource.get(&resource.id);
 
     if state.logs.loading && lines.map(|l| l.is_empty()).unwrap_or(true) {
-        center_message(frame, inner, "Loading logs…", theme.muted);
-        render_footer(frame, chunks[2], theme);
+        center_message(frame, body, "Loading logs…", theme.muted);
+        render_footer(frame, chunks[2], theme, footer_text);
         return;
     }
 
     if let Some(err) = state.logs.last_error.as_deref() {
         if lines.map(|l| l.is_empty()).unwrap_or(true) {
             let msg = friendly_log_error(err);
-            render_error_message(frame, inner, &msg, theme.degraded);
-            render_footer(frame, chunks[2], theme);
+            render_error_message(frame, body, &msg, theme.degraded);
+            render_footer(frame, chunks[2], theme, footer_text);
             return;
         }
     }
 
     let lines = lines.map(|v| v.as_slice()).unwrap_or(&[]);
     if lines.is_empty() {
-        center_message(frame, inner, "no log lines in window.", theme.muted);
-        render_footer(frame, chunks[2], theme);
+        center_message(frame, body, "no log lines in window.", theme.muted);
+        render_footer(frame, chunks[2], theme, footer_text);
         return;
     }
 
-    render_table(frame, inner, lines, state, theme);
-    render_footer(frame, chunks[2], theme);
+    render_table(frame, body, lines, state, theme);
+    render_footer(frame, chunks[2], theme, footer_text);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
     let p = Paragraph::new(Line::from(Span::styled(
-        FOOTER_HINT,
+        text.to_string(),
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(p, area);
@@ -132,6 +171,11 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
 fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppState, theme: &Theme) {
     let wrap = state.logs.wrap;
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
+    let query = state.logs.search_input.value();
+    let hi_style = Style::default()
+        .bg(theme.favorite)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
 
     // Header is rendered above the data rows by the Table widget, so the
     // available data rows occupy `area.height - 1` cells of vertical space.
@@ -159,8 +203,10 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string();
             let (lvl_text, lvl_color) = level_cell(l, theme);
-            let (source_text, source_lines) = cell_text(&l.source, source_w, wrap, theme.accent);
-            let (message_text, message_lines) = cell_text(&l.message, msg_w, wrap, theme.fg);
+            let (source_text, source_lines) =
+                cell_text(&l.source, query, source_w, wrap, theme.accent, hi_style);
+            let (message_text, message_lines) =
+                cell_text(&l.message, query, msg_w, wrap, theme.fg, hi_style);
             let row_h = source_lines.max(message_lines).max(1) as u16;
 
             let row = Row::new(vec![
@@ -209,18 +255,157 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
 /// Build a cell's text content. In wrap mode the value is split into multiple
 /// lines at the given character width; otherwise it is returned as a single
 /// line and ratatui will truncate to fit the column.
-fn cell_text(value: &str, width: usize, wrap: bool, color: Color) -> (Text<'static>, usize) {
+///
+/// When `query` is non-empty, every case-insensitive occurrence is rendered
+/// with `hi_style` so live search reads instantly across the visible window.
+fn cell_text(
+    value: &str,
+    query: &str,
+    width: usize,
+    wrap: bool,
+    color: Color,
+    hi_style: Style,
+) -> (Text<'static>, usize) {
+    let base_style = Style::default().fg(color);
+    let matches = find_matches(value, query);
+
     if !wrap || width == 0 {
-        let t = Text::from(Span::styled(value.to_string(), Style::default().fg(color)));
-        return (t, 1);
+        let spans = build_spans(value, &matches, base_style, hi_style);
+        return (Text::from(Line::from(spans)), 1);
     }
-    let parts = wrap_chars(value, width);
-    let count = parts.len().max(1);
-    let lines: Vec<Line<'static>> = parts
-        .into_iter()
-        .map(|s| Line::from(Span::styled(s, Style::default().fg(color))))
-        .collect();
+    let lines = wrap_highlighted(value, &matches, width, base_style, hi_style);
+    let count = lines.len().max(1);
     (Text::from(lines), count)
+}
+
+/// Locate every case-insensitive ASCII occurrence of `query` in `value`.
+/// Returns byte ranges suitable for slicing `value` directly (the lowercase
+/// transform preserves byte indices because non-ASCII bytes are untouched).
+fn find_matches(value: &str, query: &str) -> Vec<(usize, usize)> {
+    if query.is_empty() || value.is_empty() {
+        return Vec::new();
+    }
+    let lower = value.to_ascii_lowercase();
+    let q = query.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while from <= lower.len() {
+        match lower[from..].find(&q) {
+            Some(rel) => {
+                let start = from + rel;
+                let end = start + q.len();
+                out.push((start, end));
+                // Step at least one byte forward to avoid an infinite loop on
+                // empty queries (already short-circuited above) and to handle
+                // back-to-back matches like "aaa" with query "aa".
+                from = end.max(start + 1);
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Non-wrap path: turn `value` into a flat row of styled spans where each
+/// match range carries `hi_style`.
+fn build_spans(
+    value: &str,
+    matches: &[(usize, usize)],
+    base_style: Style,
+    hi_style: Style,
+) -> Vec<Span<'static>> {
+    if matches.is_empty() {
+        return vec![Span::styled(value.to_string(), base_style)];
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0;
+    for &(start, end) in matches {
+        if start > pos {
+            out.push(Span::styled(value[pos..start].to_string(), base_style));
+        }
+        out.push(Span::styled(value[start..end].to_string(), hi_style));
+        pos = end;
+    }
+    if pos < value.len() {
+        out.push(Span::styled(value[pos..].to_string(), base_style));
+    }
+    out
+}
+
+/// Wrap-mode path. Walks the string char by char, tagging each char as match
+/// or non-match, then chunks into lines of `width` characters and collapses
+/// adjacent same-style chars into a single span per line.
+fn wrap_highlighted(
+    value: &str,
+    matches: &[(usize, usize)],
+    width: usize,
+    base_style: Style,
+    hi_style: Style,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::from(build_spans(value, matches, base_style, hi_style))];
+    }
+    let tokens: Vec<(char, bool)> = char_tokens(value, matches);
+    if tokens.is_empty() {
+        return vec![Line::from(String::new())];
+    }
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(tokens.len().div_ceil(width));
+    let mut i = 0;
+    while i < tokens.len() {
+        let end = (i + width).min(tokens.len());
+        let chunk = &tokens[i..end];
+        lines.push(Line::from(spans_from_tokens(chunk, base_style, hi_style)));
+        i = end;
+    }
+    lines
+}
+
+/// Pair each char of `value` with a boolean indicating whether that char
+/// position falls inside any of the (byte-indexed) `matches` ranges.
+fn char_tokens(value: &str, matches: &[(usize, usize)]) -> Vec<(char, bool)> {
+    let mut out: Vec<(char, bool)> = Vec::with_capacity(value.len());
+    let mut iter = matches.iter().copied().peekable();
+    let mut cur = iter.next();
+    for (byte_pos, ch) in value.char_indices() {
+        // Advance past any ranges we've already exited.
+        while let Some((_s, e)) = cur {
+            if byte_pos >= e {
+                cur = iter.next();
+            } else {
+                break;
+            }
+        }
+        let in_match = matches!(cur, Some((s, e)) if byte_pos >= s && byte_pos < e);
+        out.push((ch, in_match));
+    }
+    out
+}
+
+fn spans_from_tokens(
+    chunk: &[(char, bool)],
+    base_style: Style,
+    hi_style: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_match = chunk[0].1;
+    for &(ch, m) in chunk {
+        if m != buf_match {
+            spans.push(Span::styled(
+                std::mem::take(&mut buf),
+                if buf_match { hi_style } else { base_style },
+            ));
+            buf_match = m;
+        }
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        spans.push(Span::styled(
+            buf,
+            if buf_match { hi_style } else { base_style },
+        ));
+    }
+    spans
 }
 
 /// Hard-wrap on character boundaries. Logs commonly contain long unbroken
@@ -410,11 +595,18 @@ pub fn friendly_log_error(raw: &str) -> String {
     let body = raw.trim();
     let lowered = body.to_lowercase();
 
+    // SEM0529 is "union: must have at least one operand that can be evaluated
+    // successfully when running with 'Fuzzy' mode" — i.e. every table in the
+    // fuzzy union failed to resolve. For our resource-centric queries that
+    // means the workspace has no rows from any of the expected tables, which
+    // is functionally identical to "diagnostic settings aren't forwarding
+    // anything here yet."
     let no_destination = lowered.contains("nologdestination")
         || lowered.contains("no log destination")
         || lowered.contains("pathnotfounderror")
         || lowered.contains("workspace not found")
-        || lowered.contains("diagnostic settings");
+        || lowered.contains("diagnostic settings")
+        || lowered.contains("sem0529");
 
     if no_destination {
         return "No diagnostic settings configured for this resource. \
@@ -474,6 +666,35 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         .map(|v| v.len())
         .unwrap_or(0);
 
+    // Search-input focus: only a small set of actions reach this handler — the
+    // raw keystrokes flow into `logs.search_input` via app.rs. Esc cancels
+    // (deactivates input, keeps query for n/N); Enter commits and jumps to the
+    // next match from the current cursor.
+    if state.logs.search_active {
+        match action {
+            Action::Back => {
+                state.logs.search_active = false;
+                return true;
+            }
+            Action::OpenSelected => {
+                state.logs.search_active = false;
+                jump_to_match(state, 1);
+                return true;
+            }
+            // Vertical nav while typing: drive the underlying table so the user
+            // can preview matches against the surrounding context.
+            Action::MoveDown
+            | Action::MoveUp
+            | Action::HalfPageDown
+            | Action::HalfPageUp
+            | Action::GotoTop
+            | Action::GotoBottom => {
+                // fall through to the navigation arms below
+            }
+            _ => return false,
+        }
+    }
+
     match action {
         Action::ToggleErrorsOnly => {
             state.logs.errors_only = !state.logs.errors_only;
@@ -487,6 +708,18 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::ToggleWrap => {
             state.logs.wrap = !state.logs.wrap;
+            true
+        }
+        Action::StartSearch => {
+            state.logs.search_active = true;
+            true
+        }
+        Action::NextMatch => {
+            jump_to_match(state, 1);
+            true
+        }
+        Action::PrevMatch => {
+            jump_to_match(state, -1);
             true
         }
         Action::OpenSelected => {
@@ -530,6 +763,71 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// True iff the log line's source or message contains `query` (case-insensitive
+/// ASCII). Empty query never matches — callers should short-circuit so `n`
+/// isn't a hidden GotoBottom alias.
+pub(crate) fn line_matches(line: &LogLine, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let q = query.to_ascii_lowercase();
+    line.source.to_ascii_lowercase().contains(&q)
+        || line.message.to_ascii_lowercase().contains(&q)
+}
+
+/// Move the logs cursor to the next (`direction == 1`) or previous (`-1`)
+/// matching line. No-op when the query is empty, no resource is selected, or
+/// no line matches. The cursor stays put if there's exactly one match and it
+/// is already selected — pressing `n` shouldn't reset position.
+fn jump_to_match(state: &mut AppState, direction: i32) {
+    let query = state.logs.search_input.value().to_string();
+    if query.is_empty() {
+        return;
+    }
+    let Some(resource_id) = state.selected_resource().map(|r| r.id.clone()) else {
+        return;
+    };
+    let Some(lines) = state.logs.by_resource.get(&resource_id) else {
+        return;
+    };
+    if lines.is_empty() {
+        return;
+    }
+    let cursor = state.logs.scroll.min(lines.len() - 1);
+    let next = find_next_match(lines, cursor, &query, direction);
+    if let Some(idx) = next {
+        state.logs.scroll = idx;
+    }
+}
+
+/// Find the next/previous matching line index, starting *after* (or *before*)
+/// `cursor` and wrapping around once.
+fn find_next_match(lines: &[LogLine], cursor: usize, query: &str, direction: i32) -> Option<usize> {
+    if lines.is_empty() {
+        return None;
+    }
+    let n = lines.len();
+    let step: isize = if direction >= 0 { 1 } else { -1 };
+    let mut idx = cursor as isize;
+    for _ in 0..n {
+        idx += step;
+        if idx < 0 {
+            idx = (n as isize) - 1;
+        } else if idx >= n as isize {
+            idx = 0;
+        }
+        if line_matches(&lines[idx as usize], query) {
+            return Some(idx as usize);
+        }
+    }
+    // No other match — if the current line itself matches, stay put.
+    if line_matches(&lines[cursor], query) {
+        Some(cursor)
+    } else {
+        None
     }
 }
 
@@ -651,6 +949,9 @@ mod tests {
             "NoLogDestination",
             "azure api error 404: {\"error\":{\"code\":\"PathNotFoundError\"}}",
             "diagnostic settings missing",
+            // SEM0529: fuzzy union resolved zero tables — same root cause as
+            // "no destination configured" from the user's perspective.
+            r#"azure api error 400: {"error":{"message":"x","code":"BadArgumentError","innererror":{"code":"SemanticError","message":"union: must have at least one operand that can be evaluated successfully when running with 'Fuzzy' mode. (SEM0529)"}}}"#,
         ] {
             let out = friendly_log_error(variant);
             assert!(
@@ -778,6 +1079,172 @@ mod tests {
         // forces it to be the only row.
         let (start, end) = visible_range(&lines, 1, 4, true, 32, 20);
         assert_eq!((start, end), (1, 1));
+    }
+
+    #[test]
+    fn find_matches_returns_all_case_insensitive_byte_ranges() {
+        let v = "Error: an Error happened (error code 42)";
+        let m = find_matches(v, "error");
+        assert_eq!(m, vec![(0, 5), (10, 15), (26, 31)]);
+        // Slicing must round-trip the original characters.
+        for (s, e) in m {
+            assert_eq!(v[s..e].to_lowercase(), "error");
+        }
+    }
+
+    #[test]
+    fn find_matches_handles_overlap_and_empty() {
+        // No overlap on a 2-letter query repeated in "aaa".
+        assert_eq!(find_matches("aaa", "aa"), vec![(0, 2)]);
+        // Empty query never matches.
+        assert!(find_matches("anything", "").is_empty());
+        // Empty value never matches.
+        assert!(find_matches("", "x").is_empty());
+    }
+
+    #[test]
+    fn build_spans_splits_on_match_boundaries() {
+        let base = Style::default().fg(Color::Reset);
+        let hi = Style::default().bg(Color::Yellow);
+        let v = "foo bar foo";
+        let matches = find_matches(v, "foo");
+        let spans = build_spans(v, &matches, base, hi);
+        // foo|" bar "|foo  → 3 spans
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "foo");
+        assert_eq!(spans[1].content, " bar ");
+        assert_eq!(spans[2].content, "foo");
+        assert_eq!(spans[0].style, hi);
+        assert_eq!(spans[1].style, base);
+        assert_eq!(spans[2].style, hi);
+    }
+
+    #[test]
+    fn start_search_sets_flag() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        assert!(handle(Action::StartSearch, &mut state));
+        assert!(state.logs.search_active);
+    }
+
+    #[test]
+    fn back_while_search_active_deactivates_and_consumes() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.search_active = true;
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.logs.search_active);
+        // Back is consumed in this case (unlike the inactive path which falls
+        // through to the global view-stack pop).
+    }
+
+    #[test]
+    fn enter_while_search_active_commits_and_jumps() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "hello"),
+                line(2, LogLevel::Info, "x", "ERROR rate limited"),
+                line(3, LogLevel::Info, "x", "world"),
+            ],
+        );
+        state.logs.search_active = true;
+        state.logs.search_input = state
+            .logs
+            .search_input
+            .clone()
+            .with_value("error".to_string());
+        state.logs.scroll = 0;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(!state.logs.search_active);
+        assert_eq!(state.logs.scroll, 1, "cursor jumps to first match");
+    }
+
+    #[test]
+    fn next_match_wraps_and_prev_match_steps_back() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "first match here"),
+                line(2, LogLevel::Info, "x", "no hit"),
+                line(3, LogLevel::Info, "x", "second match here"),
+            ],
+        );
+        state.logs.search_input = state
+            .logs
+            .search_input
+            .clone()
+            .with_value("match".to_string());
+        state.logs.scroll = 0;
+
+        // n → next match is index 2.
+        assert!(handle(Action::NextMatch, &mut state));
+        assert_eq!(state.logs.scroll, 2);
+        // n again → wraps back to index 0.
+        assert!(handle(Action::NextMatch, &mut state));
+        assert_eq!(state.logs.scroll, 0);
+        // N → steps backwards (wrap), so it lands on index 2 again.
+        assert!(handle(Action::PrevMatch, &mut state));
+        assert_eq!(state.logs.scroll, 2);
+    }
+
+    #[test]
+    fn next_match_with_empty_query_is_noop() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "a"),
+                line(2, LogLevel::Info, "x", "b"),
+            ],
+        );
+        state.logs.scroll = 0;
+        // Action still consumed (true) so the global handler doesn't try to
+        // re-handle, but cursor must not move with no query.
+        assert!(handle(Action::NextMatch, &mut state));
+        assert_eq!(state.logs.scroll, 0);
+    }
+
+    #[test]
+    fn next_match_no_hits_keeps_cursor() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "a"),
+                line(2, LogLevel::Info, "x", "b"),
+            ],
+        );
+        state.logs.scroll = 1;
+        state.logs.search_input = state
+            .logs
+            .search_input
+            .clone()
+            .with_value("zzz".to_string());
+        assert!(handle(Action::NextMatch, &mut state));
+        assert_eq!(state.logs.scroll, 1);
+    }
+
+    #[test]
+    fn renders_search_box_when_active() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![line(1, LogLevel::Info, "AppTraces", "hello world")],
+        );
+        state.logs.search_active = true;
+        state.logs.search_input = state
+            .logs
+            .search_input
+            .clone()
+            .with_value("hello".to_string());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("/hello"), "expected the search query bar");
+        assert!(s.contains("hello"), "expected the matching log line");
     }
 
     #[test]

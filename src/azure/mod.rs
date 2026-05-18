@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod az_login;
 pub mod client;
+pub mod container_app_revisions;
 pub mod health;
 pub mod logs;
 pub mod metrics;

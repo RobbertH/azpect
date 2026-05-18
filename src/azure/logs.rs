@@ -29,7 +29,7 @@ pub struct LogLine {
     pub ts: DateTime<Utc>,
     pub level: LogLevel,
     /// Origin table or signal name, e.g. `AppExceptions`, `AppRequests`,
-    /// `ContainerAppConsoleLogs_CL`.
+    /// `ContainerAppConsoleLogs` (or its legacy `_CL` variant).
     pub source: String,
     pub message: String,
     /// Every (column, value) pair from the originating Log Analytics row.
@@ -72,14 +72,24 @@ pub const KQL_FUNCTION_APP_ERRORS_FILTER: &str = r#"
      or column_ifexists("Level", "") in ("Error", "Critical")
 "#;
 
+/// Container Apps land in one of two console-log tables depending on the
+/// diagnostic-settings destination: `ContainerAppConsoleLogs_CL` (legacy
+/// "Log Analytics" destination, column `Log_s`) or `ContainerAppConsoleLogs`
+/// (modern Azure Monitor "Resource specific" destination, column `Log`).
+/// `isfuzzy=true` lets the query succeed when only one of them is populated.
 pub const KQL_CONTAINER_APP: &str = r#"
-ContainerAppConsoleLogs_CL
+union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs
 | order by TimeGenerated desc
 | take 200
 "#;
 
-pub const KQL_CONTAINER_APP_ERRORS_FILTER: &str =
-    r#"| where Log_s matches regex @"(?i)\b(error|exception|fatal|panic|stack)\b""#;
+/// `column_ifexists` is required because the two unioned tables don't share
+/// a column name for the log body (`Log_s` vs `Log`), and referencing the
+/// missing one would fail the whole query with SEM0100.
+pub const KQL_CONTAINER_APP_ERRORS_FILTER: &str = r#"
+| where column_ifexists("Log_s", "") matches regex @"(?i)\b(error|exception|fatal|panic|stack)\b"
+     or column_ifexists("Log", "") matches regex @"(?i)\b(error|exception|fatal|panic|stack)\b"
+"#;
 
 /// Maximum length of `LogLine.message` before truncation.
 const MESSAGE_TRUNCATE: usize = 500;
@@ -360,10 +370,10 @@ fn parse_container_app_row(
     columns: &[&str],
     cells: &[serde_json::Value],
 ) -> (LogLevel, String, String) {
-    let log = cell(columns, cells, "Log_s")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // `Log_s` is the legacy `_CL` schema; `Log` is the modern Azure Monitor
+    // resource-specific schema. Whichever table the row came from, only one
+    // of these is populated.
+    let log = first_non_empty(columns, cells, &["Log_s", "Log"]);
 
     let lower = log.to_lowercase();
     let is_error = ["error", "exception", "fatal", "panic"]
@@ -375,7 +385,13 @@ fn parse_container_app_row(
         LogLevel::Info
     };
 
-    let source = "ContainerAppConsoleLogs_CL".to_string();
+    // Log Analytics injects the originating table name into the `Type` column
+    // for every row, so the source label tracks which schema we're reading.
+    let source = cell(columns, cells, "Type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("ContainerAppConsoleLogs")
+        .to_string();
     (level, source, log)
 }
 
@@ -564,6 +580,48 @@ mod tests {
         assert_eq!(lines[0].level, LogLevel::Info);
         assert_eq!(lines[1].level, LogLevel::Error);
         assert!(lines[1].message.contains("FATAL"));
+    }
+
+    #[test]
+    fn parses_container_app_row_modern_schema() {
+        // Resource-specific destination: column is `Log`, not `Log_s`, and
+        // `Type` carries the originating table name.
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Log", "type": "string" },
+                    { "name": "Type", "type": "string" }
+                ],
+                "rows": [
+                    [ "2026-01-01T00:00:00Z", "startup ok", "ContainerAppConsoleLogs" ],
+                    [ "2026-01-01T00:00:01Z", "panic: nil pointer", "ContainerAppConsoleLogs" ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::ContainerApp).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].source, "ContainerAppConsoleLogs");
+        assert_eq!(lines[0].message, "startup ok");
+        assert_eq!(lines[1].level, LogLevel::Error);
+        assert!(lines[1].message.contains("panic"));
+    }
+
+    #[test]
+    fn container_app_kql_uses_fuzzy_union_over_both_tables() {
+        let kql = build_kql(ResourceKind::ContainerApp, false).unwrap();
+        assert!(kql.contains("isfuzzy=true"));
+        assert!(kql.contains("ContainerAppConsoleLogs_CL"));
+        // Modern table appears as a bare identifier (not followed by `_CL`).
+        assert!(kql.contains("ContainerAppConsoleLogs\n"));
+    }
+
+    #[test]
+    fn container_app_errors_filter_uses_column_ifexists_for_both_log_columns() {
+        let kql = build_kql(ResourceKind::ContainerApp, true).unwrap();
+        assert!(kql.contains(r#"column_ifexists("Log_s", "")"#));
+        assert!(kql.contains(r#"column_ifexists("Log", "")"#));
     }
 
     #[test]

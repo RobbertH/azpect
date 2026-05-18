@@ -105,6 +105,14 @@ pub struct LogsCache {
     pub wrap: bool,
     /// Vertical scroll offset (in lines) for the log-detail view.
     pub detail_scroll: u16,
+    /// Whether the logs search box currently has focus. While true, raw
+    /// keystrokes are forwarded into `search_input` rather than dispatched as
+    /// actions; Esc cancels (deactivates input, keeps query), Enter commits.
+    pub search_active: bool,
+    /// Case-insensitive substring filter applied to the source and message
+    /// columns. Persists across `search_active` toggles so the user can edit,
+    /// confirm with Enter, navigate, and re-open with `/`.
+    pub search_input: Input,
 }
 
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.

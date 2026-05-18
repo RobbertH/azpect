@@ -289,6 +289,11 @@ async fn event_loop(
                     state.list_cursor = 0;
                     continue;
                 }
+                // Same shape for the logs less-style search input.
+                if should_forward_to_logs_search(state, key) {
+                    state.logs.search_input.handle_event(&CtEvent::Key(key));
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -504,6 +509,22 @@ fn should_forward_to_filter(state: &AppState, key: crossterm::event::KeyEvent) -
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the logs view's less-style search
+/// box. Same carve-outs: arrows / page nav drive the underlying table so the
+/// user can scroll context around the live highlights while still typing.
+fn should_forward_to_logs_search(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.logs.search_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// True when the command palette is active *and* the key is something the
 /// input widget should consume. `Esc` (cancel) and `Enter` (execute) are
 /// reserved and handled directly by the event loop.
@@ -547,13 +568,18 @@ fn decide_action(
         // Fall through: process this key as a fresh input.
     }
 
+    // Any text-input widget currently focused? While the user is typing into
+    // one, printable keys must not fire global actions like `n` (next match)
+    // or open a chord — they belong to the input field.
+    let input_focused = state.list_filter_active || state.logs.search_active;
+
     // First-key-of-chord? Stash and wait.
-    if is_chord_starter(key, state.list_filter_active) {
+    if is_chord_starter(key, input_focused) {
         input.pending_chord = Some(('g', now));
         return Action::Noop;
     }
 
-    key_to_action(key, state.view, state.list_filter_active)
+    key_to_action(key, state.view, input_focused)
 }
 
 /// Apply an action: first to the active view's local handler, then — if the
@@ -1360,11 +1386,25 @@ fn spawn_missing_list_metrics(
     }
 }
 
-fn spawn_load_health(auth: AzureAuth, resource_id: String, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_health(
+    auth: AzureAuth,
+    resource_id: String,
+    kind: crate::azure::resources::ResourceKind,
+    tx: UnboundedSender<AppEvent>,
+) {
+    use crate::azure::resources::ResourceKind;
     tokio::spawn(async move {
-        let result = crate::azure::resource_health::fetch(&auth, &resource_id)
-            .await
-            .map_err(|e| format!("{e:#}"));
+        // Container Apps don't expose meaningful state via the generic
+        // Microsoft.ResourceHealth endpoint — it returns `Unknown` even when
+        // active revisions are ActivationFailed/Unhealthy. Use revision data
+        // as the authoritative signal instead.
+        let result = match kind {
+            ResourceKind::ContainerApp => {
+                crate::azure::container_app_revisions::fetch(&auth, &resource_id).await
+            }
+            _ => crate::azure::resource_health::fetch(&auth, &resource_id).await,
+        };
+        let result = result.map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::HealthLoaded {
             resource_id,
             result,
@@ -1379,17 +1419,17 @@ fn spawn_missing_list_health(
     auth: &AzureAuth,
     tx: &UnboundedSender<AppEvent>,
 ) {
-    let to_fetch: Vec<String> = state
+    let to_fetch: Vec<(String, crate::azure::resources::ResourceKind)> = state
         .resources
         .iter()
         .filter(|r| {
             !state.health.by_resource.contains_key(&r.id) && !state.health.pending.contains(&r.id)
         })
-        .map(|r| r.id.clone())
+        .map(|r| (r.id.clone(), r.kind))
         .collect();
-    for resource_id in to_fetch {
+    for (resource_id, kind) in to_fetch {
         state.health.pending.insert(resource_id.clone());
-        spawn_load_health(auth.clone(), resource_id, tx.clone());
+        spawn_load_health(auth.clone(), resource_id, kind, tx.clone());
     }
 }
 

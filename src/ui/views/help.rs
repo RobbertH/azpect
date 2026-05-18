@@ -43,6 +43,8 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("7", "window 7d"),
             ("w", "wrap (logs)"),
             ("e", "errors only (logs)"),
+            ("/", "search (logs)"),
+            ("n / N", "next / prev match (logs)"),
             ("l", "open logs (detail)"),
         ],
     ),
