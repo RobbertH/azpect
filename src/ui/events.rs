@@ -52,6 +52,19 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<crate::azure::resource_health::ResourceAvailability, String>,
     },
+    /// Background load completion: configured CPU/memory caps from a
+    /// Container App's template. Only fired for `ResourceKind::ContainerApp`.
+    ContainerAppLimitsLoaded {
+        resource_id: String,
+        result: Result<crate::azure::container_app_limits::ContainerAppLimits, String>,
+    },
+    /// Background load completion: active-revision metadata (name, image,
+    /// replicas, scale) from a Container App. Fired alongside `HealthLoaded`
+    /// for Container Apps since both come from the same revisions response.
+    ContainerAppRevisionMetaLoaded {
+        resource_id: String,
+        result: Result<Option<crate::azure::container_app_revisions::ActiveRevisionMeta>, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →

@@ -96,10 +96,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         theme.muted
     };
 
+    // Container-App-only extras: pulled from the revisions + container app
+    // fetches. None of these are critical; missing data just collapses the
+    // corresponding line.
+    let revision_meta = state.revision_meta.by_resource.get(&resource.id);
+    let limits = state.limits.by_resource.get(&resource.id);
+    let meta_lines = container_app_meta_lines(revision_meta, limits, theme);
+
     // Reserve enough rows for the header line + however many rows the second
     // line needs after wrapping at the available width. Without this, long
     // error messages get clipped and the user can't read the diagnostic.
-    let context_height = 1 + wrapped_line_count(&second_line_text, inner.width).max(1);
+    let mut context_height = 1 + wrapped_line_count(&second_line_text, inner.width).max(1);
+    // Each meta line already wraps independently; reserve worst-case rows so
+    // none clip. `display_width` is the printable column count of the line.
+    for (_, _, plain_text) in &meta_lines {
+        context_height += wrapped_line_count(plain_text, inner.width).max(1);
+    }
     let body = Layout::vertical([
         Constraint::Length(context_height as u16),
         Constraint::Min(0),
@@ -111,7 +123,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Style::default().fg(second_line_color),
     ));
 
-    let context = Paragraph::new(vec![
+    let mut context_lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled(&resource.resource_group, Style::default().fg(theme.muted)),
             Span::styled(" · ", Style::default().fg(theme.muted)),
@@ -135,8 +147,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             ),
         ]),
         second_line,
-    ])
-    .wrap(Wrap { trim: false });
+    ];
+    for (label, value, _) in meta_lines {
+        context_lines.push(Line::from(vec![
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(value, Style::default().fg(theme.accent)),
+        ]));
+    }
+    let context = Paragraph::new(context_lines).wrap(Wrap { trim: false });
     frame.render_widget(context, body[0]);
 
     // Sparkline grid: 4 rows of equal fixed height (1 label line + 2 bars),
@@ -152,6 +176,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     .split(body[1]);
 
     let missing_for_resource = state.metrics.missing.get(&resource.id);
+    let limits = state.limits.by_resource.get(&resource.id);
     for (i, (kind, label)) in ROW_KINDS.iter().enumerate() {
         let area = metric_rows[i];
         if area.height == 0 {
@@ -165,6 +190,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             label,
             metrics_opt,
             missing_reason,
+            limits,
             state,
             theme,
         );
@@ -288,6 +314,7 @@ fn render_metric_row(
     label: &str,
     metrics: Option<&Vec<MetricSeries>>,
     missing_reason: Option<&String>,
+    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -297,7 +324,7 @@ fn render_metric_row(
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
 
     let summary = match series {
-        Some(s) => summary_for(kind, s),
+        Some(s) => summary_for(kind, s, limits),
         None if state.metrics.loading => "loading…".to_string(),
         None if missing_reason.is_some() => "n/a".to_string(),
         None => "—".to_string(),
@@ -315,10 +342,17 @@ fn render_metric_row(
     match series {
         Some(s) if !s.points.is_empty() => {
             let data = scaled_data(s);
-            let max = data.iter().copied().max().unwrap_or(1).max(1);
+            // Ratatui's Sparkline draws one bar per data point left-to-right
+            // and leaves the remaining columns blank. With a 1d/PT15M window
+            // (96 points) and a chart wider than that, the latest sample
+            // lands mid-area and the right ~25% looks dead. Pre-stretch so
+            // bars span the full width and the most recent point sits at
+            // `now`.
+            let stretched = stretch_to_width(&data, parts[1].width as usize);
+            let max = stretched.iter().copied().max().unwrap_or(1).max(1);
             let color = color_for_metric(kind, theme);
             let sparkline = Sparkline::default()
-                .data(&data[..])
+                .data(&stretched[..])
                 .max(max)
                 .style(Style::default().fg(color));
             frame.render_widget(sparkline, parts[1]);
@@ -362,6 +396,59 @@ fn short_missing_reason(reason: &str) -> String {
     }
 }
 
+/// Build the Container-App-only meta lines that sit below `state:` in the
+/// Detail header. Each entry is `(label, value, plain_text)`: the first two
+/// drive styled rendering (bold muted label + accent value), the third is the
+/// concatenated plain string used only for wrap-aware height reservation.
+///
+/// Missing pieces are skipped: no revision data → no lines; no image → no
+/// image line; no ingress fqdn → no fqdn line.
+fn container_app_meta_lines(
+    revision_meta: Option<&crate::azure::container_app_revisions::ActiveRevisionMeta>,
+    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
+    _theme: &Theme,
+) -> Vec<(&'static str, String, String)> {
+    let mut out: Vec<(&'static str, String, String)> = Vec::new();
+
+    if let Some(m) = revision_meta {
+        if !m.name.is_empty() {
+            out.push(("rev:", m.name.clone(), format!("rev: {}", m.name)));
+        }
+        if let Some(img) = &m.image {
+            out.push(("image:", img.clone(), format!("image: {img}")));
+        }
+        let replicas_value = match (m.min_replicas, m.max_replicas) {
+            (0, 0) => format!("{}", m.replicas),
+            (min, max) => format!("{} of {min}\u{2013}{max}", m.replicas),
+        };
+        let plain = format!("replicas: {replicas_value}");
+        out.push(("replicas:", replicas_value, plain));
+    }
+
+    if let Some(fqdn) = limits.and_then(|l| l.fqdn.as_deref()) {
+        out.push(("fqdn:", fqdn.to_string(), format!("fqdn: {fqdn}")));
+    }
+
+    out
+}
+
+/// Resample `data` so its length matches `width` using nearest-neighbor
+/// indexing. Each output column maps back to `data[i * data.len() / width]`,
+/// so the leftmost output is `data[0]` and the rightmost is the last sample.
+/// Works for both upsampling (sparse data, wide chart) and downsampling
+/// (lots of points, narrow chart).
+fn stretch_to_width(data: &[u64], width: usize) -> Vec<u64> {
+    if width == 0 || data.is_empty() {
+        return Vec::new();
+    }
+    (0..width)
+        .map(|i| {
+            let idx = i * data.len() / width;
+            data[idx.min(data.len() - 1)]
+        })
+        .collect()
+}
+
 fn scaled_data(series: &MetricSeries) -> Vec<u64> {
     series
         .points
@@ -383,7 +470,11 @@ fn scaled_data(series: &MetricSeries) -> Vec<u64> {
         .collect()
 }
 
-fn summary_for(kind: MetricKind, s: &MetricSeries) -> String {
+fn summary_for(
+    kind: MetricKind,
+    s: &MetricSeries,
+    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
+) -> String {
     match kind {
         MetricKind::Traffic | MetricKind::Errors => {
             let total = s.sum();
@@ -391,11 +482,19 @@ fn summary_for(kind: MetricKind, s: &MetricSeries) -> String {
         }
         MetricKind::Cpu => {
             let latest = s.latest().unwrap_or(0.0);
-            format!("latest: {}{}", format_value(latest), unit_suffix(s))
+            let base = format!("latest: {}{}", format_value(latest), unit_suffix(s));
+            match limits.map(|l| l.cpu_millicores).filter(|m| *m > 0) {
+                Some(max_mc) => format!("{base} / max {max_mc} mCores"),
+                None => base,
+            }
         }
         MetricKind::Memory => {
             let latest = s.latest().unwrap_or(0.0);
-            format!("latest: {}{}", format_bytes(latest), unit_suffix(s))
+            let base = format!("latest: {}{}", format_bytes(latest), unit_suffix(s));
+            match limits.map(|l| l.memory_bytes).filter(|b| *b > 0) {
+                Some(max_b) => format!("{base} / max {}", format_bytes(max_b as f64)),
+                None => base,
+            }
         }
     }
 }
@@ -412,7 +511,12 @@ fn unit_suffix(s: &MetricSeries) -> String {
 }
 
 fn format_count(v: f64) -> String {
-    let v = v.max(0.0);
+    // Short-circuit non-positive / NaN before any arithmetic. `v.max(0.0)`
+    // doesn't reliably strip negative zero on every platform, which leaks
+    // through as `-0` from `format!("{:.0}", -0.0)`.
+    if v.is_nan() || v <= 0.0 {
+        return "0".to_string();
+    }
     if v >= 1_000_000.0 {
         format!("{:.1}M", v / 1_000_000.0)
     } else if v >= 1_000.0 {
@@ -568,6 +672,158 @@ mod tests {
         let out = short_missing_reason(&long);
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 81);
+    }
+
+    #[test]
+    fn stretch_to_width_upsamples_data() {
+        // 4 data points stretched to 8 columns — each input bar covers 2 cols.
+        let data = vec![1u64, 2, 3, 4];
+        let out = stretch_to_width(&data, 8);
+        assert_eq!(out, vec![1, 1, 2, 2, 3, 3, 4, 4]);
+    }
+
+    #[test]
+    fn stretch_to_width_downsamples_data() {
+        // 8 → 4: pick every other point.
+        let data = vec![10u64, 20, 30, 40, 50, 60, 70, 80];
+        let out = stretch_to_width(&data, 4);
+        assert_eq!(out, vec![10, 30, 50, 70]);
+    }
+
+    #[test]
+    fn stretch_to_width_handles_empty_and_zero() {
+        assert!(stretch_to_width(&[], 10).is_empty());
+        assert!(stretch_to_width(&[1u64, 2], 0).is_empty());
+    }
+
+    #[test]
+    fn stretch_to_width_last_column_is_last_sample() {
+        // With 96 points stretched to 120 cols, the rightmost column must
+        // still be the most recent sample (not blank, not wrapped).
+        let mut data: Vec<u64> = (0..96).collect();
+        let out = stretch_to_width(&data, 120);
+        assert_eq!(out.len(), 120);
+        assert_eq!(*out.last().unwrap(), 95);
+        // Same shape regardless of width parity.
+        data.push(96);
+        let out = stretch_to_width(&data, 100);
+        assert_eq!(*out.last().unwrap(), 96);
+    }
+
+    #[test]
+    fn meta_lines_full_shape_emits_four_entries() {
+        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::ui::theme::Theme;
+
+        let theme = Theme::catppuccin_mocha();
+        let meta = ActiveRevisionMeta {
+            name: "files-api--0000004".into(),
+            image: Some("myacr/files-api:abc123".into()),
+            replicas: 2,
+            min_replicas: 1,
+            max_replicas: 10,
+        };
+        let limits = ContainerAppLimits {
+            cpu_millicores: 500,
+            memory_bytes: 0,
+            fqdn: Some("files-api.example.azurecontainerapps.io".into()),
+        };
+        let lines = container_app_meta_lines(Some(&meta), Some(&limits), &theme);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(labels, vec!["rev:", "image:", "replicas:", "fqdn:"]);
+        assert_eq!(lines[0].1, "files-api--0000004");
+        assert_eq!(lines[1].1, "myacr/files-api:abc123");
+        assert_eq!(lines[2].1, "2 of 1\u{2013}10");
+        assert_eq!(lines[3].1, "files-api.example.azurecontainerapps.io");
+    }
+
+    #[test]
+    fn meta_lines_collapses_missing_image_scale_and_fqdn() {
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::ui::theme::Theme;
+
+        let theme = Theme::catppuccin_mocha();
+        let meta = ActiveRevisionMeta {
+            name: "rev".into(),
+            image: None,
+            replicas: 1,
+            min_replicas: 0,
+            max_replicas: 0,
+        };
+        let lines = container_app_meta_lines(Some(&meta), None, &theme);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(labels, vec!["rev:", "replicas:"]);
+        assert_eq!(lines[1].1, "1");
+    }
+
+    #[test]
+    fn meta_lines_empty_when_no_data() {
+        use crate::ui::theme::Theme;
+        let theme = Theme::catppuccin_mocha();
+        assert!(container_app_meta_lines(None, None, &theme).is_empty());
+    }
+
+    #[test]
+    fn summary_for_cpu_appends_max_when_limits_present() {
+        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        use chrono::Utc;
+
+        let series = MetricSeries {
+            kind: MetricKind::Cpu,
+            label: String::new(),
+            unit: "mCores".into(),
+            points: vec![MetricPoint {
+                ts: Utc::now(),
+                value: 12.5,
+            }],
+        };
+        let limits = ContainerAppLimits {
+            cpu_millicores: 500,
+            memory_bytes: 0,
+            fqdn: None,
+        };
+        let out = summary_for(MetricKind::Cpu, &series, Some(&limits));
+        assert!(out.contains("12.5"));
+        assert!(out.contains("/ max 500 mCores"), "got {out:?}");
+    }
+
+    #[test]
+    fn summary_for_cpu_omits_max_when_limits_zero() {
+        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        use chrono::Utc;
+
+        let series = MetricSeries {
+            kind: MetricKind::Cpu,
+            label: String::new(),
+            unit: "mCores".into(),
+            points: vec![MetricPoint {
+                ts: Utc::now(),
+                value: 4.7,
+            }],
+        };
+        let limits = ContainerAppLimits {
+            cpu_millicores: 0,
+            memory_bytes: 0,
+            fqdn: None,
+        };
+        let out = summary_for(MetricKind::Cpu, &series, Some(&limits));
+        assert!(!out.contains("/ max"), "got {out:?}");
+    }
+
+    #[test]
+    fn format_count_renders_zero_without_negative_sign() {
+        // Regression: `format!("{:.0}", -0.0_f64)` yields "-0", and
+        // `f64::max(-0.0, 0.0)` does not reliably strip the negative sign
+        // across platforms.
+        assert_eq!(format_count(-0.0), "0");
+        assert_eq!(format_count(0.0), "0");
+        assert_eq!(format_count(f64::NAN), "0");
+        assert_eq!(format_count(-5.0), "0");
+        assert_eq!(format_count(42.0), "42");
+        assert_eq!(format_count(2_500.0), "2.5k");
     }
 
     fn r() -> Resource {

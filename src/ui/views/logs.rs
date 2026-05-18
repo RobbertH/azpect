@@ -343,7 +343,9 @@ fn wrap_highlighted(
     hi_style: Style,
 ) -> Vec<Line<'static>> {
     if width == 0 {
-        return vec![Line::from(build_spans(value, matches, base_style, hi_style))];
+        return vec![Line::from(build_spans(
+            value, matches, base_style, hi_style,
+        ))];
     }
     let tokens: Vec<(char, bool)> = char_tokens(value, matches);
     if tokens.is_empty() {
@@ -774,8 +776,7 @@ pub(crate) fn line_matches(line: &LogLine, query: &str) -> bool {
         return false;
     }
     let q = query.to_ascii_lowercase();
-    line.source.to_ascii_lowercase().contains(&q)
-        || line.message.to_ascii_lowercase().contains(&q)
+    line.source.to_ascii_lowercase().contains(&q) || line.message.to_ascii_lowercase().contains(&q)
 }
 
 /// Move the logs cursor to the next (`direction == 1`) or previous (`-1`)

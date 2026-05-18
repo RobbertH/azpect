@@ -73,12 +73,22 @@ pub const KQL_FUNCTION_APP_ERRORS_FILTER: &str = r#"
 "#;
 
 /// Container Apps land in one of two console-log tables depending on the
-/// diagnostic-settings destination: `ContainerAppConsoleLogs_CL` (legacy
-/// "Log Analytics" destination, column `Log_s`) or `ContainerAppConsoleLogs`
-/// (modern Azure Monitor "Resource specific" destination, column `Log`).
-/// `isfuzzy=true` lets the query succeed when only one of them is populated.
-pub const KQL_CONTAINER_APP: &str = r#"
+/// environment's `appLogsConfiguration` destination: `ContainerAppConsoleLogs_CL`
+/// (legacy "Log Analytics" destination, column `Log_s` + `ContainerAppName_s`)
+/// or `ContainerAppConsoleLogs` (modern Azure Monitor "Resource specific"
+/// destination, columns `Log` + `ContainerAppName`). `isfuzzy=true` lets the
+/// query succeed when only one of them is populated.
+///
+/// Unlike Function Apps / APIM, Container Apps don't carry per-resource
+/// diagnostic settings — logs are forwarded by the parent Container Apps
+/// Environment. The resource-centric Log Analytics endpoint therefore resolves
+/// to an empty scope, so we query the workspace directly and filter by
+/// `ContainerAppName_s` / `ContainerAppName` to scope to one app. The
+/// `{name}` placeholder is substituted at build time.
+pub const KQL_CONTAINER_APP_TEMPLATE: &str = r#"
 union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs
+| where column_ifexists("ContainerAppName_s", "") == "{name}"
+     or column_ifexists("ContainerAppName", "") == "{name}"
 | order by TimeGenerated desc
 | take 200
 "#;
@@ -107,20 +117,32 @@ pub async fn fetch(
         ))));
     }
 
-    let kql = build_kql(resource.kind, errors_only)?;
+    let kql = build_kql(resource, errors_only)?;
     let timespan = range.timespan();
 
     let client = LogsClient::new(auth.clone())?;
-    let resp = client.query(&resource.id, &kql, &timespan).await?;
+    let resp = match resource.kind {
+        ResourceKind::ContainerApp => {
+            let customer_id =
+                crate::azure::container_app_workspace::resolve(auth, &resource.id).await?;
+            client
+                .query_workspace(&customer_id, &kql, &timespan)
+                .await?
+        }
+        _ => client.query(&resource.id, &kql, &timespan).await?,
+    };
 
     parse_logs_response(&resp, resource.kind)
 }
 
 /// Splice the errors-only filter in BEFORE the `| order by` clause if requested.
-fn build_kql(kind: ResourceKind, errors_only: bool) -> anyhow::Result<String> {
-    let (template, filter) = match kind {
-        ResourceKind::FunctionApp => (KQL_FUNCTION_APP, KQL_FUNCTION_APP_ERRORS_FILTER),
-        ResourceKind::ContainerApp => (KQL_CONTAINER_APP, KQL_CONTAINER_APP_ERRORS_FILTER),
+fn build_kql(resource: &Resource, errors_only: bool) -> anyhow::Result<String> {
+    let (template, filter) = match resource.kind {
+        ResourceKind::FunctionApp => (KQL_FUNCTION_APP.to_string(), KQL_FUNCTION_APP_ERRORS_FILTER),
+        ResourceKind::ContainerApp => (
+            container_app_kql(&resource.name),
+            KQL_CONTAINER_APP_ERRORS_FILTER,
+        ),
         ResourceKind::Apim => {
             return Err(anyhow!(
                 "APIM logs not supported in v1 (no resource-centric Log Analytics template)"
@@ -129,7 +151,7 @@ fn build_kql(kind: ResourceKind, errors_only: bool) -> anyhow::Result<String> {
     };
 
     if !errors_only {
-        return Ok(template.to_string());
+        return Ok(template);
     }
 
     // Find `| order by` and splice the filter just above it. Falls back to appending if absent.
@@ -143,6 +165,15 @@ fn build_kql(kind: ResourceKind, errors_only: bool) -> anyhow::Result<String> {
     } else {
         Ok(format!("{template}\n{filter}"))
     }
+}
+
+/// Substitute the container app name into the template. Container App names
+/// per Azure are `[a-z][a-z0-9-]{1,31}`, so they can't contain quotes, but
+/// we backslash-escape defensively in case an aliased / renamed resource
+/// somehow violates that.
+fn container_app_kql(name: &str) -> String {
+    let escaped = name.replace('\\', r"\\").replace('"', r#"\""#);
+    KQL_CONTAINER_APP_TEMPLATE.replace("{name}", &escaped)
 }
 
 fn parse_logs_response(
@@ -414,9 +445,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_resource(kind: ResourceKind, name: &str) -> Resource {
+        Resource {
+            id: "/r/x".into(),
+            name: name.into(),
+            kind,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: None,
+        }
+    }
+
     #[test]
     fn errors_filter_inserted_before_order_by() {
-        let kql = build_kql(ResourceKind::FunctionApp, true).unwrap();
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let kql = build_kql(&r, true).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let filter_idx = kql
             .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
@@ -426,13 +470,15 @@ mod tests {
 
     #[test]
     fn no_filter_when_errors_only_false() {
-        let kql = build_kql(ResourceKind::ContainerApp, false).unwrap();
+        let r = test_resource(ResourceKind::ContainerApp, "my-app");
+        let kql = build_kql(&r, false).unwrap();
         assert!(!kql.contains("matches regex"));
     }
 
     #[test]
     fn apim_kql_returns_err() {
-        assert!(build_kql(ResourceKind::Apim, false).is_err());
+        let r = test_resource(ResourceKind::Apim, "apim");
+        assert!(build_kql(&r, false).is_err());
     }
 
     #[test]
@@ -520,7 +566,8 @@ mod tests {
 
     #[test]
     fn errors_filter_includes_function_app_logs_level() {
-        let kql = build_kql(ResourceKind::FunctionApp, true).unwrap();
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let kql = build_kql(&r, true).unwrap();
         assert!(
             kql.contains(r#"column_ifexists("Level", "") in ("Error", "Critical")"#),
             "errors-only filter must catch FunctionAppLogs Error/Critical rows"
@@ -529,7 +576,8 @@ mod tests {
 
     #[test]
     fn function_app_kql_uses_fuzzy_union_with_function_app_logs() {
-        let kql = build_kql(ResourceKind::FunctionApp, false).unwrap();
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let kql = build_kql(&r, false).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("FunctionAppLogs"));
     }
@@ -610,16 +658,37 @@ mod tests {
 
     #[test]
     fn container_app_kql_uses_fuzzy_union_over_both_tables() {
-        let kql = build_kql(ResourceKind::ContainerApp, false).unwrap();
+        let r = test_resource(ResourceKind::ContainerApp, "my-app");
+        let kql = build_kql(&r, false).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("ContainerAppConsoleLogs_CL"));
-        // Modern table appears as a bare identifier (not followed by `_CL`).
+        // Modern table appears followed by newline+whitespace, not `_CL`.
         assert!(kql.contains("ContainerAppConsoleLogs\n"));
     }
 
     #[test]
+    fn container_app_kql_filters_by_resource_name() {
+        // Workspace-centric path requires a name filter; otherwise the whole
+        // workspace's container apps come back interleaved.
+        let r = test_resource(ResourceKind::ContainerApp, "files-api");
+        let kql = build_kql(&r, false).unwrap();
+        assert!(kql.contains(r#"column_ifexists("ContainerAppName_s", "") == "files-api""#));
+        assert!(kql.contains(r#"column_ifexists("ContainerAppName", "") == "files-api""#));
+    }
+
+    #[test]
+    fn container_app_kql_escapes_double_quote_in_name() {
+        // Defensive: a name containing `"` would otherwise close the KQL
+        // string literal and let the rest be parsed as KQL.
+        let r = test_resource(ResourceKind::ContainerApp, r#"bad"name"#);
+        let kql = build_kql(&r, false).unwrap();
+        assert!(kql.contains(r#"bad\"name"#));
+    }
+
+    #[test]
     fn container_app_errors_filter_uses_column_ifexists_for_both_log_columns() {
-        let kql = build_kql(ResourceKind::ContainerApp, true).unwrap();
+        let r = test_resource(ResourceKind::ContainerApp, "my-app");
+        let kql = build_kql(&r, true).unwrap();
         assert!(kql.contains(r#"column_ifexists("Log_s", "")"#));
         assert!(kql.contains(r#"column_ifexists("Log", "")"#));
     }

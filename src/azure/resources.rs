@@ -42,13 +42,22 @@ pub struct Resource {
 
 /// KQL query template. Lane 2 substitutes nothing — Resource Graph honors the
 /// `subscriptions` field in the request body to scope, so this query is fixed.
+///
+/// `state` is coalesced per resource family: Function Apps and APIM expose
+/// `properties.state` (`Running`/`Stopped`), but Container Apps don't —
+/// they expose `properties.runningStatus` (`Running`/`Progressing`/`Stopped`/
+/// `Suspended`). Without the case() the Detail view shows "state: unknown"
+/// for every Container App.
 pub const KQL: &str = r#"
 Resources
 | where (type == 'microsoft.web/sites' and kind contains 'functionapp')
     or type == 'microsoft.apimanagement/service'
     or type == 'microsoft.app/containerapps'
 | project id, name, type, kind, location, resourceGroup, subscriptionId,
-          state = tostring(properties.state)
+          state = case(
+              type == 'microsoft.app/containerapps', tostring(properties.runningStatus),
+              tostring(properties.state)
+          )
 | order by name asc
 "#;
 

@@ -131,7 +131,7 @@ pub fn metric_names(kind: ResourceKind) -> &'static [(MetricKind, &'static str, 
             // No memory metric on APIM
         ],
         ResourceKind::ContainerApp => &[
-            // Errors via $filter on statusCode startswith '5'
+            // Errors via $filter on statusCodeCategory eq '5xx'
             (MetricKind::Errors, "Requests", "Total"),
             (MetricKind::Traffic, "Requests", "Total"),
             (MetricKind::Cpu, "UsageNanoCores", "Average"),
@@ -163,6 +163,29 @@ fn short_unit(monitor_unit: &str) -> String {
         "" | "unspecified" => "".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Apply per-metric unit scaling. Container App `UsageNanoCores` lands as raw
+/// nanocores (e.g. 12_500_000), which is unreadable in the sparkline header.
+/// Scale to millicores (12.5 mCores) and override the unit label. Everything
+/// else falls through to the generic `short_unit` mapping.
+fn normalize_unit(
+    physical_name: &str,
+    raw_unit: &str,
+    points: Vec<MetricPoint>,
+) -> (String, Vec<MetricPoint>) {
+    if physical_name == "UsageNanoCores" {
+        const NANO_PER_MILLI: f64 = 1_000_000.0;
+        let scaled = points
+            .into_iter()
+            .map(|p| MetricPoint {
+                ts: p.ts,
+                value: p.value / NANO_PER_MILLI,
+            })
+            .collect();
+        return ("mCores".to_string(), scaled);
+    }
+    (short_unit(raw_unit), points)
 }
 
 /// Pick the data-point field name for the requested aggregation.
@@ -218,7 +241,13 @@ pub async fn fetch(
         let filter = if needs_error_filter && kind == MetricKind::Errors {
             match resource.kind {
                 ResourceKind::Apim => Some("GatewayResponseCodeCategory eq '5xx'".to_string()),
-                ResourceKind::ContainerApp => Some("statusCode startswith '5'".to_string()),
+                // Monitor's $filter only supports `eq`, `ne`, and `sw`
+                // (NOT `startswith`), so an earlier `statusCode startswith '5'`
+                // got rejected with BadRequest. `statusCodeCategory` is a
+                // first-class dimension on Container App `Requests` whose
+                // values are `2xx` / `4xx` / `5xx`, so an `eq` on it is both
+                // valid syntax and cleaner than `statusCode sw '5'`.
+                ResourceKind::ContainerApp => Some("statusCodeCategory eq '5xx'".to_string()),
                 ResourceKind::FunctionApp => None,
             }
         } else {
@@ -309,7 +338,7 @@ fn parse_metrics_response(
 
         // Find which requested metric this corresponds to. Match on name; if
         // multiple requested entries share a physical name (rare), pick the first.
-        let (kind, _physical, aggregation) = match requested.iter().find(|(_, n, _)| n == name) {
+        let (kind, physical, aggregation) = match requested.iter().find(|(_, n, _)| n == name) {
             Some(triple) => triple,
             None => continue,
         };
@@ -341,10 +370,12 @@ fn parse_metrics_response(
             None => Vec::new(),
         };
 
+        let (unit_label, points) = normalize_unit(physical, unit, points);
+
         out.push(MetricSeries {
             kind: *kind,
             label: label_for(*kind, resource_kind).to_string(),
-            unit: short_unit(unit),
+            unit: unit_label,
             points,
         });
     }
@@ -464,6 +495,42 @@ mod tests {
         let series = parse_metrics_response(&payload, &requested, ResourceKind::Apim);
         assert_eq!(series.len(), 1);
         assert!(series[0].points.is_empty());
+    }
+
+    #[test]
+    fn container_app_usage_nanocores_is_scaled_to_millicores() {
+        // 12_500_000 nanocores = 12.5 mCores. Unit must override the raw
+        // "NanoCores" string Azure returns.
+        let payload = json!({
+            "value": [
+                {
+                    "name": { "value": "UsageNanoCores", "localizedValue": "CPU" },
+                    "unit": "NanoCores",
+                    "timeseries": [
+                        {
+                            "data": [
+                                { "timeStamp": "2026-01-01T00:00:00Z", "average": 12_500_000.0 },
+                                { "timeStamp": "2026-01-01T00:15:00Z", "average": 0.0 }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        let requested = vec![(
+            MetricKind::Cpu,
+            "UsageNanoCores".to_string(),
+            "Average".to_string(),
+        )];
+        let series = parse_metrics_response(&payload, &requested, ResourceKind::ContainerApp);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].unit, "mCores");
+        assert!(
+            (series[0].points[0].value - 12.5).abs() < 1e-9,
+            "expected 12.5, got {}",
+            series[0].points[0].value,
+        );
+        assert_eq!(series[0].points[1].value, 0.0);
     }
 
     #[test]

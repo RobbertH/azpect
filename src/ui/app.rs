@@ -351,6 +351,7 @@ async fn event_loop(
                         }
                         spawn_missing_list_metrics(state, auth, tx);
                         spawn_missing_list_health(state, auth, tx);
+                        spawn_missing_container_app_limits(state, auth, tx);
                     }
                     Err(e) => state.set_status(format!("resources: {e}")),
                 }
@@ -407,6 +408,27 @@ async fn event_loop(
                         state.health.failures.insert(resource_id, e);
                     }
                 }
+            }
+            AppEvent::ContainerAppLimitsLoaded {
+                resource_id,
+                result,
+            } => {
+                state.limits.pending.remove(&resource_id);
+                if let Ok(limits) = result {
+                    state.limits.by_resource.insert(resource_id, limits);
+                }
+                // On error we silently leave the cache empty; the detail view
+                // just omits the "/ max" suffix rather than surfacing noise
+                // for a non-critical decoration.
+            }
+            AppEvent::ContainerAppRevisionMetaLoaded {
+                resource_id,
+                result,
+            } => {
+                if let Ok(Some(meta)) = result {
+                    state.revision_meta.by_resource.insert(resource_id, meta);
+                }
+                // Same silent-on-error policy as limits: decorative.
             }
         }
 
@@ -1396,20 +1418,83 @@ fn spawn_load_health(
     tokio::spawn(async move {
         // Container Apps don't expose meaningful state via the generic
         // Microsoft.ResourceHealth endpoint — it returns `Unknown` even when
-        // active revisions are ActivationFailed/Unhealthy. Use revision data
-        // as the authoritative signal instead.
-        let result = match kind {
+        // active revisions are ActivationFailed/Unhealthy. The revisions
+        // endpoint gives us both the authoritative availability signal and
+        // the display metadata (active revision name, image, replicas), so
+        // one fetch feeds two events.
+        match kind {
             ResourceKind::ContainerApp => {
-                crate::azure::container_app_revisions::fetch(&auth, &resource_id).await
+                match crate::azure::container_app_revisions::fetch(&auth, &resource_id).await {
+                    Ok(info) => {
+                        let _ = tx.send(AppEvent::HealthLoaded {
+                            resource_id: resource_id.clone(),
+                            result: Ok(info.availability),
+                        });
+                        let _ = tx.send(AppEvent::ContainerAppRevisionMetaLoaded {
+                            resource_id,
+                            result: Ok(info.active_revision),
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let _ = tx.send(AppEvent::HealthLoaded {
+                            resource_id,
+                            result: Err(msg),
+                        });
+                    }
+                }
             }
-            _ => crate::azure::resource_health::fetch(&auth, &resource_id).await,
-        };
-        let result = result.map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::HealthLoaded {
+            _ => {
+                let result = crate::azure::resource_health::fetch(&auth, &resource_id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(AppEvent::HealthLoaded {
+                    resource_id,
+                    result,
+                });
+            }
+        }
+    });
+}
+
+fn spawn_load_container_app_limits(
+    auth: AzureAuth,
+    resource_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::container_app_limits::fetch(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ContainerAppLimitsLoaded {
             resource_id,
             result,
         });
     });
+}
+
+/// Kick off a Container App template fetch for every Container App that
+/// doesn't already have cached limits. Same eager-on-load pattern as
+/// `spawn_missing_list_health`.
+fn spawn_missing_container_app_limits(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::azure::resources::ResourceKind;
+    let to_fetch: Vec<String> = state
+        .resources
+        .iter()
+        .filter(|r| r.kind == ResourceKind::ContainerApp)
+        .filter(|r| {
+            !state.limits.by_resource.contains_key(&r.id) && !state.limits.pending.contains(&r.id)
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    for resource_id in to_fetch {
+        state.limits.pending.insert(resource_id.clone());
+        spawn_load_container_app_limits(auth.clone(), resource_id, tx.clone());
+    }
 }
 
 /// Kick off a Resource Health fetch for every loaded resource that doesn't

@@ -76,6 +76,23 @@ pub struct MetricsCache {
     pub last_error: Option<String>,
 }
 
+/// Per-Container-App configured CPU/memory caps from the resource template,
+/// rendered alongside the CPU/Memory metrics as "latest: X / max Y". Cached
+/// per resource id; only populated for `ResourceKind::ContainerApp`.
+#[derive(Clone, Default)]
+pub struct LimitsCache {
+    pub by_resource: HashMap<String, crate::azure::container_app_limits::ContainerAppLimits>,
+    pub pending: HashSet<String>,
+}
+
+/// Per-Container-App active revision metadata (name, image, replicas, scale)
+/// from the revisions endpoint. Populated by the same fetch that drives the
+/// health badge for Container Apps.
+#[derive(Clone, Default)]
+pub struct RevisionMetaCache {
+    pub by_resource: HashMap<String, crate::azure::container_app_revisions::ActiveRevisionMeta>,
+}
+
 /// Per-resource cached Azure Resource Health availability. Populated by a
 /// background fetch kicked off after `ResourcesLoaded`; consumed by
 /// `azure::health::derive` to outrank the metric-derived heuristic.
@@ -139,6 +156,8 @@ pub struct AppState {
     pub metrics: MetricsCache,
     pub health: HealthCache,
     pub logs: LogsCache,
+    pub limits: LimitsCache,
+    pub revision_meta: RevisionMetaCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -207,6 +226,8 @@ impl AppState {
                 range,
                 ..Default::default()
             },
+            limits: LimitsCache::default(),
+            revision_meta: RevisionMetaCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,

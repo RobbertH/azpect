@@ -231,4 +231,27 @@ impl LogsClient {
         })
         .await
     }
+
+    /// Workspace-centric query. Required for Container Apps, where logs are
+    /// forwarded by the parent Container Apps Environment (not by per-resource
+    /// diagnostic settings), so the resource-centric path resolves to an empty
+    /// scope and every union returns SEM0529.
+    pub async fn query_workspace(
+        &self,
+        customer_id: &str,
+        kql: &str,
+        timespan: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{LOGS_BASE}/v1/workspaces/{customer_id}/query");
+        let body = serde_json::json!({
+            "query": kql,
+            "timespan": timespan,
+        });
+        send_with_retry(&self.http, &self.auth, SCOPE_LOGS, |http| {
+            http.request(Method::POST, &url)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body)
+        })
+        .await
+    }
 }
