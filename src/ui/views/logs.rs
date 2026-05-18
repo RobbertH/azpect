@@ -21,7 +21,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const TIME_COL: u16 = 19;
@@ -66,6 +66,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             header_spans.push(Span::styled(
                 format!("· /{} ", state.logs.search_input.value()),
                 Style::default().fg(theme.fg),
+            ));
+        }
+        // Reload-in-flight indicator: only useful when we already have lines
+        // showing (otherwise the body's "Loading logs…" already conveys it).
+        if state.logs.loading
+            && state
+                .logs
+                .by_resource
+                .get(&r.id)
+                .is_some_and(|lines| !lines.is_empty())
+        {
+            header_spans.push(Span::styled(
+                "· refreshing… ",
+                Style::default().fg(theme.muted),
             ));
         }
     } else {

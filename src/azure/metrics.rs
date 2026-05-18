@@ -78,6 +78,16 @@ impl TimeRange {
             TimeRange::Week => "7d",
         }
     }
+
+    /// Human-readable form of the per-bin aggregation interval. Surfaced in
+    /// the detail header so the user understands why a single bar represents
+    /// 15 minutes / 1 hour of data rather than near-realtime.
+    pub fn pretty_interval(&self) -> &'static str {
+        match self {
+            TimeRange::Day => "15m",
+            TimeRange::Week => "1h",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

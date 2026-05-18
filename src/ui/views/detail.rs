@@ -134,7 +134,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Span::styled(badge_label, Style::default().fg(badge_color)),
             Span::styled(" · ", Style::default().fg(theme.muted)),
             Span::styled(
-                format!("window {}", state.metrics.range.label()),
+                format!(
+                    "window {} · per {}",
+                    state.metrics.range.label(),
+                    state.metrics.range.pretty_interval()
+                ),
                 Style::default().fg(theme.fg),
             ),
             Span::styled(
@@ -708,6 +712,51 @@ mod tests {
         data.push(96);
         let out = stretch_to_width(&data, 100);
         assert_eq!(*out.last().unwrap(), 96);
+    }
+
+    #[test]
+    fn latest_point_ts_picks_the_max_across_series() {
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        let t = |s: &str| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+                .unwrap()
+                .and_utc()
+        };
+        let series = vec![
+            MetricSeries {
+                kind: MetricKind::Traffic,
+                label: String::new(),
+                unit: String::new(),
+                points: vec![
+                    MetricPoint {
+                        ts: t("2026-05-18T16:00:00"),
+                        value: 1.0,
+                    },
+                    MetricPoint {
+                        ts: t("2026-05-18T16:15:00"),
+                        value: 2.0,
+                    },
+                ],
+            },
+            MetricSeries {
+                kind: MetricKind::Cpu,
+                label: String::new(),
+                unit: String::new(),
+                points: vec![MetricPoint {
+                    ts: t("2026-05-18T16:30:00"),
+                    value: 5.0,
+                }],
+            },
+        ];
+        let v = Some(&series);
+        assert_eq!(latest_point_ts(v).unwrap(), t("2026-05-18T16:30:00"));
+    }
+
+    #[test]
+    fn latest_point_ts_handles_empty_and_missing() {
+        assert!(latest_point_ts(None).is_none());
+        let empty: Vec<crate::azure::metrics::MetricSeries> = vec![];
+        assert!(latest_point_ts(Some(&empty)).is_none());
     }
 
     #[test]
