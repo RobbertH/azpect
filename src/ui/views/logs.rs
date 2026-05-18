@@ -527,8 +527,8 @@ fn level_cell(line: &LogLine, theme: &Theme) -> (String, Color) {
     }
     match line.level {
         LogLevel::Error => ("ERR".into(), theme.critical),
-        LogLevel::Warn => ("WRN".into(), theme.degraded),
-        LogLevel::Info => ("INF".into(), theme.fg),
+        LogLevel::Warn => ("WARN".into(), theme.degraded),
+        LogLevel::Info => ("INFO".into(), theme.fg),
         LogLevel::Trace => ("TRC".into(), theme.muted),
     }
 }
