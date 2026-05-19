@@ -110,6 +110,19 @@ pub struct HealthCache {
 pub struct LogsCache {
     /// keyed by resource id
     pub by_resource: HashMap<String, Vec<LogLine>>,
+    /// Per-resource flag for "the last fetch came back full, so older rows
+    /// may still exist in the window." Drives both the header indicator and
+    /// the auto-fetch trigger on G / scroll-past-bottom.
+    pub more_available: HashMap<String, bool>,
+    /// Set true while an *older-than* page is in flight. Distinct from
+    /// `loading`, which is the initial / refresh fetch — keeping them apart
+    /// avoids the body wiping back to "Loading logs…" during a fetch-more.
+    pub loading_more: bool,
+    /// Set by the logs view when the user crosses the bottom of the buffer
+    /// (G or MoveDown at last row). Drained by the event loop, which spawns
+    /// the older-than fetch and clears it. View handlers can't spawn tasks
+    /// directly, so this flag is the bridge.
+    pub fetch_more_requested: bool,
     pub range: TimeRange,
     pub errors_only: bool,
     pub loading: bool,

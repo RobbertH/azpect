@@ -61,6 +61,43 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!("· {} ", state.logs.range.label()),
             Style::default().fg(theme.muted),
         ));
+        // Buffer status: row count, plus a hint about whether more older rows
+        // are reachable. Lets the user see why G stops where it does, and
+        // confirms when scroll-to-load has actually pulled fresh pages in.
+        let cached = state
+            .logs
+            .by_resource
+            .get(&r.id)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if cached > 0 {
+            let more = state
+                .logs
+                .more_available
+                .get(&r.id)
+                .copied()
+                .unwrap_or(false);
+            header_spans.push(Span::styled(
+                format!("· {cached} rows "),
+                Style::default().fg(theme.muted),
+            ));
+            if state.logs.loading_more {
+                header_spans.push(Span::styled(
+                    "· loading more… ",
+                    Style::default().fg(theme.muted),
+                ));
+            } else if more {
+                header_spans.push(Span::styled(
+                    "· more on ↓ ",
+                    Style::default().fg(theme.muted),
+                ));
+            } else {
+                header_spans.push(Span::styled(
+                    "· window complete ",
+                    Style::default().fg(theme.muted),
+                ));
+            }
+        }
         if state.logs.errors_only {
             header_spans.push(Span::styled(
                 "· filter: errors only ✓ ",
@@ -832,7 +869,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::MoveDown => {
             if lines_len > 0 {
+                let at_bottom = state.logs.scroll + 1 >= lines_len;
                 state.logs.scroll = (state.logs.scroll + 1).min(lines_len - 1);
+                if at_bottom {
+                    request_fetch_more(state);
+                }
             }
             true
         }
@@ -842,7 +883,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::HalfPageDown => {
             if lines_len > 0 {
+                let at_bottom = state.logs.scroll + HALF_PAGE >= lines_len;
                 state.logs.scroll = (state.logs.scroll + HALF_PAGE).min(lines_len - 1);
+                if at_bottom {
+                    request_fetch_more(state);
+                }
             }
             true
         }
@@ -858,6 +903,10 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if lines_len > 0 {
                 state.logs.scroll = lines_len - 1;
             }
+            // G is also a "give me everything" hint — always ask for more,
+            // even when the cursor was already at the bottom. The drain in
+            // app.rs coalesces a second press while a fetch is in flight.
+            request_fetch_more(state);
             true
         }
         _ => false,
@@ -926,6 +975,23 @@ fn find_next_match(lines: &[LogLine], cursor: usize, query: &str, direction: i32
     } else {
         None
     }
+}
+
+/// Signal the event loop to fetch an older page for the currently-selected
+/// resource. Guarded by `more_available` so we don't spam the workspace once
+/// the user has reached the bottom of the window, and by `loading_more` so a
+/// rapid `G`-press doesn't queue duplicate fetches.
+fn request_fetch_more(state: &mut AppState) {
+    if state.logs.loading || state.logs.loading_more {
+        return;
+    }
+    let Some(id) = state.selected_resource().map(|r| r.id.clone()) else {
+        return;
+    };
+    if !state.logs.more_available.get(&id).copied().unwrap_or(false) {
+        return;
+    }
+    state.logs.fetch_more_requested = true;
 }
 
 fn set_window(state: &mut AppState, range: TimeRange) -> bool {
@@ -1442,6 +1508,71 @@ mod tests {
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("/hello"), "expected the search query bar");
         assert!(s.contains("hello"), "expected the matching log line");
+    }
+
+    #[test]
+    fn goto_bottom_requests_fetch_more_when_more_available() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "a"),
+                line(2, LogLevel::Info, "x", "b"),
+            ],
+        );
+        state.logs.more_available.insert("/r/one".into(), true);
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert!(
+            state.logs.fetch_more_requested,
+            "G with more_available should ask the event loop for an older page"
+        );
+    }
+
+    #[test]
+    fn goto_bottom_does_not_request_when_window_exhausted() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state
+            .logs
+            .by_resource
+            .insert("/r/one".into(), vec![line(1, LogLevel::Info, "x", "a")]);
+        state.logs.more_available.insert("/r/one".into(), false);
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert!(
+            !state.logs.fetch_more_requested,
+            "G after window-complete must not pester the workspace again"
+        );
+    }
+
+    #[test]
+    fn move_down_at_last_row_requests_fetch_more() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "a"),
+                line(2, LogLevel::Info, "x", "b"),
+            ],
+        );
+        state.logs.more_available.insert("/r/one".into(), true);
+        state.logs.scroll = 1; // already on the last row
+        assert!(handle(Action::MoveDown, &mut state));
+        assert!(state.logs.fetch_more_requested);
+    }
+
+    #[test]
+    fn fetch_more_request_suppressed_while_loading_more() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state
+            .logs
+            .by_resource
+            .insert("/r/one".into(), vec![line(1, LogLevel::Info, "x", "a")]);
+        state.logs.more_available.insert("/r/one".into(), true);
+        state.logs.loading_more = true;
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert!(
+            !state.logs.fetch_more_requested,
+            "in-flight fetch must coalesce repeated G presses"
+        );
     }
 
     #[test]

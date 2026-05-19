@@ -298,6 +298,7 @@ async fn event_loop(
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
                 }
+                drain_fetch_more_requested(state, auth, tx);
             }
             AppEvent::SubscriptionsLoaded(res) => {
                 state.loading_subscriptions = false;
@@ -383,13 +384,27 @@ async fn event_loop(
             }
             AppEvent::LogsLoaded {
                 resource_id,
+                append,
                 result,
             } => {
-                state.logs.loading = false;
+                if append {
+                    state.logs.loading_more = false;
+                } else {
+                    state.logs.loading = false;
+                }
                 match result {
-                    Ok(lines) => {
-                        state.logs.by_resource.insert(resource_id, lines);
+                    Ok(page) => {
                         state.logs.last_error = None;
+                        state
+                            .logs
+                            .more_available
+                            .insert(resource_id.clone(), page.has_more);
+                        if append {
+                            let entry = state.logs.by_resource.entry(resource_id).or_default();
+                            entry.extend(page.lines);
+                        } else {
+                            state.logs.by_resource.insert(resource_id, page.lines);
+                        }
                     }
                     Err(e) => state.logs.last_error = Some(e),
                 }
@@ -696,14 +711,19 @@ fn do_open_in_browser(state: &mut AppState) {
     }
 }
 
-/// Resolve what `o` should open. List/Detail/Logs open the selected resource's
-/// portal blade; Subscriptions opens the highlighted subscription's overview.
+/// Resolve what `o` should open. List/Detail open the selected resource's
+/// overview blade; Logs/LogDetail jump straight to the resource's Logs (KQL)
+/// blade so the user lands on the same signal they were just reading.
+/// Subscriptions opens the highlighted subscription's overview.
 fn portal_url_for(state: &AppState) -> Option<String> {
     const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
     match state.view {
-        View::List | View::Detail | View::Logs | View::LogDetail => state
+        View::List | View::Detail => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        View::Logs | View::LogDetail => state
+            .selected_resource()
+            .map(|r| format!("{PORTAL_BASE}{}/logs", r.id)),
         View::Subscriptions => state
             .subscriptions
             .get(state.subscription_cursor)
@@ -864,12 +884,18 @@ fn kick_off_loads_for_view(
         View::Logs => {
             if let Some(resource) = state.selected_resource().cloned() {
                 if force || !state.logs.loading {
+                    // Fresh fetch always starts from the newest end — drop the
+                    // pagination metadata so the next page detection starts
+                    // clean (otherwise a stale `more_available = false` would
+                    // suppress fetch-more on the new dataset).
+                    state.logs.more_available.remove(&resource.id);
                     state.logs.loading = true;
                     spawn_load_logs(
                         auth.clone(),
                         resource,
                         state.logs.range,
                         state.logs.errors_only,
+                        None,
                         tx.clone(),
                     );
                 }
@@ -878,6 +904,45 @@ fn kick_off_loads_for_view(
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
+}
+
+/// Spawn an older-than fetch when the logs view raised `fetch_more_requested`.
+/// View handlers can't spawn tasks themselves (no access to `auth` / `tx`), so
+/// they set the flag and we drain it from the event loop. Drains exactly once
+/// per action; double-presses while a fetch is already in flight are coalesced
+/// by the `loading_more` guard.
+fn drain_fetch_more_requested(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    if !std::mem::take(&mut state.logs.fetch_more_requested) {
+        return;
+    }
+    if state.logs.loading || state.logs.loading_more {
+        return;
+    }
+    let Some(resource) = state.selected_resource().cloned() else {
+        return;
+    };
+    let oldest = state
+        .logs
+        .by_resource
+        .get(&resource.id)
+        .and_then(|lines| lines.last())
+        .map(|l| l.ts);
+    let Some(older_than) = oldest else {
+        return;
+    };
+    state.logs.loading_more = true;
+    spawn_load_logs(
+        auth.clone(),
+        resource,
+        state.logs.range,
+        state.logs.errors_only,
+        Some(older_than),
+        tx.clone(),
+    );
 }
 
 fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1524,15 +1589,18 @@ fn spawn_load_logs(
     resource: Resource,
     range: TimeRange,
     errors_only: bool,
+    older_than: Option<chrono::DateTime<chrono::Utc>>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    let append = older_than.is_some();
     tokio::spawn(async move {
         let resource_id = resource.id.clone();
-        let result = crate::azure::logs::fetch(&auth, &resource, range, errors_only)
+        let result = crate::azure::logs::fetch(&auth, &resource, range, errors_only, older_than)
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::LogsLoaded {
             resource_id,
+            append,
             result,
         });
     });
@@ -2012,5 +2080,9 @@ mod tests {
         let url = portal_url_for(&state).expect("log detail should yield a portal URL");
         assert!(url.contains("portal.azure.com"));
         assert!(url.contains("/sites/alpha"));
+        assert!(
+            url.ends_with("/logs"),
+            "log views should open the Logs blade, got {url}"
+        );
     }
 }

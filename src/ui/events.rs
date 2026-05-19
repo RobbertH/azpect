@@ -14,7 +14,6 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::azure::logs::LogLine;
 use crate::azure::metrics::MetricsResult;
 use crate::azure::resources::Resource;
 use crate::azure::subscriptions::Subscription;
@@ -42,9 +41,14 @@ pub enum AppEvent {
         result: Result<MetricsResult, String>,
     },
     /// Background load completion: logs for a specific resource id.
+    ///
+    /// `append` distinguishes the initial / refresh fetch (`false` — replace
+    /// the cached vec) from a paginated older-than fetch (`true` — push the
+    /// page onto the end of the existing vec).
     LogsLoaded {
         resource_id: String,
-        result: Result<Vec<LogLine>, String>,
+        append: bool,
+        result: Result<crate::azure::logs::LogsPage, String>,
     },
     /// Background load completion: Azure Resource Health availability for a
     /// specific resource id.

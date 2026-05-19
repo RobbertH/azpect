@@ -53,10 +53,15 @@ pub fn supports_logs(kind: ResourceKind) -> bool {
 /// `AppRequests`) with `FunctionAppLogs`, which is what the Function App
 /// resource ships when only diagnostic settings are configured (no AI, or
 /// classic AI). At least one of the four must resolve or KQL returns SEM0529.
+///
+/// `{limit}` is substituted at build time. Sizing the cap to the time range
+/// (see [`row_limit`]) keeps a low-volume 1h window cheap while letting a
+/// 1d / 7d window actually span the requested duration — otherwise `G` lands
+/// at the bottom of the buffer, not the bottom of the window.
 pub const KQL_FUNCTION_APP: &str = r#"
 union isfuzzy=true AppTraces, AppExceptions, AppRequests, FunctionAppLogs
 | order by TimeGenerated desc
-| take 200
+| take {limit}
 "#;
 
 /// `Level` covers `FunctionAppLogs`; `SeverityLevel`/`itemType`/`Success` cover
@@ -90,7 +95,7 @@ union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs
 | where column_ifexists("ContainerAppName_s", "") == "{name}"
      or column_ifexists("ContainerAppName", "") == "{name}"
 | order by TimeGenerated desc
-| take 200
+| take {limit}
 "#;
 
 /// `column_ifexists` is required because the two unioned tables don't share
@@ -104,12 +109,32 @@ pub const KQL_CONTAINER_APP_ERRORS_FILTER: &str = r#"
 /// Maximum length of `LogLine.message` before truncation.
 const MESSAGE_TRUNCATE: usize = 500;
 
+/// Rows per fetch. Each page round-trips through the workspace, so smaller
+/// pages keep the first paint snappy; the UI calls [`fetch`] with an
+/// `older_than` cursor whenever the user scrolls past the bottom, so the
+/// effective coverage of a 1d / 7d window is unbounded by this constant.
+///
+/// A returned page with exactly `PAGE_SIZE` rows is taken as the signal that
+/// older data may still exist (`has_more = true`). Fewer rows → we've hit
+/// the start of the window.
+pub const PAGE_SIZE: u32 = 500;
+
+/// One page of log rows plus whether the workspace likely has more older rows
+/// in the same window. `has_more` is the page-saturation heuristic: a fetch
+/// that came back full is taken as "older rows still exist," partial → done.
+#[derive(Debug, Default)]
+pub struct LogsPage {
+    pub lines: Vec<LogLine>,
+    pub has_more: bool,
+}
+
 pub async fn fetch(
     auth: &AzureAuth,
     resource: &Resource,
     range: TimeRange,
     errors_only: bool,
-) -> anyhow::Result<Vec<LogLine>> {
+    older_than: Option<DateTime<Utc>>,
+) -> anyhow::Result<LogsPage> {
     if !supports_logs(resource.kind) {
         return Err(anyhow!(AzpectError::UnsupportedMetric(format!(
             "logs not supported for {:?}",
@@ -117,7 +142,7 @@ pub async fn fetch(
         ))));
     }
 
-    let kql = build_kql(resource, errors_only)?;
+    let kql = build_kql(resource, errors_only, older_than)?;
     let timespan = range.timespan();
 
     let client = LogsClient::new(auth.clone())?;
@@ -132,12 +157,20 @@ pub async fn fetch(
         _ => client.query(&resource.id, &kql, &timespan).await?,
     };
 
-    parse_logs_response(&resp, resource.kind)
+    let lines = parse_logs_response(&resp, resource.kind)?;
+    let has_more = lines.len() as u32 >= PAGE_SIZE;
+    Ok(LogsPage { lines, has_more })
 }
 
-/// Splice the errors-only filter in BEFORE the `| order by` clause if requested.
-fn build_kql(resource: &Resource, errors_only: bool) -> anyhow::Result<String> {
-    let (template, filter) = match resource.kind {
+/// Splice the errors-only filter (and an `older_than` cursor for pagination)
+/// in BEFORE the `| order by` clause. Both filters land in the same spot so
+/// the order by / take still see the narrowest possible row set.
+fn build_kql(
+    resource: &Resource,
+    errors_only: bool,
+    older_than: Option<DateTime<Utc>>,
+) -> anyhow::Result<String> {
+    let (template, errors_filter) = match resource.kind {
         ResourceKind::FunctionApp => (KQL_FUNCTION_APP.to_string(), KQL_FUNCTION_APP_ERRORS_FILTER),
         ResourceKind::ContainerApp => (
             container_app_kql(&resource.name),
@@ -150,20 +183,36 @@ fn build_kql(resource: &Resource, errors_only: bool) -> anyhow::Result<String> {
         }
     };
 
-    if !errors_only {
+    let template = template.replace("{limit}", &PAGE_SIZE.to_string());
+
+    // Build the filter block (zero, one, or two clauses) and splice it before
+    // `| order by`. Each clause is a full `| where …` line; concatenated they
+    // form a contiguous filter section.
+    let mut filter_block = String::new();
+    if errors_only {
+        filter_block.push_str(errors_filter.trim());
+        filter_block.push('\n');
+    }
+    if let Some(ts) = older_than {
+        // RFC3339 with microsecond precision keeps cursor strictly older than
+        // the last received row even if two rows landed in the same second.
+        let stamp = ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        filter_block.push_str(&format!(r#"| where TimeGenerated < datetime("{stamp}")"#));
+        filter_block.push('\n');
+    }
+
+    if filter_block.is_empty() {
         return Ok(template);
     }
 
-    // Find `| order by` and splice the filter just above it. Falls back to appending if absent.
     if let Some(idx) = template.find("| order by") {
-        let mut spliced = String::with_capacity(template.len() + filter.len() + 1);
+        let mut spliced = String::with_capacity(template.len() + filter_block.len());
         spliced.push_str(&template[..idx]);
-        spliced.push_str(filter.trim());
-        spliced.push('\n');
+        spliced.push_str(&filter_block);
         spliced.push_str(&template[idx..]);
         Ok(spliced)
     } else {
-        Ok(format!("{template}\n{filter}"))
+        Ok(format!("{template}\n{filter_block}"))
     }
 }
 
@@ -460,7 +509,7 @@ mod tests {
     #[test]
     fn errors_filter_inserted_before_order_by() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, true).unwrap();
+        let kql = build_kql(&r, true, None).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let filter_idx = kql
             .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
@@ -471,14 +520,14 @@ mod tests {
     #[test]
     fn no_filter_when_errors_only_false() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, false).unwrap();
+        let kql = build_kql(&r, false, None).unwrap();
         assert!(!kql.contains("matches regex"));
     }
 
     #[test]
     fn apim_kql_returns_err() {
         let r = test_resource(ResourceKind::Apim, "apim");
-        assert!(build_kql(&r, false).is_err());
+        assert!(build_kql(&r, false, None).is_err());
     }
 
     #[test]
@@ -567,7 +616,7 @@ mod tests {
     #[test]
     fn errors_filter_includes_function_app_logs_level() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, true).unwrap();
+        let kql = build_kql(&r, true, None).unwrap();
         assert!(
             kql.contains(r#"column_ifexists("Level", "") in ("Error", "Critical")"#),
             "errors-only filter must catch FunctionAppLogs Error/Critical rows"
@@ -577,7 +626,7 @@ mod tests {
     #[test]
     fn function_app_kql_uses_fuzzy_union_with_function_app_logs() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, false).unwrap();
+        let kql = build_kql(&r, false, None).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("FunctionAppLogs"));
     }
@@ -659,7 +708,7 @@ mod tests {
     #[test]
     fn container_app_kql_uses_fuzzy_union_over_both_tables() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, false).unwrap();
+        let kql = build_kql(&r, false, None).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("ContainerAppConsoleLogs_CL"));
         // Modern table appears followed by newline+whitespace, not `_CL`.
@@ -671,7 +720,7 @@ mod tests {
         // Workspace-centric path requires a name filter; otherwise the whole
         // workspace's container apps come back interleaved.
         let r = test_resource(ResourceKind::ContainerApp, "files-api");
-        let kql = build_kql(&r, false).unwrap();
+        let kql = build_kql(&r, false, None).unwrap();
         assert!(kql.contains(r#"column_ifexists("ContainerAppName_s", "") == "files-api""#));
         assert!(kql.contains(r#"column_ifexists("ContainerAppName", "") == "files-api""#));
     }
@@ -681,14 +730,14 @@ mod tests {
         // Defensive: a name containing `"` would otherwise close the KQL
         // string literal and let the rest be parsed as KQL.
         let r = test_resource(ResourceKind::ContainerApp, r#"bad"name"#);
-        let kql = build_kql(&r, false).unwrap();
+        let kql = build_kql(&r, false, None).unwrap();
         assert!(kql.contains(r#"bad\"name"#));
     }
 
     #[test]
     fn container_app_errors_filter_uses_column_ifexists_for_both_log_columns() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, true).unwrap();
+        let kql = build_kql(&r, true, None).unwrap();
         assert!(kql.contains(r#"column_ifexists("Log_s", "")"#));
         assert!(kql.contains(r#"column_ifexists("Log", "")"#));
     }
@@ -700,5 +749,56 @@ mod tests {
         // "…" is 3 bytes, so length = 500 + 3.
         assert!(t.len() <= MESSAGE_TRUNCATE + 3);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn build_kql_splices_older_than_cursor_before_order_by() {
+        let r = test_resource(ResourceKind::ContainerApp, "files-api");
+        let cursor = DateTime::parse_from_rfc3339("2026-05-19T03:17:43.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_kql(&r, false, Some(cursor)).unwrap();
+        let where_idx = kql
+            .find("| where TimeGenerated < datetime(")
+            .expect("cursor clause present");
+        let order_idx = kql.find("| order by").expect("order by present");
+        assert!(
+            where_idx < order_idx,
+            "cursor must filter before order by/take, got:\n{kql}"
+        );
+        assert!(
+            kql.contains(r#"datetime("2026-05-19T03:17:43.123456Z")"#),
+            "expected microsecond-precision RFC3339 cursor, got:\n{kql}"
+        );
+    }
+
+    #[test]
+    fn build_kql_combines_errors_filter_and_older_than() {
+        // Both clauses must appear, both before order by, both as their own
+        // `| where …` lines so KQL parses them as filters in sequence.
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let cursor = DateTime::parse_from_rfc3339("2026-05-19T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_kql(&r, true, Some(cursor)).unwrap();
+        let order_idx = kql.find("| order by").expect("order by present");
+        let errors_idx = kql
+            .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
+            .expect("errors filter present");
+        let cursor_idx = kql.find("| where TimeGenerated <").expect("cursor present");
+        assert!(errors_idx < order_idx);
+        assert!(cursor_idx < order_idx);
+    }
+
+    #[test]
+    fn build_kql_substitutes_page_size_into_take() {
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let kql = build_kql(&r, false, None).unwrap();
+        assert!(
+            kql.contains(&format!("take {PAGE_SIZE}")),
+            "expected `take {PAGE_SIZE}` in:\n{kql}"
+        );
+        // The `{limit}` placeholder must not survive to the server.
+        assert!(!kql.contains("{limit}"));
     }
 }
