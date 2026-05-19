@@ -12,11 +12,13 @@ use ratatui::Frame;
 use crate::azure::health::{derive, find, HealthStatus};
 use crate::azure::logs::supports_logs;
 use crate::azure::metrics::{MetricKind, MetricSeries, TimeRange};
+use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "0 1h  1 1d  7 7d  l logs  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str =
+    "0 1h  1 1d  7 7d  l logs  Enter APIs (APIM)  Esc back  r refresh  ? help  q quit";
 
 const ROW_KINDS: [(MetricKind, &str); 4] = [
     (MetricKind::Traffic, "Requests"),
@@ -589,6 +591,22 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.view = View::Logs;
             } else {
                 state.set_status("logs are not supported for this resource type");
+            }
+            true
+        }
+        Action::OpenSelected => {
+            // APIM drill-in: Enter on an APIM service opens the APIs panel.
+            // Other resource kinds have no further drill-in from Detail, so
+            // swallow the action to avoid accidental no-op transitions.
+            let is_apim = state
+                .selected_resource()
+                .map(|r| r.kind == ResourceKind::Apim)
+                .unwrap_or(false);
+            if is_apim {
+                state.apim.apis_cursor = 0;
+                state.apim.selected_api_id = None;
+                state.view_stack.push(state.view);
+                state.view = View::ApimApis;
             }
             true
         }

@@ -445,6 +445,48 @@ async fn event_loop(
                 }
                 // Same silent-on-error policy as limits: decorative.
             }
+            AppEvent::ApimApisLoaded { service_id, result } => {
+                state.apim.apis_pending.remove(&service_id);
+                match result {
+                    Ok(apis) => {
+                        state.apim.apis_error.remove(&service_id);
+                        state.apim.apis.insert(service_id, apis);
+                    }
+                    Err(e) => {
+                        state.apim.apis.remove(&service_id);
+                        state.apim.apis_error.insert(service_id, e);
+                    }
+                }
+            }
+            AppEvent::ApimOperationsLoaded { api_id, result } => {
+                state.apim.operations_pending.remove(&api_id);
+                match result {
+                    Ok(ops) => {
+                        state.apim.operations_error.remove(&api_id);
+                        state.apim.operations.insert(api_id, ops);
+                    }
+                    Err(e) => {
+                        state.apim.operations.remove(&api_id);
+                        state.apim.operations_error.insert(api_id, e);
+                    }
+                }
+            }
+            AppEvent::ApimOperationPolicyLoaded {
+                operation_id,
+                result,
+            } => {
+                state.apim.policy_pending.remove(&operation_id);
+                match result {
+                    Ok(content) => {
+                        state.apim.policy_error.remove(&operation_id);
+                        state.apim.policy.insert(operation_id, content);
+                    }
+                    Err(e) => {
+                        state.apim.policy.remove(&operation_id);
+                        state.apim.policy_error.insert(operation_id, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -646,6 +688,9 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::Detail => crate::ui::views::detail::handle(action, state),
         View::Logs => crate::ui::views::logs::handle(action, state),
         View::LogDetail => crate::ui::views::logs_detail::handle(action, state),
+        View::ApimApis => crate::ui::views::apim_apis::handle(action, state),
+        View::ApimOperations => crate::ui::views::apim_operations::handle(action, state),
+        View::ApimPolicy => crate::ui::views::apim_policy::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -715,6 +760,12 @@ fn do_open_in_browser(state: &mut AppState) {
 /// overview blade; Logs/LogDetail jump straight to the resource's Logs (KQL)
 /// blade so the user lands on the same signal they were just reading.
 /// Subscriptions opens the highlighted subscription's overview.
+/// Trim the `/apis/{apiName}` suffix off an API resource id to recover the
+/// owning APIM service id. Returns `None` if the shape doesn't match.
+fn service_id_from_api_id(api_id: &str) -> Option<&str> {
+    api_id.rsplit_once("/apis/").map(|(svc, _)| svc)
+}
+
 fn portal_url_for(state: &AppState) -> Option<String> {
     const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
     match state.view {
@@ -724,6 +775,18 @@ fn portal_url_for(state: &AppState) -> Option<String> {
         View::Logs | View::LogDetail => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}/logs", r.id)),
+        // Per-API/per-operation resource URLs land on Azure's generic resource
+        // view, not the APIM editor — so from any APIM view we open the
+        // service's APIs blade where the real management UX lives.
+        View::ApimApis => state
+            .selected_resource()
+            .map(|r| format!("{PORTAL_BASE}{}/apim-apis", r.id)),
+        View::ApimOperations | View::ApimPolicy => state
+            .apim
+            .selected_api_id
+            .as_deref()
+            .and_then(service_id_from_api_id)
+            .map(|svc_id| format!("{PORTAL_BASE}{svc_id}/apim-apis")),
         View::Subscriptions => state
             .subscriptions
             .get(state.subscription_cursor)
@@ -741,6 +804,24 @@ fn yank_target(state: &AppState) -> Option<String> {
         View::LogDetail => crate::ui::views::logs_detail::selected_line(state)
             .map(crate::ui::views::logs_detail::yank_text),
         View::List | View::Detail => state.selected_resource().map(|r| r.id.clone()),
+        View::ApimApis => state.selected_resource().and_then(|r| {
+            state
+                .apim
+                .apis
+                .get(&r.id)
+                .and_then(|rows| rows.get(state.apim.apis_cursor))
+                .map(|api| api.id.clone())
+        }),
+        View::ApimOperations => state.apim.selected_api_id.as_deref().and_then(|api_id| {
+            state
+                .apim
+                .operations
+                .get(api_id)
+                .and_then(|rows| rows.get(state.apim.operations_cursor))
+                .map(|op| op.id.clone())
+        }),
+        View::ApimPolicy => crate::ui::views::apim_policy::yank_text(state)
+            .or_else(|| state.apim.selected_operation_id.clone()),
         View::Subscriptions => state
             .subscriptions
             .get(state.subscription_cursor)
@@ -901,6 +982,62 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::ApimApis => {
+            if let Some(svc_id) = state
+                .selected_resource()
+                .map(|r| r.id.clone())
+                .and_then(|id| {
+                    if state
+                        .selected_resource()
+                        .map(|r| r.kind == crate::azure::resources::ResourceKind::Apim)
+                        .unwrap_or(false)
+                    {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+            {
+                let cached = state.apim.apis.contains_key(&svc_id);
+                let in_flight = state.apim.apis_pending.contains(&svc_id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.apim.apis.remove(&svc_id);
+                        state.apim.apis_error.remove(&svc_id);
+                    }
+                    state.apim.apis_pending.insert(svc_id.clone());
+                    spawn_load_apim_apis(auth.clone(), svc_id, tx.clone());
+                }
+            }
+        }
+        View::ApimOperations => {
+            if let Some(api_id) = state.apim.selected_api_id.clone() {
+                let cached = state.apim.operations.contains_key(&api_id);
+                let in_flight = state.apim.operations_pending.contains(&api_id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.apim.operations.remove(&api_id);
+                        state.apim.operations_error.remove(&api_id);
+                    }
+                    state.apim.operations_pending.insert(api_id.clone());
+                    spawn_load_apim_operations(auth.clone(), api_id, tx.clone());
+                }
+            }
+        }
+        View::ApimPolicy => {
+            if let Some(op_id) = state.apim.selected_operation_id.clone() {
+                let cached = state.apim.policy.contains_key(&op_id);
+                let in_flight = state.apim.policy_pending.contains(&op_id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.apim.policy.remove(&op_id);
+                        state.apim.policy_error.remove(&op_id);
+                    }
+                    state.apim.policy_pending.insert(op_id.clone());
+                    spawn_load_apim_operation_policy(auth.clone(), op_id, tx.clone());
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -972,6 +1109,11 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::Detail => crate::ui::views::detail::render(f, view_area, state, theme),
         View::Logs => crate::ui::views::logs::render(f, view_area, state, theme),
         View::LogDetail => crate::ui::views::logs_detail::render(f, view_area, state, theme),
+        View::ApimApis => crate::ui::views::apim_apis::render(f, view_area, state, theme),
+        View::ApimOperations => {
+            crate::ui::views::apim_operations::render(f, view_area, state, theme)
+        }
+        View::ApimPolicy => crate::ui::views::apim_policy::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -1582,6 +1724,40 @@ fn spawn_missing_list_health(
         state.health.pending.insert(resource_id.clone());
         spawn_load_health(auth.clone(), resource_id, kind, tx.clone());
     }
+}
+
+fn spawn_load_apim_apis(auth: AzureAuth, service_id: String, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::apim::list_apis(&auth, &service_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ApimApisLoaded { service_id, result });
+    });
+}
+
+fn spawn_load_apim_operations(auth: AzureAuth, api_id: String, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::apim::list_operations(&auth, &api_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ApimOperationsLoaded { api_id, result });
+    });
+}
+
+fn spawn_load_apim_operation_policy(
+    auth: AzureAuth,
+    operation_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::apim::fetch_operation_policy(&auth, &operation_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ApimOperationPolicyLoaded {
+            operation_id,
+            result,
+        });
+    });
 }
 
 fn spawn_load_logs(

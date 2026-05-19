@@ -23,6 +23,15 @@ pub enum View {
     /// Full-screen detail panel for a single log line. Opened with Enter from
     /// the logs table; reads `LogsCache::scroll` to pick the line.
     LogDetail,
+    /// APIM-only: list of APIs hosted by the selected APIM service. Opened
+    /// with Enter from Detail when the resource is `ResourceKind::Apim`.
+    ApimApis,
+    /// APIM-only: list of operations (routes) on the selected API. Opened
+    /// with Enter from `ApimApis`.
+    ApimOperations,
+    /// APIM-only: policy XML for the selected operation. Opened with Enter
+    /// from `ApimOperations`.
+    ApimPolicy,
     Help,
 }
 
@@ -106,6 +115,38 @@ pub struct HealthCache {
     pub failures: HashMap<String, String>,
 }
 
+/// State for the APIM drill-in views: APIs list (per APIM service), operations
+/// list (per API), and policy XML (per operation). Three caches are bundled
+/// together because they share a navigation chain and the same fetch/error
+/// shape, and isolating each into its own AppState field would just spam the
+/// struct.
+#[derive(Clone, Default)]
+pub struct ApimCache {
+    /// Keyed by APIM service resource id.
+    pub apis: HashMap<String, Vec<crate::azure::apim::Api>>,
+    pub apis_pending: HashSet<String>,
+    pub apis_error: HashMap<String, String>,
+    pub apis_cursor: usize,
+
+    /// Keyed by API resource id (`{service}/apis/{apiName}`).
+    pub operations: HashMap<String, Vec<crate::azure::apim::Operation>>,
+    pub operations_pending: HashSet<String>,
+    pub operations_error: HashMap<String, String>,
+    pub operations_cursor: usize,
+    /// Which API the operations view is currently drilling into. Pinned when
+    /// the user opens an API from `ApimApis` so navigating back to that view
+    /// doesn't lose track. `None` outside the operations/policy views.
+    pub selected_api_id: Option<String>,
+
+    /// Keyed by operation resource id. `None` value = APIM returned 404 (no
+    /// policy configured); `Some(xml)` = the raw policy document.
+    pub policy: HashMap<String, Option<String>>,
+    pub policy_pending: HashSet<String>,
+    pub policy_error: HashMap<String, String>,
+    pub policy_scroll: u16,
+    pub selected_operation_id: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -176,6 +217,7 @@ pub struct AppState {
     pub logs: LogsCache,
     pub limits: LimitsCache,
     pub revision_meta: RevisionMetaCache,
+    pub apim: ApimCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -246,6 +288,7 @@ impl AppState {
             },
             limits: LimitsCache::default(),
             revision_meta: RevisionMetaCache::default(),
+            apim: ApimCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,

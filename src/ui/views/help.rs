@@ -50,6 +50,15 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "APIM (APIs/Routes)",
+        &[
+            ("Enter", "drill down: APIs > routes > policy"),
+            ("y", "yank API / operation / policy"),
+            ("o", "open in Azure Portal"),
+            ("r", "refresh current panel"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -82,12 +91,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     }
 
-    // Two-column layout: left = first two sections, right = last two.
+    // Two-column layout: split sections roughly in half so the popup uses
+    // both columns even as new sections are added.
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
 
-    let left_lines = lines_for(&[SECTIONS[0], SECTIONS[1]], theme);
-    let right_lines = lines_for(&[SECTIONS[2], SECTIONS[3]], theme);
+    let mid = SECTIONS.len().div_ceil(2);
+    let left_lines = lines_for(&SECTIONS[..mid], theme);
+    let right_lines = lines_for(&SECTIONS[mid..], theme);
 
     frame.render_widget(Paragraph::new(left_lines), cols[0]);
     frame.render_widget(Paragraph::new(right_lines), cols[1]);

@@ -69,6 +69,23 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<Option<crate::azure::container_app_revisions::ActiveRevisionMeta>, String>,
     },
+    /// Background load completion: list of APIs for an APIM service.
+    ApimApisLoaded {
+        service_id: String,
+        result: Result<Vec<crate::azure::apim::Api>, String>,
+    },
+    /// Background load completion: list of operations for an APIM API.
+    ApimOperationsLoaded {
+        api_id: String,
+        result: Result<Vec<crate::azure::apim::Operation>, String>,
+    },
+    /// Background load completion: policy XML for an APIM operation. `Ok(None)`
+    /// means APIM reported no policy is configured (404 swallowed in the
+    /// fetcher); `Ok(Some(xml))` is the raw document.
+    ApimOperationPolicyLoaded {
+        operation_id: String,
+        result: Result<Option<String>, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →

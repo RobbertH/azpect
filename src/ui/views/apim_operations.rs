@@ -1,0 +1,333 @@
+//! APIM operations (routes) panel. Reached from [`super::apim_apis`] via Enter.
+//! Pressing Enter on a row opens the operation's policy XML in
+//! [`super::apim_policy`].
+
+#![allow(dead_code, unused_variables)]
+
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
+
+use crate::ui::events::Action;
+use crate::ui::state::{AppState, View};
+use crate::ui::theme::Theme;
+
+const FOOTER_HINT: &str = "j/k move  Enter policy  Esc back  r refresh  ? help  q quit";
+const HALF_PAGE: usize = 10;
+
+const METHOD_COL_WIDTH: usize = 7;
+const URL_COL_WIDTH: usize = 40;
+const NAME_COL_WIDTH: usize = 30;
+
+pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let api_id = state.apim.selected_api_id.as_deref();
+    let api_display = api_id
+        .and_then(|id| display_name_for(state, id))
+        .unwrap_or_else(|| "(no API)".to_string());
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " operations ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            api_display,
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    frame.render_widget(header, chunks[0]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(" routes ", Style::default().fg(theme.fg)));
+    let inner = block.inner(chunks[1]);
+    frame.render_widget(block, chunks[1]);
+
+    let Some(api_id) = api_id else {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "no API selected.",
+            Style::default().fg(theme.muted),
+        )));
+        frame.render_widget(p, inner);
+        render_footer(frame, chunks[2], theme);
+        return;
+    };
+
+    if let Some(err) = state.apim.operations_error.get(api_id) {
+        let p = Paragraph::new(Line::from(Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(theme.critical),
+        )));
+        frame.render_widget(p, inner);
+        render_footer(frame, chunks[2], theme);
+        return;
+    }
+
+    let ops = state.apim.operations.get(api_id);
+    let loading = state.apim.operations_pending.contains(api_id);
+    match ops {
+        None if loading => {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "loading operations …",
+                Style::default().fg(theme.muted),
+            )));
+            frame.render_widget(p, inner);
+        }
+        None => {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "press r to load operations.",
+                Style::default().fg(theme.muted),
+            )));
+            frame.render_widget(p, inner);
+        }
+        Some(rows) if rows.is_empty() => {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "no operations defined on this API.",
+                Style::default().fg(theme.muted),
+            )));
+            frame.render_widget(p, inner);
+        }
+        Some(rows) => {
+            let cursor = state.apim.operations_cursor.min(rows.len() - 1);
+            let visible = inner.height as usize;
+            let scroll = scroll_for(cursor, rows.len(), visible);
+
+            let lines: Vec<Line> = rows
+                .iter()
+                .enumerate()
+                .skip(scroll)
+                .take(visible)
+                .map(|(i, op)| {
+                    let selected = i == cursor;
+                    let method = format!("{:<w$}", op.method, w = METHOD_COL_WIDTH);
+                    let url = format!(
+                        "{:<w$}",
+                        truncate_right(&op.url_template, URL_COL_WIDTH),
+                        w = URL_COL_WIDTH
+                    );
+                    let name = format!(
+                        "{:<w$}",
+                        truncate_right(&op.display_name, NAME_COL_WIDTH),
+                        w = NAME_COL_WIDTH
+                    );
+                    let method_color = color_for_method(&op.method, theme);
+                    let spans = vec![
+                        Span::raw(if selected { "▍ " } else { "  " }),
+                        Span::styled(
+                            method,
+                            Style::default()
+                                .fg(method_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(url, Style::default().fg(theme.fg)),
+                        Span::raw("  "),
+                        Span::styled(name, Style::default().fg(theme.muted)),
+                    ];
+                    if selected {
+                        Line::from(spans).style(theme.selection())
+                    } else {
+                        Line::from(spans)
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+    }
+
+    render_footer(frame, chunks[2], theme);
+}
+
+/// Method-colored chips so the verb stands out at a glance. Falls back to
+/// the foreground colour for anything we don't recognise (custom verbs are
+/// rare in APIM but allowed).
+fn color_for_method(method: &str, theme: &Theme) -> Color {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => theme.healthy,
+        "POST" => theme.accent,
+        "PUT" | "PATCH" => theme.degraded,
+        "DELETE" => theme.critical,
+        _ => theme.fg,
+    }
+}
+
+fn display_name_for(state: &AppState, api_id: &str) -> Option<String> {
+    state
+        .apim
+        .apis
+        .values()
+        .flat_map(|v| v.iter())
+        .find(|a| a.id == api_id)
+        .map(|a| {
+            if a.path.is_empty() {
+                a.display_name.clone()
+            } else {
+                format!("{} · /{}", a.display_name, a.path)
+            }
+        })
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let p = Paragraph::new(Line::from(Span::styled(
+        FOOTER_HINT,
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(p, area);
+}
+
+pub fn handle(action: Action, state: &mut AppState) -> bool {
+    let Some(api_id) = state.apim.selected_api_id.clone() else {
+        return false;
+    };
+    let len = state
+        .apim
+        .operations
+        .get(&api_id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    match action {
+        Action::MoveDown => {
+            if len > 0 {
+                state.apim.operations_cursor = (state.apim.operations_cursor + 1).min(len - 1);
+            }
+            true
+        }
+        Action::MoveUp => {
+            state.apim.operations_cursor = state.apim.operations_cursor.saturating_sub(1);
+            true
+        }
+        Action::HalfPageDown => {
+            if len > 0 {
+                state.apim.operations_cursor =
+                    (state.apim.operations_cursor + HALF_PAGE).min(len - 1);
+            }
+            true
+        }
+        Action::HalfPageUp => {
+            state.apim.operations_cursor = state.apim.operations_cursor.saturating_sub(HALF_PAGE);
+            true
+        }
+        Action::GotoTop => {
+            state.apim.operations_cursor = 0;
+            true
+        }
+        Action::GotoBottom => {
+            if len > 0 {
+                state.apim.operations_cursor = len - 1;
+            }
+            true
+        }
+        Action::OpenSelected => {
+            let op_id = state
+                .apim
+                .operations
+                .get(&api_id)
+                .and_then(|rows| rows.get(state.apim.operations_cursor))
+                .map(|op| op.id.clone());
+            if let Some(op_id) = op_id {
+                state.apim.selected_operation_id = Some(op_id);
+                state.apim.policy_scroll = 0;
+                state.view_stack.push(state.view);
+                state.view = View::ApimPolicy;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn truncate_right(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
+fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+    if cursor < visible {
+        return 0;
+    }
+    (cursor + 1).saturating_sub(visible).min(len - visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::azure::apim::Operation;
+    use crate::config::Config;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn fixture() -> AppState {
+        let mut state = AppState::new(Config::default());
+        state.view = View::ApimOperations;
+        state.apim.selected_api_id = Some("/svc/myapim/apis/echo".into());
+        state
+    }
+
+    #[test]
+    fn renders_method_and_url() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.apim.operations.insert(
+            "/svc/myapim/apis/echo".into(),
+            vec![Operation {
+                id: "/svc/myapim/apis/echo/operations/get-resource".into(),
+                name: "get-resource".into(),
+                display_name: "Retrieve resource".into(),
+                method: "GET".into(),
+                url_template: "/resource".into(),
+            }],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("GET"));
+        assert!(buf.contains("/resource"));
+        assert!(buf.contains("Retrieve resource"));
+    }
+
+    #[test]
+    fn enter_opens_policy_view() {
+        let mut state = fixture();
+        state.apim.operations.insert(
+            "/svc/myapim/apis/echo".into(),
+            vec![Operation {
+                id: "/svc/myapim/apis/echo/operations/get-resource".into(),
+                name: "get-resource".into(),
+                display_name: "Retrieve".into(),
+                method: "GET".into(),
+                url_template: "/resource".into(),
+            }],
+        );
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::ApimPolicy);
+        assert_eq!(
+            state.apim.selected_operation_id.as_deref(),
+            Some("/svc/myapim/apis/echo/operations/get-resource")
+        );
+    }
+}
