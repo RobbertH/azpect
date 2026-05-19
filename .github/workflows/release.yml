@@ -121,3 +121,90 @@ jobs:
         run: cargo publish --locked --token "$CARGO_REGISTRY_TOKEN"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: RobbertH/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/RobbertH/azpect/releases/download/${TAG}"
+
+          sha_for() {
+            awk '{print $1}' "dist/${BIN_NAME}-${TAG}-$1.tar.gz.sha256"
+          }
+
+          SHA_MAC_ARM=$(sha_for aarch64-apple-darwin)
+          SHA_MAC_X86=$(sha_for x86_64-apple-darwin)
+          SHA_LINUX_X86=$(sha_for x86_64-unknown-linux-gnu)
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/azpect.rb <<EOF
+          class Azpect < Formula
+            desc "Terminal UI for observing the health of Azure APIs (Function Apps, APIM, Container Apps)."
+            homepage "https://github.com/RobbertH/azpect"
+            version "${VERSION}"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            on_macos do
+              on_arm do
+                url "${BASE}/${BIN_NAME}-${TAG}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+              on_intel do
+                url "${BASE}/${BIN_NAME}-${TAG}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${BASE}/${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "azpect"
+            end
+
+            test do
+              system "#{bin}/azpect", "--version"
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/azpect.rb
+          if git diff --staged --quiet; then
+            echo "no formula changes"
+            exit 0
+          fi
+          git commit -m "azpect ${TAG}"
+          git push
