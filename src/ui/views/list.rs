@@ -252,17 +252,18 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 return true;
             }
             Action::OpenSelected => {
-                // Pressing Enter while searching commits the filter and opens.
+                // Vim-style: first Enter just defocuses the search box and hands
+                // control to the filtered list. A second Enter (handled below)
+                // opens the highlighted row.
                 state.list_filter_active = false;
-                if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
-                    state.config.last_resource_id = Some(id);
-                    state.view_stack.push(state.view);
-                    state.view = View::Detail;
-                }
                 return true;
             }
-            Action::MoveDown
-            | Action::MoveUp
+            Action::MoveDown => {
+                // Vim-style: Down hands focus to the filtered list.
+                state.list_filter_active = false;
+                // fall through to navigation handling below
+            }
+            Action::MoveUp
             | Action::HalfPageDown
             | Action::HalfPageUp
             | Action::GotoTop
