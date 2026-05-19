@@ -1,6 +1,6 @@
 [package]
 name = "azpect"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Terminal UI for observing the health of Azure APIs (Function Apps, APIM, Container Apps)."
