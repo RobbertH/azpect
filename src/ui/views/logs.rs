@@ -21,7 +21,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const TIME_COL: u16 = 19;
@@ -720,6 +720,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.logs.scroll = 0;
             true
         }
+        Action::SetWindowHour => set_window(state, TimeRange::Hour),
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::ToggleWrap => {

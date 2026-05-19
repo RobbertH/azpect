@@ -36,6 +36,9 @@ pub enum MetricKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum TimeRange {
+    /// Last hour, aggregated per PT1M (60 bins). Useful for in-the-moment
+    /// investigation when 15-minute bars hide a recent spike.
+    Hour,
     #[default]
     Day,
     Week,
@@ -59,14 +62,16 @@ impl TimeRange {
 
     pub fn duration(&self) -> chrono::Duration {
         match self {
+            TimeRange::Hour => chrono::Duration::hours(1),
             TimeRange::Day => chrono::Duration::hours(24),
             TimeRange::Week => chrono::Duration::days(7),
         }
     }
 
-    /// ISO-8601 grain for `interval`. Day → `PT15M`, Week → `PT1H`.
+    /// ISO-8601 grain for `interval`. Hour → `PT1M`, Day → `PT15M`, Week → `PT1H`.
     pub fn interval(&self) -> &'static str {
         match self {
+            TimeRange::Hour => "PT1M",
             TimeRange::Day => "PT15M",
             TimeRange::Week => "PT1H",
         }
@@ -74,6 +79,7 @@ impl TimeRange {
 
     pub fn label(&self) -> &'static str {
         match self {
+            TimeRange::Hour => "1h",
             TimeRange::Day => "1d",
             TimeRange::Week => "7d",
         }
@@ -81,9 +87,10 @@ impl TimeRange {
 
     /// Human-readable form of the per-bin aggregation interval. Surfaced in
     /// the detail header so the user understands why a single bar represents
-    /// 15 minutes / 1 hour of data rather than near-realtime.
+    /// 1 / 15 minutes / 1 hour of data rather than near-realtime.
     pub fn pretty_interval(&self) -> &'static str {
         match self {
+            TimeRange::Hour => "1m",
             TimeRange::Day => "15m",
             TimeRange::Week => "1h",
         }
@@ -397,6 +404,16 @@ fn parse_metrics_response(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hour_range_uses_minute_intervals() {
+        // 1h window with PT1M bins gives 60 data points — fine-grained enough
+        // for near-realtime investigation without exceeding Monitor limits.
+        assert_eq!(TimeRange::Hour.interval(), "PT1M");
+        assert_eq!(TimeRange::Hour.label(), "1h");
+        assert_eq!(TimeRange::Hour.pretty_interval(), "1m");
+        assert_eq!(TimeRange::Hour.duration(), chrono::Duration::hours(1));
+    }
 
     #[test]
     fn timespan_uses_z_suffix_not_plus_offset() {

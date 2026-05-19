@@ -806,6 +806,7 @@ fn after_action(
         // appropriate to whatever the new view is.
         Action::OpenSelected
         | Action::OpenLogs
+        | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
         | Action::ToggleErrorsOnly => {

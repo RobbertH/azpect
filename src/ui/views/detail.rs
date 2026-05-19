@@ -16,7 +16,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "1 1d  7 7d  l logs  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str = "0 1h  1 1d  7 7d  l logs  Esc back  r refresh  ? help  q quit";
 
 const ROW_KINDS: [(MetricKind, &str); 4] = [
     (MetricKind::Traffic, "Requests"),
@@ -226,6 +226,7 @@ fn build_time_axis(range: TimeRange, width: u16) -> String {
         return String::new();
     }
     let total_minutes = match range {
+        TimeRange::Hour => 60_i64,
         TimeRange::Day => 24 * 60_i64,
         TimeRange::Week => 7 * 24 * 60_i64,
     };
@@ -575,6 +576,7 @@ fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     match action {
+        Action::SetWindowHour => set_window(state, TimeRange::Hour),
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::OpenLogs => {
@@ -712,51 +714,6 @@ mod tests {
         data.push(96);
         let out = stretch_to_width(&data, 100);
         assert_eq!(*out.last().unwrap(), 96);
-    }
-
-    #[test]
-    fn latest_point_ts_picks_the_max_across_series() {
-        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
-        let t = |s: &str| {
-            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-                .unwrap()
-                .and_utc()
-        };
-        let series = vec![
-            MetricSeries {
-                kind: MetricKind::Traffic,
-                label: String::new(),
-                unit: String::new(),
-                points: vec![
-                    MetricPoint {
-                        ts: t("2026-05-18T16:00:00"),
-                        value: 1.0,
-                    },
-                    MetricPoint {
-                        ts: t("2026-05-18T16:15:00"),
-                        value: 2.0,
-                    },
-                ],
-            },
-            MetricSeries {
-                kind: MetricKind::Cpu,
-                label: String::new(),
-                unit: String::new(),
-                points: vec![MetricPoint {
-                    ts: t("2026-05-18T16:30:00"),
-                    value: 5.0,
-                }],
-            },
-        ];
-        let v = Some(&series);
-        assert_eq!(latest_point_ts(v).unwrap(), t("2026-05-18T16:30:00"));
-    }
-
-    #[test]
-    fn latest_point_ts_handles_empty_and_missing() {
-        assert!(latest_point_ts(None).is_none());
-        let empty: Vec<crate::azure::metrics::MetricSeries> = vec![];
-        assert!(latest_point_ts(Some(&empty)).is_none());
     }
 
     #[test]

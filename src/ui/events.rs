@@ -97,6 +97,7 @@ pub enum Action {
     PrevMatch,
     SwitchSubscription,
     Refresh,
+    SetWindowHour,
     SetWindowDay,
     SetWindowWeek,
     /// Toggle word-wrap in the logs view so long source/message cells render
@@ -206,6 +207,9 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::SwitchSubscription,
         KeyCode::Char('r') => Action::Refresh,
+        // Digit-keyed time-range shortcuts, grouped numerically:
+        // `0` → 1h (less than a day), `1` → 1d, `7` → 7d (a week).
+        KeyCode::Char('0') => Action::SetWindowHour,
         KeyCode::Char('1') => Action::SetWindowDay,
         KeyCode::Char('7') => Action::SetWindowWeek,
         KeyCode::Char('w') => Action::ToggleWrap,
@@ -361,6 +365,7 @@ mod tests {
             Action::SwitchSubscription
         );
         assert_eq!(key_to_action(key('r'), v, false), Action::Refresh);
+        assert_eq!(key_to_action(key('0'), v, false), Action::SetWindowHour);
         assert_eq!(key_to_action(key('7'), v, false), Action::SetWindowWeek);
         assert_eq!(key_to_action(key('w'), v, false), Action::ToggleWrap);
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
