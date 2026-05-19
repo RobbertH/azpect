@@ -122,6 +122,11 @@ pub struct LogsCache {
     pub wrap: bool,
     /// Vertical scroll offset (in lines) for the log-detail view.
     pub detail_scroll: u16,
+    /// Horizontal column offset (in characters) applied to the source and
+    /// message columns when `wrap` is OFF. Lets the user scroll long lines
+    /// past the column boundary with `h`/`l`. No-op when `wrap` is ON because
+    /// the text already lays out across multiple rows.
+    pub h_offset: usize,
     /// Whether the logs search box currently has focus. While true, raw
     /// keystrokes are forwarded into `search_input` rather than dispatched as
     /// actions; Esc cancels (deactivates input, keeps query), Enter commits.

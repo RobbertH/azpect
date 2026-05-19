@@ -21,9 +21,10 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
+const H_SCROLL_STEP: usize = 8;
 const TIME_COL: u16 = 19;
 const LVL_COL: u16 = 5;
 const SOURCE_COL: u16 = 32;
@@ -217,10 +218,17 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string();
             let (lvl_text, lvl_color) = level_cell(l, theme);
+            // Horizontal scroll is non-wrap-only: when wrap is ON the cell
+            // already spans multiple rows so there's nothing hidden to scroll
+            // to. Slice both the source and message identically so the visible
+            // window of every row stays aligned.
+            let h = if wrap { 0 } else { state.logs.h_offset };
+            let source_view = apply_h_offset(&l.source, h);
+            let message_view = apply_h_offset(&l.message, h);
             let (source_text, source_lines) =
-                cell_text(&l.source, query, source_w, wrap, theme.accent, hi_style);
+                cell_text(&source_view, query, source_w, wrap, theme.accent, hi_style);
             let (message_text, message_lines) =
-                cell_text(&l.message, query, msg_w, wrap, theme.fg, hi_style);
+                cell_text(&message_view, query, msg_w, wrap, theme.fg, hi_style);
             let row_h = source_lines.max(message_lines).max(1) as u16;
 
             let row = Row::new(vec![
@@ -264,6 +272,28 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
     )
     .column_spacing(COLUMN_SPACING);
     frame.render_widget(table, area);
+}
+
+/// Char-aware horizontal scroll: drop the first `offset` characters and
+/// prepend a `…` marker so the user can tell content has been scrolled past.
+/// When `offset == 0` returns the original string verbatim. Handles UTF-8
+/// safely by stepping in `char_indices` — slicing by byte index would panic
+/// mid-codepoint.
+fn apply_h_offset(value: &str, offset: usize) -> String {
+    if offset == 0 {
+        return value.to_string();
+    }
+    let mut iter = value.char_indices();
+    if let Some((byte_idx, _)) = iter.nth(offset) {
+        let mut out = String::with_capacity(value.len() - byte_idx + 3);
+        out.push('\u{2026}');
+        out.push_str(&value[byte_idx..]);
+        out
+    } else {
+        // Offset past the end of the string — show the marker alone so the
+        // user knows the row exists but is fully scrolled off.
+        "\u{2026}".to_string()
+    }
 }
 
 /// Build a cell's text content. In wrap mode the value is split into multiple
@@ -725,6 +755,29 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
         Action::ToggleWrap => {
             state.logs.wrap = !state.logs.wrap;
+            // Reset horizontal offset when turning wrap ON — it would be a
+            // no-op anyway and we don't want the offset to "stick" invisibly
+            // and surprise the user the next time wrap goes off.
+            if state.logs.wrap {
+                state.logs.h_offset = 0;
+            }
+            true
+        }
+        // Horizontal scroll. Only meaningful when wrap is OFF — otherwise the
+        // cell already spans rows and there's nothing to reveal. Eight chars
+        // per keystroke is a reasonable middle ground: fine-grained enough to
+        // line up an interesting span, coarse enough that you're not mashing
+        // `l` to cross a long stack trace.
+        Action::MoveLeft => {
+            if !state.logs.wrap {
+                state.logs.h_offset = state.logs.h_offset.saturating_sub(H_SCROLL_STEP);
+            }
+            true
+        }
+        Action::MoveRight => {
+            if !state.logs.wrap {
+                state.logs.h_offset = state.logs.h_offset.saturating_add(H_SCROLL_STEP);
+            }
             true
         }
         Action::StartSearch => {
@@ -1062,6 +1115,55 @@ mod tests {
         assert!(state.logs.wrap);
         assert!(handle(Action::ToggleWrap, &mut state));
         assert!(!state.logs.wrap);
+    }
+
+    #[test]
+    fn toggle_wrap_on_resets_h_offset() {
+        // Scrolling right then turning wrap on should reset the offset so
+        // the row layout is sensible and stays sensible when wrap is later
+        // toggled back off.
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.h_offset = 24;
+        assert!(handle(Action::ToggleWrap, &mut state));
+        assert!(state.logs.wrap);
+        assert_eq!(state.logs.h_offset, 0);
+    }
+
+    #[test]
+    fn move_left_right_scroll_horizontally_when_unwrapped() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        assert!(!state.logs.wrap);
+        assert!(handle(Action::MoveRight, &mut state));
+        assert_eq!(state.logs.h_offset, H_SCROLL_STEP);
+        assert!(handle(Action::MoveRight, &mut state));
+        assert_eq!(state.logs.h_offset, 2 * H_SCROLL_STEP);
+        assert!(handle(Action::MoveLeft, &mut state));
+        assert_eq!(state.logs.h_offset, H_SCROLL_STEP);
+        // Saturating: extra MoveLeft beyond zero stays at zero.
+        for _ in 0..5 {
+            assert!(handle(Action::MoveLeft, &mut state));
+        }
+        assert_eq!(state.logs.h_offset, 0);
+    }
+
+    #[test]
+    fn move_left_right_are_noop_when_wrap_is_on() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.wrap = true;
+        assert!(handle(Action::MoveRight, &mut state));
+        assert!(handle(Action::MoveRight, &mut state));
+        assert_eq!(state.logs.h_offset, 0);
+    }
+
+    #[test]
+    fn apply_h_offset_prepends_ellipsis_and_slices_chars() {
+        assert_eq!(apply_h_offset("hello world", 0), "hello world");
+        assert_eq!(apply_h_offset("hello world", 6), "\u{2026}world");
+        // UTF-8 safe: stepping past a multi-byte char.
+        assert_eq!(apply_h_offset("naïve", 2), "\u{2026}ïve");
+        // Past end of string: still emits the marker so the user can tell
+        // the row is fully scrolled off.
+        assert_eq!(apply_h_offset("abc", 10), "\u{2026}");
     }
 
     #[test]
