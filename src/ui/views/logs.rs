@@ -25,6 +25,10 @@ const FOOTER_HINT: &str =
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
+/// Minimum visible characters that should remain on the longest line at the
+/// rightmost scroll position. Conservative lower bound on the message column's
+/// actual width — the layout uses `Constraint::Min(20)` for that column.
+const H_SCROLL_MIN_VISIBLE: usize = 20;
 const TIME_COL: u16 = 19;
 const LVL_COL: u16 = 5;
 const SOURCE_COL: u16 = 32;
@@ -218,15 +222,14 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string();
             let (lvl_text, lvl_color) = level_cell(l, theme);
-            // Horizontal scroll is non-wrap-only: when wrap is ON the cell
-            // already spans multiple rows so there's nothing hidden to scroll
-            // to. Slice both the source and message identically so the visible
-            // window of every row stays aligned.
+            // Horizontal scroll is non-wrap-only and applies *only* to the
+            // message column. Source values are short (usually a table /
+            // signal name) and the column is fixed-width 32, so scrolling
+            // it would just hide useful information behind a `…`.
             let h = if wrap { 0 } else { state.logs.h_offset };
-            let source_view = apply_h_offset(&l.source, h);
             let message_view = apply_h_offset(&l.message, h);
             let (source_text, source_lines) =
-                cell_text(&source_view, query, source_w, wrap, theme.accent, hi_style);
+                cell_text(&l.source, query, source_w, wrap, theme.accent, hi_style);
             let (message_text, message_lines) =
                 cell_text(&message_view, query, msg_w, wrap, theme.fg, hi_style);
             let row_h = source_lines.max(message_lines).max(1) as u16;
@@ -272,6 +275,23 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
     )
     .column_spacing(COLUMN_SPACING);
     frame.render_widget(table, area);
+}
+
+/// Character count of the longest cached message for the currently-selected
+/// resource, used to cap horizontal scrolling. Returns 0 when nothing is
+/// loaded, which collapses the right-scroll cap so `l` becomes a no-op.
+fn longest_message_chars(state: &AppState) -> usize {
+    state
+        .selected_resource()
+        .and_then(|r| state.logs.by_resource.get(&r.id))
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|l| l.message.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
 }
 
 /// Char-aware horizontal scroll: drop the first `offset` characters and
@@ -776,7 +796,15 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::MoveRight => {
             if !state.logs.wrap {
-                state.logs.h_offset = state.logs.h_offset.saturating_add(H_SCROLL_STEP);
+                // Cap at `longest_msg - MIN_VISIBLE` so the last MIN_VISIBLE
+                // characters of the longest message stay on screen. When
+                // every message is short enough to fit comfortably, the cap
+                // saturates to 0 and `l` becomes a no-op — no point letting
+                // the user scroll content that's already fully visible.
+                let max_msg = longest_message_chars(state);
+                let cap = max_msg.saturating_sub(H_SCROLL_MIN_VISIBLE);
+                let new_offset = state.logs.h_offset.saturating_add(H_SCROLL_STEP);
+                state.logs.h_offset = new_offset.min(cap);
             }
             true
         }
@@ -1129,9 +1157,29 @@ mod tests {
         assert_eq!(state.logs.h_offset, 0);
     }
 
+    /// Seed the logs cache with a single line whose message has the given
+    /// character length, so horizontal-scroll tests have something to clamp
+    /// against.
+    fn seed_with_message(state: &mut AppState, message_chars: usize) {
+        let id = state.selected_resource().unwrap().id.clone();
+        let message = "x".repeat(message_chars);
+        state.logs.by_resource.insert(
+            id,
+            vec![crate::azure::logs::LogLine {
+                ts: chrono::Utc::now(),
+                level: crate::azure::logs::LogLevel::Info,
+                source: "AppLogs".into(),
+                message,
+                fields: vec![],
+            }],
+        );
+    }
+
     #[test]
     fn move_left_right_scroll_horizontally_when_unwrapped() {
         let mut state = fixture(ResourceKind::FunctionApp);
+        // Plenty of message room: 1000 chars - 20 min-visible = cap of 980.
+        seed_with_message(&mut state, 1000);
         assert!(!state.logs.wrap);
         assert!(handle(Action::MoveRight, &mut state));
         assert_eq!(state.logs.h_offset, H_SCROLL_STEP);
@@ -1147,8 +1195,39 @@ mod tests {
     }
 
     #[test]
+    fn move_right_saturates_at_longest_message_minus_min_visible() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        // Message is 100 chars long — cap should be 100 - 20 = 80.
+        seed_with_message(&mut state, 100);
+        // Hammer MoveRight until it stops advancing.
+        let mut last = state.logs.h_offset;
+        for _ in 0..200 {
+            assert!(handle(Action::MoveRight, &mut state));
+            if state.logs.h_offset == last {
+                break;
+            }
+            last = state.logs.h_offset;
+        }
+        assert_eq!(state.logs.h_offset, 80);
+    }
+
+    #[test]
+    fn move_right_is_noop_when_longest_message_fits_in_min_visible() {
+        // If every message is at most MIN_VISIBLE chars, the cap saturates
+        // to 0 and `l` should never advance — there's nothing hidden to
+        // scroll toward.
+        let mut state = fixture(ResourceKind::FunctionApp);
+        seed_with_message(&mut state, 15);
+        for _ in 0..5 {
+            assert!(handle(Action::MoveRight, &mut state));
+        }
+        assert_eq!(state.logs.h_offset, 0);
+    }
+
+    #[test]
     fn move_left_right_are_noop_when_wrap_is_on() {
         let mut state = fixture(ResourceKind::FunctionApp);
+        seed_with_message(&mut state, 1000);
         state.logs.wrap = true;
         assert!(handle(Action::MoveRight, &mut state));
         assert!(handle(Action::MoveRight, &mut state));
