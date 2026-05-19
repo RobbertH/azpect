@@ -2,12 +2,12 @@
 
 A terminal UI for observing the health of Azure APIs at a glance.
 
-`azpect` lists Function Apps, API Management instances, and Container Apps across
-every subscription you can access, and shows a health badge plus
-24-hour / 7-day sparklines for **requests**, **HTTP 5xx errors**,
-**CPU**, and **memory** without leaving your terminal. For Function Apps
-and Container Apps it also tails the most recent logs (with an
-"errors only" filter) via Log Analytics.
+`azpect` lists Function Apps, API Management instances, Container Apps, and
+Application Gateways across every subscription you can access, and shows a
+health badge plus 24-hour / 7-day sparklines for **requests**, **HTTP 5xx
+errors**, **CPU**, and **memory** without leaving your terminal. For Function
+Apps and Container Apps it also tails the most recent logs (with an "errors
+only" filter) via Log Analytics.
 
 ## Status
 

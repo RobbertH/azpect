@@ -13,7 +13,6 @@ use ratatui::Frame;
 
 use crate::azure::logs::{LogLevel, LogLine};
 use crate::azure::metrics::TimeRange;
-use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
 use crate::ui::state::AppState;
 #[cfg(test)]
@@ -177,13 +176,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         return;
     };
 
-    if matches!(resource.kind, ResourceKind::Apim) {
-        center_message(
-            frame,
-            body,
-            "Logs are not supported for APIM in v1.",
-            theme.muted,
+    if !crate::azure::logs::supports_logs(resource.kind) {
+        let msg = format!(
+            "Logs are not supported for {} in v1.",
+            resource.kind.short_tag()
         );
+        center_message(frame, body, &msg, theme.muted);
         render_footer(frame, chunks[2], theme, footer_text);
         return;
     }

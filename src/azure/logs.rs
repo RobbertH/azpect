@@ -40,7 +40,8 @@ pub struct LogLine {
     pub fields: Vec<(String, String)>,
 }
 
-/// Whether we know how to query logs for this resource type. APIM is `false` in v1.
+/// Whether we know how to query logs for this resource type. APIM and
+/// Application Gateway are `false` in v1.
 pub fn supports_logs(kind: ResourceKind) -> bool {
     matches!(kind, ResourceKind::FunctionApp | ResourceKind::ContainerApp)
 }
@@ -176,9 +177,10 @@ fn build_kql(
             container_app_kql(&resource.name),
             KQL_CONTAINER_APP_ERRORS_FILTER,
         ),
-        ResourceKind::Apim => {
+        ResourceKind::Apim | ResourceKind::AppGateway => {
             return Err(anyhow!(
-                "APIM logs not supported in v1 (no resource-centric Log Analytics template)"
+                "logs not supported for {:?} in v1 (no resource-centric Log Analytics template)",
+                resource.kind
             ));
         }
     };
@@ -295,7 +297,9 @@ fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) 
     let (level, source, message) = match kind {
         ResourceKind::FunctionApp => parse_function_app_row(columns, cells),
         ResourceKind::ContainerApp => parse_container_app_row(columns, cells),
-        ResourceKind::Apim => return None, // unreachable in practice
+        // Unreachable in practice — supports_logs() filters these out
+        // before fetch() is ever called.
+        ResourceKind::Apim | ResourceKind::AppGateway => return None,
     };
 
     let message = truncate(message, MESSAGE_TRUNCATE);

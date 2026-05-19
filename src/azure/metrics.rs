@@ -154,6 +154,15 @@ pub fn metric_names(kind: ResourceKind) -> &'static [(MetricKind, &'static str, 
             (MetricKind::Cpu, "UsageNanoCores", "Average"),
             (MetricKind::Memory, "WorkingSetBytes", "Average"),
         ],
+        ResourceKind::AppGateway => &[
+            // Errors via $filter on HttpStatusGroup eq '5xx'
+            (MetricKind::Errors, "ResponseStatus", "Total"),
+            (MetricKind::Traffic, "TotalRequests", "Total"),
+            // CapacityUnits is v2-only; on v1 SKUs the per-metric call 400s
+            // and the fetch layer logs it as "missing" without failing the rest.
+            (MetricKind::Cpu, "CapacityUnits", "Average"),
+            // No memory-equivalent metric on App Gateway.
+        ],
     }
 }
 
@@ -163,6 +172,7 @@ fn label_for(kind: MetricKind, resource_kind: ResourceKind) -> &'static str {
         (MetricKind::Errors, _) => "Http 5xx",
         (MetricKind::Traffic, _) => "Requests",
         (MetricKind::Cpu, ResourceKind::Apim) => "Capacity",
+        (MetricKind::Cpu, ResourceKind::AppGateway) => "Capacity Units",
         (MetricKind::Cpu, _) => "CPU",
         (MetricKind::Memory, _) => "Memory",
     }
@@ -245,7 +255,7 @@ pub async fn fetch(
 
     let needs_error_filter = matches!(
         resource.kind,
-        ResourceKind::Apim | ResourceKind::ContainerApp
+        ResourceKind::Apim | ResourceKind::ContainerApp | ResourceKind::AppGateway
     );
 
     type Handle = tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>;
@@ -265,6 +275,9 @@ pub async fn fetch(
                 // values are `2xx` / `4xx` / `5xx`, so an `eq` on it is both
                 // valid syntax and cleaner than `statusCode sw '5'`.
                 ResourceKind::ContainerApp => Some("statusCodeCategory eq '5xx'".to_string()),
+                // App Gateway exposes `HttpStatusGroup` as `1xx`/`2xx`/.../`5xx`
+                // on the `ResponseStatus` metric.
+                ResourceKind::AppGateway => Some("HttpStatusGroup eq '5xx'".to_string()),
                 ResourceKind::FunctionApp => None,
             }
         } else {

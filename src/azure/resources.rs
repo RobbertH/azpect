@@ -14,15 +14,17 @@ pub enum ResourceKind {
     FunctionApp,
     Apim,
     ContainerApp,
+    AppGateway,
 }
 
 impl ResourceKind {
-    /// Four-letter tag for the list view: `Func`, `APIM`, `Cont`.
+    /// Four-letter tag for the list view: `Func`, `APIM`, `Cont`, `AppG`.
     pub fn short_tag(&self) -> &'static str {
         match self {
             ResourceKind::Apim => "APIM",
             ResourceKind::FunctionApp => "Func",
             ResourceKind::ContainerApp => "Cont",
+            ResourceKind::AppGateway => "AppG",
         }
     }
 }
@@ -44,18 +46,21 @@ pub struct Resource {
 /// `subscriptions` field in the request body to scope, so this query is fixed.
 ///
 /// `state` is coalesced per resource family: Function Apps and APIM expose
-/// `properties.state` (`Running`/`Stopped`), but Container Apps don't —
-/// they expose `properties.runningStatus` (`Running`/`Progressing`/`Stopped`/
-/// `Suspended`). Without the case() the Detail view shows "state: unknown"
-/// for every Container App.
+/// `properties.state` (`Running`/`Stopped`), Container Apps expose
+/// `properties.runningStatus` (`Running`/`Progressing`/`Stopped`/`Suspended`),
+/// and Application Gateways expose `properties.operationalState`
+/// (`Running`/`Stopped`/`Starting`/`Stopping`). Without the case() the Detail
+/// view shows "state: unknown" for those families.
 pub const KQL: &str = r#"
 Resources
 | where (type == 'microsoft.web/sites' and kind contains 'functionapp')
     or type == 'microsoft.apimanagement/service'
     or type == 'microsoft.app/containerapps'
+    or type == 'microsoft.network/applicationgateways'
 | project id, name, type, kind, location, resourceGroup, subscriptionId,
           state = case(
               type == 'microsoft.app/containerapps', tostring(properties.runningStatus),
+              type == 'microsoft.network/applicationgateways', tostring(properties.operationalState),
               tostring(properties.state)
           )
 | order by name asc
@@ -108,6 +113,8 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
         ResourceKind::Apim
     } else if ty == "microsoft.app/containerapps" {
         ResourceKind::ContainerApp
+    } else if ty == "microsoft.network/applicationgateways" {
+        ResourceKind::AppGateway
     } else {
         return None;
     };
@@ -198,6 +205,16 @@ mod tests {
                     "resourceGroup": "rg1",
                     "subscriptionId": "sub1",
                     "state": "Running"
+                },
+                {
+                    "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Network/applicationGateways/myagw",
+                    "name": "myagw",
+                    "type": "microsoft.network/applicationgateways",
+                    "kind": "",
+                    "location": "westeurope",
+                    "resourceGroup": "rg1",
+                    "subscriptionId": "sub1",
+                    "state": "Running"
                 }
             ]
         });
@@ -210,12 +227,14 @@ mod tests {
             .collect();
 
         // Plain web app (kind=app,linux) must be skipped.
-        assert_eq!(resources.len(), 3);
+        assert_eq!(resources.len(), 4);
         assert_eq!(resources[0].kind, ResourceKind::FunctionApp);
         assert_eq!(resources[0].state.as_deref(), Some("Running"));
         assert_eq!(resources[1].kind, ResourceKind::Apim);
         assert_eq!(resources[1].state, None); // empty string filtered out
         assert_eq!(resources[2].kind, ResourceKind::ContainerApp);
+        assert_eq!(resources[3].kind, ResourceKind::AppGateway);
+        assert_eq!(resources[3].state.as_deref(), Some("Running"));
     }
 
     #[test]
