@@ -25,6 +25,23 @@ users the easiest path is `az login`.
 Run `azpect debug-auth` to confirm credentials resolve and to print the
 list of subscriptions the active credential can see.
 
+## Install
+
+### Homebrew (macOS, Linux)
+
+```sh
+brew install RobbertH/tap/azpect
+```
+
+Or tap once and install by name:
+
+```sh
+brew tap RobbertH/tap
+brew install azpect
+```
+
+Upgrade later with `brew upgrade azpect`.
+
 ## Build
 
 ```sh
