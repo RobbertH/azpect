@@ -12,7 +12,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Enter open  r refresh  ? help  q quit";
+const FOOTER_HINT: &str = "j/k move  Enter open  y yank id  o portal  r refresh  ? help  q quit";
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -81,7 +81,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 let selected = i == cursor;
                 let name = truncate_right(&sub.display_name, max_name);
                 let pad_name = format!("{:<width$}", name, width = max_name);
-                let prefix: String = sub.id.chars().take(8).collect();
                 let state_color = match sub.state.as_str() {
                     "Enabled" => theme.healthy,
                     "Disabled" | "Deleted" | "Warned" => theme.degraded,
@@ -94,7 +93,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     Span::raw("  "),
                     Span::styled(format!("({})", sub.state), Style::default().fg(state_color)),
                     Span::raw("  "),
-                    Span::styled(format!("[{prefix}…]"), Style::default().fg(theme.muted)),
+                    Span::styled(sub.id.as_str(), Style::default().fg(theme.muted)),
                 ];
 
                 if Some(&sub.id) == state.config.last_subscription_id.as_ref() {
