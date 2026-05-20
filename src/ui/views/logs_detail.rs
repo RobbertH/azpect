@@ -36,7 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Span::styled(
             state
                 .selected_resource()
-                .map(|r| r.name.clone())
+                .map(|r| r.name.as_str())
                 .unwrap_or_default(),
             Style::default().fg(theme.fg),
         ),
