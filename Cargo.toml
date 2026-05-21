@@ -3,7 +3,7 @@ name = "azpect"
 version = "0.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Terminal UI for observing the health of Azure APIs (Function Apps, APIM, Container Apps)."
+description = "Terminal UI for inspecting Azure resources: Function Apps, APIM, Container Apps, Application Gateway backends, and storage blobs."
 repository = "https://github.com/RobbertH/azpect"
 readme = "README.md"
 keywords = ["azure", "tui", "monitoring", "ratatui", "observability"]
@@ -34,6 +34,7 @@ tui-input = "0.14"
 nucleo-matcher = "0.3"
 futures = "0.3"
 open = "5"
+quick-xml = { version = "0.36", features = ["serialize"] }
 
 [profile.release]
 lto = "thin"

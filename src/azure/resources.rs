@@ -4,6 +4,7 @@
 #![allow(dead_code, unused_variables)]
 
 use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::azure::auth::AzureAuth;
@@ -40,6 +41,13 @@ pub struct Resource {
     pub subscription_id: String,
     /// Azure resource state (`Running`, `Stopped`, etc.) when the provider exposes it.
     pub state: Option<String>,
+    /// `systemData.createdAt` from the ARM envelope. `None` for older resource
+    /// types that pre-date systemData (created before ~2020) or where Resource
+    /// Graph hasn't surfaced it.
+    pub created_at: Option<DateTime<Utc>>,
+    /// `systemData.lastModifiedAt` from the ARM envelope. Same caveats as
+    /// `created_at` — missing for legacy resources.
+    pub modified_at: Option<DateTime<Utc>>,
 }
 
 /// KQL query template. Lane 2 substitutes nothing — Resource Graph honors the
@@ -62,6 +70,21 @@ Resources
               type == 'microsoft.app/containerapps', tostring(properties.runningStatus),
               type == 'microsoft.network/applicationgateways', tostring(properties.operationalState),
               tostring(properties.state)
+          ),
+          // systemData is the standard ARM envelope but older Resource Providers
+          // (notably microsoft.web/sites and microsoft.apimanagement/service)
+          // don't populate it. Coalesce per type to their RP-specific timestamp
+          // fields so most rows actually have a date. modifiedAt has the same
+          // story but only Function Apps expose `properties.lastModifiedTimeUtc`;
+          // for APIM there's no equivalent so it falls back to systemData / null.
+          createdAt = case(
+              type == 'microsoft.web/sites', tostring(properties.createdTime),
+              type == 'microsoft.apimanagement/service', tostring(properties.createdAtUtc),
+              tostring(systemData.createdAt)
+          ),
+          modifiedAt = case(
+              type == 'microsoft.web/sites', tostring(properties.lastModifiedTimeUtc),
+              tostring(systemData.lastModifiedAt)
           )
 | order by name asc
 "#;
@@ -145,6 +168,8 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
         .and_then(|n| n.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let created_at = parse_optional_rfc3339(v.get("createdAt"));
+    let modified_at = parse_optional_rfc3339(v.get("modifiedAt"));
 
     Some(Resource {
         id,
@@ -154,7 +179,22 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
         resource_group,
         subscription_id,
         state,
+        created_at,
+        modified_at,
     })
+}
+
+/// Pull an RFC3339 timestamp out of a JSON field, tolerant of `null`, missing
+/// and empty-string. Returns `None` if absent or unparseable — older resources
+/// pre-date `systemData`, and Resource Graph surfaces those as empty strings.
+fn parse_optional_rfc3339(v: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    let s = v?.as_str()?;
+    if s.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -174,7 +214,9 @@ mod tests {
                     "location": "westeurope",
                     "resourceGroup": "rg1",
                     "subscriptionId": "sub1",
-                    "state": "Running"
+                    "state": "Running",
+                    "createdAt": "2024-03-15T08:30:00Z",
+                    "modifiedAt": "2024-05-01T12:00:00Z"
                 },
                 {
                     "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.ApiManagement/service/myapim",
@@ -184,7 +226,9 @@ mod tests {
                     "location": "westeurope",
                     "resourceGroup": "rg1",
                     "subscriptionId": "sub1",
-                    "state": ""
+                    "state": "",
+                    "createdAt": "",
+                    "modifiedAt": ""
                 },
                 {
                     "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.App/containerApps/myca",
@@ -230,9 +274,21 @@ mod tests {
         assert_eq!(resources.len(), 4);
         assert_eq!(resources[0].kind, ResourceKind::FunctionApp);
         assert_eq!(resources[0].state.as_deref(), Some("Running"));
+        // Function App row carried both systemData timestamps.
+        assert!(resources[0].created_at.is_some());
+        assert_eq!(
+            resources[0].created_at.unwrap().to_rfc3339(),
+            "2024-03-15T08:30:00+00:00"
+        );
+        assert!(resources[0].modified_at.is_some());
         assert_eq!(resources[1].kind, ResourceKind::Apim);
         assert_eq!(resources[1].state, None); // empty string filtered out
+                                              // APIM row sent empty strings for the timestamps — both must collapse to None.
+        assert!(resources[1].created_at.is_none());
+        assert!(resources[1].modified_at.is_none());
         assert_eq!(resources[2].kind, ResourceKind::ContainerApp);
+        // Container app row omitted createdAt entirely — should also be None.
+        assert!(resources[2].created_at.is_none());
         assert_eq!(resources[3].kind, ResourceKind::AppGateway);
         assert_eq!(resources[3].state.as_deref(), Some("Running"));
     }

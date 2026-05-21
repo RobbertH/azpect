@@ -256,6 +256,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: None,
+            created_at: None,
+            modified_at: None,
         }];
         state.list_cursor = 0;
         state.view = View::ApimApis;

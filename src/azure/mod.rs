@@ -1,6 +1,7 @@
 //! Azure-side modules: auth, REST client, resource discovery, metrics, logs, derived health.
 
 pub mod apim;
+pub mod appgw_backends;
 pub mod auth;
 pub mod az_login;
 pub mod client;
@@ -12,4 +13,5 @@ pub mod logs;
 pub mod metrics;
 pub mod resource_health;
 pub mod resources;
+pub mod storage;
 pub mod subscriptions;

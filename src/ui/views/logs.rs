@@ -769,12 +769,13 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 
     // Search-input focus: only a small set of actions reach this handler — the
     // raw keystrokes flow into `logs.search_input` via app.rs. Esc cancels
-    // (deactivates input, keeps query for n/N); Enter commits and jumps to the
-    // next match from the current cursor.
+    // AND clears the query (matching the storage views — "Esc removes the
+    // filter, period"). Enter commits and jumps to the next match.
     if state.logs.search_active {
         match action {
             Action::Back => {
                 state.logs.search_active = false;
+                state.logs.search_input.reset();
                 return true;
             }
             Action::OpenSelected => {
@@ -1023,6 +1024,8 @@ mod tests {
             resource_group: "rg-demo".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }
     }
 
@@ -1388,13 +1391,18 @@ mod tests {
     }
 
     #[test]
-    fn back_while_search_active_deactivates_and_consumes() {
+    fn back_while_search_active_clears_and_consumes() {
         let mut state = fixture(ResourceKind::FunctionApp);
         state.logs.search_active = true;
+        state.logs.search_input = tui_input::Input::default().with_value("error".to_string());
         assert!(handle(Action::Back, &mut state));
         assert!(!state.logs.search_active);
-        // Back is consumed in this case (unlike the inactive path which falls
-        // through to the global view-stack pop).
+        assert!(
+            state.logs.search_input.value().is_empty(),
+            "Esc removes the filter — matches the storage views' behaviour"
+        );
+        // Back is consumed (does not fall through to the global semantic-parent
+        // navigation).
     }
 
     #[test]

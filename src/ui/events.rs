@@ -86,6 +86,42 @@ pub enum AppEvent {
         operation_id: String,
         result: Result<Option<String>, String>,
     },
+    /// Background load completion: backend pools (and their members) for one
+    /// Application Gateway, keyed by gateway resource id.
+    AppGatewayBackendsLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::appgw_backends::BackendPool>, String>,
+    },
+    /// Background load completion: list of storage accounts for the current
+    /// subscription scope.
+    StorageAccountsLoaded(Result<Vec<crate::azure::storage::StorageAccount>, String>),
+    /// Background load completion: list of blob containers for one storage
+    /// account, keyed by ARM id.
+    StorageContainersLoaded {
+        account_id: String,
+        result: Result<Vec<crate::azure::storage::BlobContainer>, String>,
+    },
+    /// Background load completion: per-account aggregate stats (container /
+    /// blob / file / queue / table counts and totals) for the storage account
+    /// overview view, keyed by ARM id.
+    StorageOverviewLoaded {
+        account_id: String,
+        result: Result<crate::azure::storage::StorageAccountStats, String>,
+    },
+    /// Background load completion: list of blobs in one container. `key` is the
+    /// `(account, container)` pair flattened by
+    /// [`crate::ui::state::StorageCache::blobs_key`].
+    StorageBlobsLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::storage::Blob>, String>,
+    },
+    /// Background load completion: metadata + body preview for one blob. `key`
+    /// is the `(account, container, blob)` triple flattened by
+    /// [`crate::ui::state::StorageCache::blob_preview_key`].
+    StorageBlobPreviewLoaded {
+        key: String,
+        result: Result<crate::azure::storage::BlobPreview, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →
@@ -117,6 +153,9 @@ pub enum Action {
     NextMatch,
     PrevMatch,
     SwitchSubscription,
+    /// Open the top-level Storage mode (blob accounts list). Bound to `S`
+    /// (capital so it doesn't collide with `s` = switch subscription).
+    OpenStorage,
     Refresh,
     SetWindowHour,
     SetWindowDay,
@@ -227,6 +266,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('F') => Action::ToggleFavoritesOnly,
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::SwitchSubscription,
+        KeyCode::Char('S') => Action::OpenStorage,
         KeyCode::Char('r') => Action::Refresh,
         // Digit-keyed time-range shortcuts, grouped numerically:
         // `0` → 1h (less than a day), `1` → 1d, `7` → 7d (a week).
@@ -369,6 +409,20 @@ mod tests {
         // action now that `w` is repurposed for wrap.
         assert_eq!(key_to_action(key('d'), v, false), Action::Noop);
         assert_eq!(key_to_action(key('1'), v, false), Action::SetWindowDay);
+    }
+
+    #[test]
+    fn capital_s_opens_storage_mode() {
+        // Lowercase `s` switches subscription; capital `S` enters the
+        // top-level Storage mode. Keep them distinct so muscle memory for
+        // the existing subscription picker doesn't accidentally yank the
+        // user out of their current view.
+        let v = View::List;
+        assert_eq!(
+            key_to_action(key('s'), v, false),
+            Action::SwitchSubscription
+        );
+        assert_eq!(key_to_action(key_shift('S'), v, false), Action::OpenStorage);
     }
 
     #[test]

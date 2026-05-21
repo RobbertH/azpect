@@ -258,6 +258,8 @@ mod tests {
             resource_group: "rg-demo".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }];
         s.list_cursor = 0;
         s.view = View::LogDetail;

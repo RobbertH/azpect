@@ -15,7 +15,12 @@ use anyhow::anyhow;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 
-use crate::azure::auth::{AzureAuth, SCOPE_ARM, SCOPE_LOGS};
+use crate::azure::auth::{AzureAuth, SCOPE_ARM, SCOPE_LOGS, SCOPE_STORAGE};
+
+/// `x-ms-version` header value for blob data-plane requests. Pinned to a stable
+/// release of the REST API; bump in lockstep across all storage calls so server
+/// behavior stays consistent.
+pub const STORAGE_API_VERSION: &str = "2021-12-02";
 
 /// Default user agent on every outbound request.
 pub const USER_AGENT: &str = concat!("azpect/", env!("CARGO_PKG_VERSION"));
@@ -204,6 +209,98 @@ impl ArmClient {
     }
 }
 
+/// Outcome of a successful blob data-plane request.
+///
+/// Returned by [`send_bytes_with_retry`]. The `headers` map is always present
+/// (HEAD responses use it exclusively); `body` is empty for HEAD.
+pub struct BytesResponse {
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+/// Variant of [`send_with_retry`] for non-JSON responses (XML enumeration,
+/// raw blob bytes, HEAD metadata). Same retry/backoff/redaction discipline,
+/// but returns headers + bytes verbatim instead of parsing JSON.
+///
+/// `extra_headers` is invoked on every attempt so callers can attach
+/// per-request headers (e.g. `x-ms-version`, `Range`, `Accept`) without
+/// re-allocating in the success path.
+async fn send_bytes_with_retry<F, H>(
+    http: &reqwest::Client,
+    auth: &AzureAuth,
+    scope: &str,
+    mut build: F,
+    mut extra_headers: H,
+) -> anyhow::Result<BytesResponse>
+where
+    F: FnMut(&reqwest::Client) -> reqwest::RequestBuilder,
+    H: FnMut(&mut HeaderMap),
+{
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut iter = BACKOFF_MS.iter().copied();
+    let mut next_backoff: Option<u64> = Some(0);
+
+    while let Some(prelude_ms) = next_backoff {
+        if prelude_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(prelude_ms)).await;
+        }
+        let upcoming = iter.next();
+        next_backoff = upcoming;
+
+        let token = auth
+            .token(scope)
+            .await
+            .map_err(|e| anyhow!("token acquisition for {scope} failed: {e}"))?;
+
+        let mut headers = HeaderMap::new();
+        let bearer = format!("Bearer {token}");
+        let auth_value = HeaderValue::from_str(&bearer)
+            .map_err(|_| anyhow!("bearer token contained invalid header characters"))?;
+        headers.insert(AUTHORIZATION, auth_value);
+        extra_headers(&mut headers);
+
+        let req = build(http).headers(headers);
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("network error: {e}"));
+                if next_backoff.is_some() {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() {
+            let headers = resp.headers().clone();
+            let bytes = resp.bytes().await.map_err(|e| anyhow!("read body: {e}"))?;
+            return Ok(BytesResponse {
+                headers,
+                body: bytes.to_vec(),
+            });
+        }
+
+        if should_retry(status) {
+            if let Some(base) = next_backoff {
+                let extra = retry_after_secs(resp.headers()).unwrap_or(0);
+                let _ = resp.bytes().await;
+                next_backoff = Some(base + extra * 1_000);
+                last_err = Some(anyhow!("retryable status {status}"));
+                continue;
+            }
+        }
+
+        // Terminal error.
+        let status_code = status.as_u16();
+        let body = body_excerpt(resp).await;
+        return Err(anyhow!("azure api error {}: {}", status_code, body));
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("request failed after retries")))
+}
+
 impl LogsClient {
     pub fn new(auth: AzureAuth) -> anyhow::Result<Self> {
         Ok(Self {
@@ -253,5 +350,90 @@ impl LogsClient {
                 .json(&body)
         })
         .await
+    }
+}
+
+/// Client for blob data-plane calls (`*.blob.core.windows.net`). Unlike
+/// [`ArmClient`], the host changes per account so callers pass full URLs.
+/// Uses `SCOPE_STORAGE` and attaches the `x-ms-version` header automatically.
+#[derive(Clone)]
+pub struct StorageClient {
+    pub(crate) auth: AzureAuth,
+    pub(crate) http: reqwest::Client,
+}
+
+impl StorageClient {
+    pub fn new(auth: AzureAuth) -> anyhow::Result<Self> {
+        Ok(Self {
+            auth,
+            http: build_http()?,
+        })
+    }
+
+    /// `GET {url}` returning the raw response body as a UTF-8 string. Intended
+    /// for the XML container/blob enumeration endpoints. Errors if the body
+    /// is not valid UTF-8 (Azure always sends ASCII XML for these endpoints).
+    pub async fn get_xml(&self, url: &str) -> anyhow::Result<String> {
+        let url_owned = url.to_string();
+        let resp = send_bytes_with_retry(
+            &self.http,
+            &self.auth,
+            SCOPE_STORAGE,
+            |http| http.request(Method::GET, &url_owned),
+            |headers| {
+                headers.insert(ACCEPT, HeaderValue::from_static("application/xml"));
+                headers.insert(
+                    "x-ms-version",
+                    HeaderValue::from_static(STORAGE_API_VERSION),
+                );
+            },
+        )
+        .await?;
+        String::from_utf8(resp.body)
+            .map_err(|e| anyhow!("storage response was not valid utf-8: {e}"))
+    }
+
+    /// `HEAD {url}` returning only response headers (blob metadata lookup).
+    pub async fn head(&self, url: &str) -> anyhow::Result<HeaderMap> {
+        let url_owned = url.to_string();
+        let resp = send_bytes_with_retry(
+            &self.http,
+            &self.auth,
+            SCOPE_STORAGE,
+            |http| http.request(Method::HEAD, &url_owned),
+            |headers| {
+                headers.insert(
+                    "x-ms-version",
+                    HeaderValue::from_static(STORAGE_API_VERSION),
+                );
+            },
+        )
+        .await?;
+        Ok(resp.headers)
+    }
+
+    /// `GET {url}` with a `Range:` header set, returning the raw bytes. Caller
+    /// is responsible for forming a valid HTTP range expression (e.g.
+    /// `"bytes=0-1023"`).
+    pub async fn get_bytes_range(&self, url: &str, range: &str) -> anyhow::Result<Vec<u8>> {
+        let url_owned = url.to_string();
+        let range_owned = range.to_string();
+        let resp = send_bytes_with_retry(
+            &self.http,
+            &self.auth,
+            SCOPE_STORAGE,
+            |http| http.request(Method::GET, &url_owned),
+            |headers| {
+                headers.insert(
+                    "x-ms-version",
+                    HeaderValue::from_static(STORAGE_API_VERSION),
+                );
+                if let Ok(v) = HeaderValue::from_str(&range_owned) {
+                    headers.insert(reqwest::header::RANGE, v);
+                }
+            },
+        )
+        .await?;
+        Ok(resp.body)
     }
 }

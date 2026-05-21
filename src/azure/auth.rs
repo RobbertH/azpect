@@ -28,6 +28,13 @@ pub const SCOPE_ARM: &str = "https://management.azure.com/.default";
 /// OAuth scope for Log Analytics queries (`api.loganalytics.io`).
 pub const SCOPE_LOGS: &str = "https://api.loganalytics.io/.default";
 
+/// OAuth scope for the Azure Storage **data plane** (`*.blob.core.windows.net`,
+/// etc.). The control-plane operations on storage accounts go through ARM
+/// (`SCOPE_ARM`); enumerating containers' contents or fetching blob bytes
+/// requires this dedicated audience and the caller needs the
+/// `Storage Blob Data Reader` role (or stronger) on the account.
+pub const SCOPE_STORAGE: &str = "https://storage.azure.com/.default";
+
 /// Refresh tokens this far before their stated expiry.
 pub const REFRESH_BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -186,5 +193,6 @@ mod tests {
     fn scope_constants_are_stable() {
         assert_eq!(SCOPE_ARM, "https://management.azure.com/.default");
         assert_eq!(SCOPE_LOGS, "https://api.loganalytics.io/.default");
+        assert_eq!(SCOPE_STORAGE, "https://storage.azure.com/.default");
     }
 }

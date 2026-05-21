@@ -25,7 +25,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Resources",
+        "API resources",
         &[
             ("Enter", "open detail"),
             ("l", "open logs"),
@@ -59,6 +59,38 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Application Gateway",
+        &[
+            ("Enter", "show backend pools and their members"),
+            ("y", "yank gateway id / FQDN / IP / NIC id"),
+            ("o", "open gateway in Azure Portal"),
+            ("r", "refresh backend pools"),
+        ],
+    ),
+    (
+        "Storage (blobs)",
+        &[
+            ("S", "enter storage mode"),
+            (
+                "Enter",
+                "drill: accounts > overview > containers > blobs > preview",
+            ),
+            (
+                "overview",
+                "per-account stats (blobs/files/queues/tables, ~24h lag)",
+            ),
+            (
+                "/",
+                "filter accounts / containers / blobs by name (substring)",
+            ),
+            ("j/k", "scroll preview (detail)"),
+            ("g/G", "preview top / bottom"),
+            ("y", "yank account / container / blob / body"),
+            ("o", "open account in Azure Portal"),
+            ("r", "refresh current panel"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -66,6 +98,19 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("o", "open in Azure Portal"),
             ("?", "toggle help"),
             ("q", "quit"),
+        ],
+    ),
+    (
+        "Command palette (:)",
+        &[
+            (":", "open command palette"),
+            ("Tab / S-Tab", "cycle prefix matches"),
+            (":storage / :s", "enter storage mode"),
+            (":apis / :a", "back to apis list"),
+            (":subscriptions / :subs", "subscription picker"),
+            (":help / :h / :?", "open help"),
+            (":refresh", "force-refresh current view"),
+            (":quit / :q", "quit"),
         ],
     ),
 ];

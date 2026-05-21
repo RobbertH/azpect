@@ -32,6 +32,30 @@ pub enum View {
     /// APIM-only: policy XML for the selected operation. Opened with Enter
     /// from `ApimOperations`.
     ApimPolicy,
+    /// Top-level "Storage" mode entry point — lists storage accounts across the
+    /// selected subscriptions. Opened with `S` from any non-modal view.
+    StorageAccounts,
+    /// Azure-portal-style "account overview" panel for the pinned storage
+    /// account: aggregate container / blob / file-share / queue / table counts
+    /// and capacity sourced from Azure Monitor metrics. Sits between
+    /// `StorageAccounts` and `StorageContainers` in the drill chain — Enter
+    /// here opens the containers list. Stats are daily-resolution with a
+    /// reporting lag of up to ~24h (same data the portal shows).
+    StorageAccountOverview,
+    /// List of blob containers under the selected storage account. Opened with
+    /// Enter from `StorageAccountOverview`.
+    StorageContainers,
+    /// List of blobs inside the selected container. Opened with Enter from
+    /// `StorageContainers`. Supports `/` to filter by case-insensitive
+    /// substring match on the blob name (client-side over the full list).
+    StorageBlobs,
+    /// Metadata + bounded body preview for the selected blob. Opened with Enter
+    /// from `StorageBlobs`.
+    StorageBlobDetail,
+    /// Application-Gateway-only: backend pools (and their members) for the
+    /// selected gateway. Opened with Enter from `List` when the resource is
+    /// `ResourceKind::AppGateway`.
+    AppGatewayBackends,
     Help,
 }
 
@@ -147,6 +171,157 @@ pub struct ApimCache {
     pub selected_operation_id: Option<String>,
 }
 
+/// State for the Application Gateway backends drill-in view: a single map of
+/// pools keyed by gateway resource id, with the usual pending / error / cursor
+/// sidecars. The view is one level deep (gateway → pools+members) so there's
+/// no parent selection to pin beyond the cursor in the resource list itself.
+#[derive(Clone, Default)]
+pub struct AppGatewayBackendsCache {
+    /// Keyed by Application Gateway resource id.
+    pub pools: HashMap<String, Vec<crate::azure::appgw_backends::BackendPool>>,
+    pub pools_pending: HashSet<String>,
+    pub pools_error: HashMap<String, String>,
+    /// Cursor into the *flattened* row list rendered by the view (pool header
+    /// rows + member rows interleaved). Lives here so it survives refresh /
+    /// re-entry.
+    pub cursor: usize,
+}
+
+/// State for the Storage drill-in views. Mirrors `ApimCache`: each level of
+/// the chain (accounts → containers → blobs → blob preview) has its own
+/// in-memory cache, pending set, and per-key error map so the views can render
+/// loading / error / data states without re-fetching on every frame.
+#[derive(Clone, Default)]
+pub struct StorageCache {
+    /// All storage accounts discovered for the current subscription scope.
+    /// Wrapped in `Option` so the view can distinguish "never fetched" from
+    /// "fetched and empty".
+    pub accounts: Option<Vec<crate::azure::storage::StorageAccount>>,
+    pub accounts_pending: bool,
+    pub accounts_error: Option<String>,
+    pub accounts_cursor: usize,
+    /// Client-side case-insensitive substring filter applied to the accounts
+    /// list by name. Mirrors `list_filter` + `list_filter_active` so the input
+    /// forwarding code in `app.rs` can route keystrokes to the right buffer.
+    /// Empty value → all accounts pass.
+    pub accounts_filter: Input,
+    pub accounts_filter_active: bool,
+    /// Pinned account the user drilled into. Carried across the rest of the
+    /// chain so per-resource fetches keep using the same account name even if
+    /// the cursor in `StorageAccounts` moves.
+    pub selected_account: Option<crate::azure::storage::StorageAccount>,
+
+    /// Per-account aggregated stats shown by `StorageAccountOverview` (the
+    /// Azure-portal "account overview" panel). Keyed by ARM id. Populated
+    /// lazily on first entry and *only* refetched on explicit `r` because the
+    /// underlying Azure Monitor metrics update at most a few times per day.
+    pub overview_stats: HashMap<String, crate::azure::storage::StorageAccountStats>,
+    pub overview_pending: HashSet<String>,
+    pub overview_error: HashMap<String, String>,
+
+    /// Keyed by storage account resource id.
+    pub containers: HashMap<String, Vec<crate::azure::storage::BlobContainer>>,
+    pub containers_pending: HashSet<String>,
+    pub containers_error: HashMap<String, String>,
+    pub containers_cursor: usize,
+    /// Client-side case-insensitive substring filter applied to the containers
+    /// list by name. Mirrors `accounts_filter` + `accounts_filter_active` so
+    /// the input forwarding code in `app.rs` can route keystrokes to the right
+    /// buffer. Empty value → all containers pass.
+    pub containers_filter: Input,
+    pub containers_filter_active: bool,
+    /// Pinned container name the user drilled into.
+    pub selected_container: Option<String>,
+
+    /// Keyed by `"{account_name}/{container_name}"`. The full set of blobs in
+    /// the container is fetched once and filtered client-side, so the prefix
+    /// is no longer a cache-key dimension.
+    pub blobs: HashMap<String, Vec<crate::azure::storage::Blob>>,
+    pub blobs_pending: HashSet<String>,
+    pub blobs_error: HashMap<String, String>,
+    pub blobs_cursor: usize,
+    /// Client-side case-insensitive substring filter applied to the blobs list
+    /// by name. Mirrors `accounts_filter` + `accounts_filter_active` so the
+    /// input forwarding code in `app.rs` can route keystrokes to the right
+    /// buffer. Empty value → all blobs pass.
+    pub blobs_filter: Input,
+    pub blobs_filter_active: bool,
+    /// Pinned blob name the user drilled into.
+    pub selected_blob: Option<String>,
+
+    /// Keyed by `"{account_name}/{container_name}/{blob_name}"`.
+    pub blob_preview: HashMap<String, crate::azure::storage::BlobPreview>,
+    pub blob_preview_pending: HashSet<String>,
+    pub blob_preview_error: HashMap<String, String>,
+    pub blob_preview_scroll: u16,
+}
+
+impl StorageCache {
+    /// Cache key for the blobs map. The full container is fetched once and
+    /// filtered client-side, so the key is just `{account}/{container}` — no
+    /// prefix dimension.
+    pub fn blobs_key(account: &str, container: &str) -> String {
+        format!("{account}/{container}")
+    }
+
+    /// Cache key for the blob preview map.
+    pub fn blob_preview_key(account: &str, container: &str, blob: &str) -> String {
+        format!("{account}/{container}/{blob}")
+    }
+
+    /// Apply `accounts_filter` to `accounts` as a case-insensitive substring
+    /// match on the account name. Returns an empty vector when accounts
+    /// haven't been fetched yet. An empty filter passes everything through.
+    pub fn filtered_accounts(&self) -> Vec<&crate::azure::storage::StorageAccount> {
+        let needle = self.accounts_filter.value().to_lowercase();
+        match self.accounts.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|a| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `containers_filter` to the containers under `account_id` as a
+    /// case-insensitive substring match on the container name. Returns an
+    /// empty vector when containers haven't been fetched yet for this
+    /// account. An empty filter passes everything through.
+    pub fn filtered_containers(
+        &self,
+        account_id: &str,
+    ) -> Vec<&crate::azure::storage::BlobContainer> {
+        let needle = self.containers_filter.value().to_lowercase();
+        match self.containers.get(account_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `blobs_filter` to the blobs under `(account, container)` as a
+    /// case-insensitive substring match on the blob name. Returns an empty
+    /// vector when blobs haven't been fetched yet. An empty filter passes
+    /// everything through.
+    pub fn filtered_blobs(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> Vec<&crate::azure::storage::Blob> {
+        let needle = self.blobs_filter.value().to_lowercase();
+        let key = Self::blobs_key(account, container);
+        match self.blobs.get(&key) {
+            Some(rows) => rows
+                .iter()
+                .filter(|b| needle.is_empty() || b.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -183,11 +358,13 @@ pub struct LogsCache {
     pub h_offset: usize,
     /// Whether the logs search box currently has focus. While true, raw
     /// keystrokes are forwarded into `search_input` rather than dispatched as
-    /// actions; Esc cancels (deactivates input, keeps query), Enter commits.
+    /// actions; Esc cancels AND clears the query (consistent with the storage
+    /// views — "Esc removes the filter, period"); Enter commits and jumps to
+    /// the next match.
     pub search_active: bool,
     /// Case-insensitive substring filter applied to the source and message
-    /// columns. Persists across `search_active` toggles so the user can edit,
-    /// confirm with Enter, navigate, and re-open with `/`.
+    /// columns. Reset on Esc; persists across Enter-commits so the user can
+    /// keep `n`/`N`-navigating without re-typing.
     pub search_input: Input,
 }
 
@@ -218,6 +395,8 @@ pub struct AppState {
     pub limits: LimitsCache,
     pub revision_meta: RevisionMetaCache,
     pub apim: ApimCache,
+    pub appgw: AppGatewayBackendsCache,
+    pub storage: StorageCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -242,6 +421,13 @@ pub struct AppState {
     /// rather than dispatched as actions; Esc cancels, Enter executes.
     pub command_active: bool,
     pub command_input: Input,
+    /// Active Tab-completion cycle. `(original_prefix, candidates, index)`:
+    /// `original_prefix` is what the user had typed before the *first* Tab in
+    /// the cycle (so Shift+Tab back past zero restores it); `candidates` is
+    /// the prefix-match list captured at that moment; `index` is the
+    /// currently-shown candidate. Cleared as soon as the user types a key
+    /// other than Tab / Shift+Tab.
+    pub command_tab_cycle: Option<(String, Vec<String>, usize)>,
 
     /// In-app `az login` modal state. See [`AuthPrompt`].
     pub auth_prompt: AuthPrompt,
@@ -289,6 +475,8 @@ impl AppState {
             limits: LimitsCache::default(),
             revision_meta: RevisionMetaCache::default(),
             apim: ApimCache::default(),
+            appgw: AppGatewayBackendsCache::default(),
+            storage: StorageCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -296,6 +484,7 @@ impl AppState {
             quit_confirm_yes: false,
             command_active: false,
             command_input: Input::default(),
+            command_tab_cycle: None,
             auth_prompt: AuthPrompt::Hidden,
             auth_menu_focus: AuthMenuFocus::Browser,
             auth_tenant: None,
@@ -335,6 +524,21 @@ impl AppState {
             .filter(|r| needle.is_empty() || is_subsequence(&needle, &r.name.to_lowercase()))
             .collect()
     }
+}
+
+/// Look up the human-readable display name for a subscription GUID. Returns
+/// `None` when the id isn't in `state.subscriptions`, so callers can render a
+/// blank cell rather than echoing the id back at the user.
+///
+/// Free function rather than an `AppState` method so views that already iterate
+/// over `state.subscriptions` (or hold a borrow into it) can call this without
+/// re-borrowing through `&self`.
+pub fn subscription_display_name<'a>(state: &'a AppState, sub_id: &str) -> Option<&'a str> {
+    state
+        .subscriptions
+        .iter()
+        .find(|s| s.id == sub_id)
+        .map(|s| s.display_name.as_str())
 }
 
 /// Returns true if every character of `needle` appears in `haystack` in order

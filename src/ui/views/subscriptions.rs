@@ -162,6 +162,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.view = View::List;
                 state.list_cursor = 0;
                 state.resources.clear();
+                state.storage = crate::ui::state::StorageCache::default();
+                state.appgw = crate::ui::state::AppGatewayBackendsCache::default();
             }
             true
         }

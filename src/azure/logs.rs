@@ -507,6 +507,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: None,
+            created_at: None,
+            modified_at: None,
         }
     }
 

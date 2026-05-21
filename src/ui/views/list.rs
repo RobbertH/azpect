@@ -2,6 +2,7 @@
 
 #![allow(dead_code, unused_variables)]
 
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,7 +11,7 @@ use ratatui::Frame;
 
 use crate::azure::health::{derive, HealthStatus};
 use crate::azure::logs::supports_logs;
-use crate::azure::resources::Resource;
+use crate::azure::resources::{Resource, ResourceKind};
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
@@ -26,56 +27,47 @@ const HALF_PAGE: usize = 10;
 /// space-padded.
 const NAME_COL_WIDTH: usize = 36;
 const RG_COL_WIDTH: usize = 20;
+/// Width of the `CREATED` / `MODIFIED` columns: `YYYY-MM-DD` is 10 chars. We
+/// reserve exactly that — older resources with `None` for the timestamp render
+/// as an empty column, which keeps the next column aligned.
+const DATE_COL_WIDTH: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
 
-    // Header line with mode chips.
-    let mut header_spans = vec![Span::styled(
-        " APIs ",
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
+    // All status info (count, filter, favorites flag) folds into the block
+    // title so it shares a line with the border instead of consuming its own
+    // row. The breadcrumb at the very top of the screen already names the view.
+    let mut title_spans: Vec<Span> = vec![Span::styled(
+        " api resources ",
+        Style::default().fg(theme.fg),
     )];
-    if state.favorites_only {
-        header_spans.push(Span::styled(
-            "★ favorites only ",
-            Style::default().fg(theme.favorite),
-        ));
-    }
-    if state.list_filter_active || !state.list_filter.value().is_empty() {
-        header_spans.push(Span::styled(
-            format!("/{} ", state.list_filter.value()),
-            Style::default().fg(theme.fg),
-        ));
-    }
-    header_spans.push(Span::styled(
+    title_spans.push(Span::styled(
         format!(
-            "· {} of {}",
+            "· {} of {} ",
             state.filtered_resources().len(),
             state.resources.len()
         ),
         Style::default().fg(theme.muted),
     ));
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
-
-    // Body: bordered block.
-    let title = if state.list_filter_active {
-        " resources (search) ".to_string()
-    } else {
-        " resources ".to_string()
-    };
+    if state.favorites_only {
+        title_spans.push(Span::styled(
+            "★ favorites ",
+            Style::default().fg(theme.favorite),
+        ));
+    }
+    if state.list_filter_active || !state.list_filter.value().is_empty() {
+        title_spans.push(Span::styled(
+            format!("/{} ", state.list_filter.value()),
+            Style::default().fg(theme.accent),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(title, Style::default().fg(theme.fg)));
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
+        .title(Line::from(title_spans));
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
 
     // Optionally split off a top row for the search input.
     let (search_area, list_area) = if state.list_filter_active {
@@ -98,7 +90,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if state.loading_resources && filtered.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
-            "loading resources …",
+            "loading api resources …",
             Style::default().fg(theme.muted),
         )));
         frame.render_widget(p, list_area);
@@ -106,7 +98,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let msg = if state.favorites_only {
             "no favorites in this subscription. press f on a row to add one."
         } else if !state.list_filter.value().is_empty() {
-            "no resources match the current filter."
+            "no api resources match the current filter."
         } else {
             "no Function Apps, APIM instances, or Container Apps found."
         };
@@ -116,12 +108,62 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         )));
         frame.render_widget(p, list_area);
     } else {
-        let cursor = state.list_cursor.min(filtered.len() - 1);
-        let visible = list_area.height as usize;
-        let scroll = scroll_for(cursor, filtered.len(), visible);
+        // Carve off a 1-row header strip; the body gets the rest.
+        let (header_area, body_area) = if list_area.height > 1 {
+            let parts =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(list_area);
+            (Some(parts[0]), parts[1])
+        } else {
+            (None, list_area)
+        };
 
         let max_name = NAME_COL_WIDTH;
         let max_rg = RG_COL_WIDTH;
+
+        if let Some(ha) = header_area {
+            let header_spans = vec![
+                Span::raw("    "), // selection prefix (2) + favorite glyph + space (2)
+                Span::styled(
+                    format!("{:<width$}", "NAME", width = max_name),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<4}", "KIND"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("    "), // badge glyph (●) + space + state column padding
+                Span::styled(
+                    format!("{:<8}", "STATUS"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<width$}", "RESOURCE GROUP", width = max_rg),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<width$}", "CREATED", width = DATE_COL_WIDTH),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            frame.render_widget(Paragraph::new(Line::from(header_spans)), ha);
+        }
+
+        let cursor = state.list_cursor.min(filtered.len() - 1);
+        let visible = body_area.height as usize;
+        let scroll = scroll_for(cursor, filtered.len(), visible);
 
         let lines: Vec<Line> = filtered
             .iter()
@@ -152,6 +194,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     width = max_rg
                 );
 
+                let created = format!(
+                    "{:<width$}",
+                    format_date(r.created_at.as_ref()),
+                    width = DATE_COL_WIDTH
+                );
+
                 let spans = vec![
                     Span::raw(if selected { "▍ " } else { "  " }),
                     fav_glyph,
@@ -168,6 +216,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     ),
                     Span::raw("  "),
                     Span::styled(rg, Style::default().fg(theme.muted)),
+                    Span::raw("  "),
+                    Span::styled(created, Style::default().fg(theme.muted)),
                 ];
 
                 if selected {
@@ -178,14 +228,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             })
             .collect();
 
-        frame.render_widget(Paragraph::new(lines), list_area);
+        frame.render_widget(Paragraph::new(lines), body_area);
     }
 
     let footer = Paragraph::new(Line::from(Span::styled(
         FOOTER_HINT,
         Style::default().fg(theme.muted),
     )));
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[1]);
 }
 
 pub(crate) fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
@@ -213,6 +263,16 @@ fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
         HealthStatus::Degraded => theme.degraded,
         HealthStatus::Critical => theme.critical,
         HealthStatus::Unknown => theme.unknown,
+    }
+}
+
+/// Render an optional `DateTime<Utc>` as `YYYY-MM-DD` for the list view. Older
+/// ARM resources pre-date `systemData` and surface as `None`; those collapse to
+/// an empty string so the column stays blank rather than showing a placeholder.
+fn format_date(dt: Option<&DateTime<Utc>>) -> String {
+    match dt {
+        Some(d) => d.format("%Y-%m-%d").to_string(),
+        None => String::new(),
     }
 }
 
@@ -306,10 +366,22 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::OpenSelected => {
-            if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
+            // Most kinds open the generic Detail view; Application Gateways
+            // skip that level and land directly on their backend-pools view,
+            // because "what's this gateway hooked up to?" is what the user
+            // wants when they hit Enter on an AppGw row.
+            if let Some(selected) = state.selected_resource() {
+                let id = selected.id.clone();
+                let kind = selected.kind;
                 state.config.last_resource_id = Some(id);
                 state.view_stack.push(state.view);
-                state.view = View::Detail;
+                state.view = match kind {
+                    ResourceKind::AppGateway => {
+                        state.appgw.cursor = 0;
+                        View::AppGatewayBackends
+                    }
+                    _ => View::Detail,
+                };
             }
             true
         }
@@ -363,6 +435,8 @@ mod tests {
             resource_group: "rg-demo".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }
     }
 
@@ -379,7 +453,7 @@ mod tests {
     #[test]
     fn renders_without_panic() {
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(100, 12);
+        let backend = TestBackend::new(120, 12);
         let mut term = Terminal::new(backend).unwrap();
         let state = fixture();
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -387,6 +461,38 @@ mod tests {
         assert!(s.contains("alpha-func"));
         assert!(s.contains("Func"));
         assert!(s.contains("LOADING"));
+        // The renamed block title now reads "api resources".
+        assert!(
+            s.contains("api resources"),
+            "expected api resources title in {s}"
+        );
+        // CREATED header column shipped — even if every row's date is empty.
+        assert!(s.contains("CREATED"), "expected CREATED header in {s}");
+    }
+
+    #[test]
+    fn renders_created_column_value_when_present() {
+        use chrono::TimeZone;
+
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.resources[0].created_at = Some(Utc.with_ymd_and_hms(2024, 3, 15, 8, 30, 0).unwrap());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("2024-03-15"),
+            "expected ISO date in row, got {s}"
+        );
+    }
+
+    #[test]
+    fn format_date_handles_none_and_some() {
+        use chrono::TimeZone;
+        assert_eq!(format_date(None), "");
+        let d = Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
+        assert_eq!(format_date(Some(&d)), "2026-05-21");
     }
 
     #[test]

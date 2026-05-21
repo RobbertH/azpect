@@ -17,8 +17,25 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str =
-    "0 1h  1 1d  7 7d  l logs  Enter APIs (APIM)  Esc back  r refresh  ? help  q quit";
+/// Base footer hint without a resource-kind-specific Enter clue. The drill-in
+/// segment is appended per-render by [`footer_hint_for`] so Function Apps /
+/// Container Apps don't show an Enter that does nothing.
+const FOOTER_HINT_BASE: &str = "0 1h  1 1d  7 7d  l logs  Esc back  r refresh  ? help  q quit";
+
+fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
+    use crate::azure::resources::ResourceKind;
+    let enter_clue = match kind {
+        ResourceKind::Apim => Some("Enter apis"),
+        ResourceKind::AppGateway => Some("Enter backends"),
+        ResourceKind::FunctionApp | ResourceKind::ContainerApp => None,
+    };
+    match enter_clue {
+        Some(clue) => {
+            format!("0 1h  1 1d  7 7d  l logs  {clue}  Esc back  r refresh  ? help  q quit")
+        }
+        None => FOOTER_HINT_BASE.to_string(),
+    }
+}
 
 const ROW_KINDS: [(MetricKind, &str); 4] = [
     (MetricKind::Traffic, "Requests"),
@@ -67,7 +84,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
         frame.render_widget(p, inner);
-        render_footer(frame, chunks[2], theme);
+        render_footer(frame, chunks[2], theme, FOOTER_HINT_BASE);
         return;
     };
 
@@ -84,18 +101,37 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         (color_for_health(h, theme), h.label())
     };
 
+    // The second header line either reports an error or surfaces the resource's
+    // lifecycle state. When it's a state line, the label stays muted but the
+    // value picks up a colour via `state_color` so the user can clock "is this
+    // thing actually running?" at a glance instead of squinting at grey text.
+    let second_line: Line = match failure {
+        Some(msg) => Line::from(Span::styled(
+            format!("metrics error: {msg}"),
+            Style::default().fg(theme.critical),
+        )),
+        None => {
+            let raw_state = resource.state.as_deref().unwrap_or("unknown");
+            Line::from(vec![
+                Span::styled("state: ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    raw_state.to_string(),
+                    Style::default()
+                        .fg(state_color(raw_state, theme))
+                        .add_modifier(if raw_state == "Running" {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ])
+        }
+    };
+    // Plain-text form used only to reserve enough wrapped rows in the layout
+    // below. Must match the visible text shape of `second_line`.
     let second_line_text = match failure {
         Some(msg) => format!("metrics error: {msg}"),
-        None => resource
-            .state
-            .as_deref()
-            .map(|s| format!("state: {s}"))
-            .unwrap_or_else(|| "state: unknown".to_string()),
-    };
-    let second_line_color = if failure.is_some() {
-        theme.critical
-    } else {
-        theme.muted
+        None => format!("state: {}", resource.state.as_deref().unwrap_or("unknown")),
     };
 
     // Container-App-only extras: pulled from the revisions + container app
@@ -119,11 +155,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Constraint::Min(0),
     ])
     .split(inner);
-
-    let second_line = Line::from(Span::styled(
-        second_line_text,
-        Style::default().fg(second_line_color),
-    ));
 
     let mut context_lines: Vec<Line> = vec![
         Line::from(vec![
@@ -206,7 +237,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
     }
 
-    render_footer(frame, chunks[2], theme);
+    render_footer(frame, chunks[2], theme, &footer_hint_for(resource.kind));
 }
 
 /// Render a 1-row time axis aligned under the sparkline grid. Five
@@ -305,9 +336,9 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
     chars.div_ceil(w)
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
+fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, hint: &str) {
     let p = Paragraph::new(Line::from(Span::styled(
-        FOOTER_HINT,
+        hint,
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(p, area);
@@ -573,6 +604,23 @@ fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
         HealthStatus::Degraded => theme.degraded,
         HealthStatus::Critical => theme.critical,
         HealthStatus::Unknown => theme.unknown,
+    }
+}
+
+/// Pick a colour for the `state:` value shown on the Detail header. Matches the
+/// vocabulary across Function Apps (`Running`/`Stopped`), Container Apps
+/// (`Running`/`Progressing`/`Stopped`/`Suspended`), and App Gateways
+/// (`Running`/`Starting`/`Stopping`/`Stopped`). The catppuccin palette has no
+/// dedicated "good" green for state, so `Running` reuses `theme.fg` (the caller
+/// adds a bold modifier separately) — distinct from the badge colours and still
+/// reads as "fine" against muted siblings.
+fn state_color(state: &str, theme: &Theme) -> Color {
+    match state {
+        "Running" => theme.fg,
+        "Stopped" => theme.critical,
+        "Suspended" => theme.degraded,
+        "Starting" | "Stopping" | "Progressing" => theme.accent,
+        _ => theme.muted,
     }
 }
 
@@ -859,6 +907,8 @@ mod tests {
             resource_group: "rg-demo".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }
     }
 
@@ -956,6 +1006,21 @@ mod tests {
         assert!(handle(Action::OpenLogs, &mut state));
         assert_eq!(state.view, View::Detail);
         assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn state_color_maps_known_states() {
+        let theme = Theme::catppuccin_mocha();
+        assert_eq!(state_color("Running", &theme), theme.fg);
+        assert_eq!(state_color("Stopped", &theme), theme.critical);
+        assert_eq!(state_color("Suspended", &theme), theme.degraded);
+        assert_eq!(state_color("Starting", &theme), theme.accent);
+        assert_eq!(state_color("Stopping", &theme), theme.accent);
+        assert_eq!(state_color("Progressing", &theme), theme.accent);
+        // Anything unfamiliar falls back to muted rather than misleadingly
+        // colouring an unknown lifecycle state.
+        assert_eq!(state_color("Wibble", &theme), theme.muted);
+        assert_eq!(state_color("unknown", &theme), theme.muted);
     }
 
     #[test]

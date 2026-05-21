@@ -254,30 +254,62 @@ async fn event_loop(
                     }
                 }
                 // Command palette has top priority. While active, all keys
-                // except Esc (cancel) and Enter (execute) flow into the
-                // command input buffer.
+                // except Esc (cancel), Enter (execute), and Tab / Shift+Tab
+                // (completion cycle) flow into the command input buffer.
                 if state.command_active {
-                    if should_forward_to_command(state, key) {
-                        state.command_input.handle_event(&CtEvent::Key(key));
-                        continue;
-                    }
                     match key.code {
                         KeyCode::Esc => {
                             state.command_active = false;
                             state.command_input.reset();
+                            state.command_tab_cycle = None;
                             continue;
                         }
                         KeyCode::Enter => {
                             let cmd = state.command_input.value().to_string();
-                            run_command(state, &cmd);
+                            // Closing the palette before dispatching the
+                            // action so a status message from `run_command`
+                            // shows in the cleared bottom-of-screen layout.
                             state.command_active = false;
                             state.command_input.reset();
+                            state.command_tab_cycle = None;
+                            let view_before = state.view;
+                            run_command(state, &cmd);
+                            // `:refresh` is the one command we can't fully
+                            // resolve inside `run_command` because the load
+                            // helpers need `auth` and `tx`. Route it through
+                            // the normal force-refresh path the `r` key uses.
+                            if cmd.trim() == "refresh" {
+                                kick_off_loads_for_view(state, auth, tx, true);
+                            } else if state.view != view_before {
+                                // Navigation command (`:storage`, `:apis`,
+                                // …) just transitioned views. Kick off
+                                // whatever loads the new view needs, the same
+                                // way the after-action chain does for keys.
+                                kick_off_loads_for_view(state, auth, tx, false);
+                            }
                             if state.should_quit {
                                 break;
                             }
                             continue;
                         }
-                        _ => {}
+                        KeyCode::Tab => {
+                            step_palette_tab_cycle(state, true);
+                            continue;
+                        }
+                        KeyCode::BackTab => {
+                            step_palette_tab_cycle(state, false);
+                            continue;
+                        }
+                        _ => {
+                            if should_forward_to_command(state, key) {
+                                // Any new keystroke breaks the cycle so the
+                                // next Tab rebuilds candidates against the
+                                // freshly-edited buffer.
+                                state.command_tab_cycle = None;
+                                state.command_input.handle_event(&CtEvent::Key(key));
+                                continue;
+                            }
+                        }
                     }
                 }
                 // When the list filter input has focus, forward raw keystrokes
@@ -292,6 +324,36 @@ async fn event_loop(
                 // Same shape for the logs less-style search input.
                 if should_forward_to_logs_search(state, key) {
                     state.logs.search_input.handle_event(&CtEvent::Key(key));
+                    continue;
+                }
+                // Storage blobs name filter shares the same carve-out shape.
+                // Reset the cursor so a shrinking match list never points past
+                // the end of `filtered_blobs()`.
+                if should_forward_to_blobs_filter(state, key) {
+                    state.storage.blobs_filter.handle_event(&CtEvent::Key(key));
+                    state.storage.blobs_cursor = 0;
+                    continue;
+                }
+                // Storage containers name filter shares the same carve-out shape.
+                // Reset the cursor so a shrinking match list never points past
+                // the end of `filtered_containers()`.
+                if should_forward_to_containers_filter(state, key) {
+                    state
+                        .storage
+                        .containers_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.storage.containers_cursor = 0;
+                    continue;
+                }
+                // Storage accounts name filter shares the same carve-out shape.
+                // Reset the cursor so a shrinking match list never points past
+                // the end of `filtered_accounts()`.
+                if should_forward_to_accounts_filter(state, key) {
+                    state
+                        .storage
+                        .accounts_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.storage.accounts_cursor = 0;
                     continue;
                 }
                 let action = decide_action(&mut input, key, state);
@@ -487,6 +549,92 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::AppGatewayBackendsLoaded {
+                resource_id,
+                result,
+            } => {
+                state.appgw.pools_pending.remove(&resource_id);
+                match result {
+                    Ok(pools) => {
+                        state.appgw.pools_error.remove(&resource_id);
+                        state.appgw.pools.insert(resource_id, pools);
+                    }
+                    Err(e) => {
+                        state.appgw.pools.remove(&resource_id);
+                        state.appgw.pools_error.insert(resource_id, e);
+                    }
+                }
+            }
+            AppEvent::StorageAccountsLoaded(res) => {
+                state.storage.accounts_pending = false;
+                match res {
+                    Ok(accounts) => {
+                        state.storage.accounts_error = None;
+                        // Clamp cursor if the previous list was longer than the
+                        // freshly-fetched one (e.g. user switched subscription).
+                        if !accounts.is_empty() && state.storage.accounts_cursor >= accounts.len() {
+                            state.storage.accounts_cursor = accounts.len() - 1;
+                        }
+                        state.storage.accounts = Some(accounts);
+                    }
+                    Err(e) => {
+                        state.storage.accounts = None;
+                        state.storage.accounts_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::StorageContainersLoaded { account_id, result } => {
+                state.storage.containers_pending.remove(&account_id);
+                match result {
+                    Ok(containers) => {
+                        state.storage.containers_error.remove(&account_id);
+                        state.storage.containers.insert(account_id, containers);
+                    }
+                    Err(e) => {
+                        state.storage.containers.remove(&account_id);
+                        state.storage.containers_error.insert(account_id, e);
+                    }
+                }
+            }
+            AppEvent::StorageOverviewLoaded { account_id, result } => {
+                state.storage.overview_pending.remove(&account_id);
+                match result {
+                    Ok(stats) => {
+                        state.storage.overview_error.remove(&account_id);
+                        state.storage.overview_stats.insert(account_id, stats);
+                    }
+                    Err(e) => {
+                        state.storage.overview_stats.remove(&account_id);
+                        state.storage.overview_error.insert(account_id, e);
+                    }
+                }
+            }
+            AppEvent::StorageBlobsLoaded { key, result } => {
+                state.storage.blobs_pending.remove(&key);
+                match result {
+                    Ok(blobs) => {
+                        state.storage.blobs_error.remove(&key);
+                        state.storage.blobs.insert(key, blobs);
+                    }
+                    Err(e) => {
+                        state.storage.blobs.remove(&key);
+                        state.storage.blobs_error.insert(key, e);
+                    }
+                }
+            }
+            AppEvent::StorageBlobPreviewLoaded { key, result } => {
+                state.storage.blob_preview_pending.remove(&key);
+                match result {
+                    Ok(preview) => {
+                        state.storage.blob_preview_error.remove(&key);
+                        state.storage.blob_preview.insert(key, preview);
+                    }
+                    Err(e) => {
+                        state.storage.blob_preview.remove(&key);
+                        state.storage.blob_preview_error.insert(key, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -605,10 +753,100 @@ fn should_forward_to_logs_search(state: &AppState, key: crossterm::event::KeyEve
 }
 
 /// True when the command palette is active *and* the key is something the
-/// input widget should consume. `Esc` (cancel) and `Enter` (execute) are
-/// reserved and handled directly by the event loop.
+/// input widget should consume. `Esc` (cancel), `Enter` (execute), and
+/// `Tab` / `BackTab` (completion cycle) are reserved and handled directly by
+/// the event loop.
 fn should_forward_to_command(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
-    state.command_active && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+    state.command_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the storage-blobs name filter.
+/// Only forwards while the blobs view has its filter box focused; same Esc /
+/// Enter carve-out so cancel / commit still reach the dispatcher.
+fn should_forward_to_blobs_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::StorageBlobs
+        && state.storage.blobs_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the storage-containers name
+/// filter. Only forwards while the containers view has its filter box
+/// focused; same Esc / Enter / arrow carve-outs so cancel / commit / nav
+/// still reach the dispatcher.
+fn should_forward_to_containers_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::StorageContainers
+        && state.storage.containers_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the storage-accounts name filter.
+/// Only forwards while the accounts view has its filter box focused; same
+/// Esc / Enter / arrow carve-outs so cancel / commit / nav still reach the
+/// dispatcher.
+fn should_forward_to_accounts_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::StorageAccounts
+        && state.storage.accounts_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Registered palette commands: `(canonical, aliases, description)`. Each
+/// entry produces one canonical name plus zero or more aliases that resolve
+/// to the same action in [`run_command`]. The list also feeds Tab-completion
+/// — every name (canonical + aliases) is a candidate for prefix-matching.
+const PALETTE_COMMANDS: &[(&str, &[&str])] = &[
+    ("storage", &["s"]),
+    ("apis", &["a", "resources", "r"]),
+    ("subscriptions", &["subs"]),
+    ("help", &["h", "?"]),
+    ("quit", &["q"]),
+    ("refresh", &[]),
+];
+
+/// Flattened list of every palette name (canonical + aliases) plus the legacy
+/// vim-style quit aliases. Returned in deterministic order so Tab-completion
+/// cycles predictably.
+fn palette_completion_candidates() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (canonical, aliases) in PALETTE_COMMANDS {
+        out.push((*canonical).to_string());
+        for a in *aliases {
+            out.push((*a).to_string());
+        }
+    }
+    // Legacy vim-style aliases for `quit` — still recognised by `run_command`
+    // and worth completing so muscle memory works.
+    for extra in ["qa", "qa!", "quitall"] {
+        out.push(extra.to_string());
+    }
+    out
 }
 
 /// Parse and execute a command palette buffer. Unknown commands surface a
@@ -616,13 +854,116 @@ fn should_forward_to_command(state: &AppState, key: crossterm::event::KeyEvent) 
 fn run_command(state: &mut AppState, cmd: &str) {
     let trimmed = cmd.trim();
     match trimmed {
+        "" => {} // empty: silently ignore
         // `:q` and friends quit immediately and intentionally bypass the
         // quit-confirmation modal: typing `:q` is explicit user intent, not
         // an accidental Esc press.
         "q" | "quit" | "qa" | "qa!" | "quitall" => state.should_quit = true,
-        "" => {} // empty: silently ignore
+        // Top-level Storage mode. Mirrors the `S` key path: push the current
+        // view onto the stack so Esc walks back; reset the cursor; load on
+        // arrival is handled by the after-action side-effect chain — for
+        // palette commands we trigger that via `apply_palette_command`.
+        "storage" | "s" => {
+            if !matches!(
+                state.view,
+                View::StorageAccounts
+                    | View::StorageAccountOverview
+                    | View::StorageContainers
+                    | View::StorageBlobs
+                    | View::StorageBlobDetail
+            ) {
+                state.view_stack.push(state.view);
+                state.view = View::StorageAccounts;
+                state.storage.accounts_cursor = 0;
+            }
+        }
+        "apis" | "a" | "resources" | "r" => {
+            if state.view != View::List {
+                state.view_stack.push(state.view);
+                state.view = View::List;
+            }
+        }
+        "subscriptions" | "subs" => {
+            if state.view != View::Subscriptions {
+                state.view_stack.push(state.view);
+                state.view = View::Subscriptions;
+            }
+        }
+        "help" | "h" | "?" => {
+            if state.view != View::Help {
+                state.view_stack.push(state.view);
+                state.view = View::Help;
+            }
+        }
+        // Refresh is handled by the caller after we return — it needs `auth`
+        // and `tx`, which `run_command` doesn't have. Signal via status hint
+        // and let the dispatcher kick off the load.
+        "refresh" => {
+            // Nothing to do here: `dispatch_command_palette` peeks the buffer
+            // before calling `run_command` and routes refresh through the
+            // normal `kick_off_loads_for_view` path.
+        }
         other => {
             state.set_status(format!("unknown command: :{other}"));
+        }
+    }
+}
+
+/// Compute the next Tab-completion candidate set for the current buffer. The
+/// candidates are every palette name (canonical + aliases) whose name starts
+/// with the trimmed buffer, in registration order.
+fn palette_tab_candidates(buffer: &str) -> Vec<String> {
+    let needle = buffer.trim();
+    palette_completion_candidates()
+        .into_iter()
+        .filter(|name| name.starts_with(needle))
+        .collect()
+}
+
+/// Inline ghost-text suffix shown after the typed input — the part Tab would
+/// fill in. Returns the empty string when the buffer is empty, when no
+/// candidate prefix-matches, or when the buffer already equals the first
+/// candidate (nothing left to suggest).
+fn palette_ghost_hint(buffer: &str) -> String {
+    let needle = buffer.trim();
+    if needle.is_empty() {
+        return String::new();
+    }
+    palette_tab_candidates(buffer)
+        .into_iter()
+        .next()
+        .and_then(|cand| cand.strip_prefix(needle).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Advance (or rewind) the palette Tab-completion cycle by one step. Builds
+/// the candidate list lazily on the first Tab; subsequent Tabs cycle through
+/// it. `forward = false` walks backward (Shift+Tab).
+fn step_palette_tab_cycle(state: &mut AppState, forward: bool) {
+    let buffer = state.command_input.value().to_string();
+    // Lazy init: build candidates from whatever the user has typed so far.
+    if state.command_tab_cycle.is_none() {
+        let candidates = palette_tab_candidates(&buffer);
+        if candidates.is_empty() {
+            return;
+        }
+        state.command_tab_cycle = Some((buffer, candidates, 0));
+    } else if let Some((_, cands, idx)) = state.command_tab_cycle.as_mut() {
+        if cands.is_empty() {
+            return;
+        }
+        let len = cands.len();
+        *idx = if forward {
+            (*idx + 1) % len
+        } else {
+            // Wrap-around without going negative.
+            (*idx + len - 1) % len
+        };
+    }
+    // Apply the current candidate to the input.
+    if let Some((_, cands, idx)) = state.command_tab_cycle.as_ref() {
+        if let Some(cand) = cands.get(*idx).cloned() {
+            state.command_input = Input::default().with_value(cand);
         }
     }
 }
@@ -650,7 +991,11 @@ fn decide_action(
     // Any text-input widget currently focused? While the user is typing into
     // one, printable keys must not fire global actions like `n` (next match)
     // or open a chord — they belong to the input field.
-    let input_focused = state.list_filter_active || state.logs.search_active;
+    let input_focused = state.list_filter_active
+        || state.logs.search_active
+        || (state.view == View::StorageBlobs && state.storage.blobs_filter_active)
+        || (state.view == View::StorageContainers && state.storage.containers_filter_active)
+        || (state.view == View::StorageAccounts && state.storage.accounts_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -691,6 +1036,14 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::ApimApis => crate::ui::views::apim_apis::handle(action, state),
         View::ApimOperations => crate::ui::views::apim_operations::handle(action, state),
         View::ApimPolicy => crate::ui::views::apim_policy::handle(action, state),
+        View::AppGatewayBackends => crate::ui::views::appgw_backends::handle(action, state),
+        View::StorageAccounts => crate::ui::views::storage_accounts::handle(action, state),
+        View::StorageAccountOverview => {
+            crate::ui::views::storage_account_overview::handle(action, state)
+        }
+        View::StorageContainers => crate::ui::views::storage_containers::handle(action, state),
+        View::StorageBlobs => crate::ui::views::storage_blobs::handle(action, state),
+        View::StorageBlobDetail => crate::ui::views::storage_blob_detail::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -787,10 +1140,29 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .as_deref()
             .and_then(service_id_from_api_id)
             .map(|svc_id| format!("{PORTAL_BASE}{svc_id}/apim-apis")),
+        View::AppGatewayBackends => state
+            .selected_resource()
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         View::Subscriptions => state
             .subscriptions
             .get(state.subscription_cursor)
             .map(|s| format!("{PORTAL_BASE}/subscriptions/{}/overview", s.id)),
+        // Storage views land on the account's overview blade; the portal
+        // exposes the container/blob drill-down off of there. The cursor
+        // indexes into the *filtered* view so `o` follows what's on screen.
+        View::StorageAccounts => state
+            .storage
+            .filtered_accounts()
+            .get(state.storage.accounts_cursor)
+            .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+        View::StorageAccountOverview
+        | View::StorageContainers
+        | View::StorageBlobs
+        | View::StorageBlobDetail => state
+            .storage
+            .selected_account
+            .as_ref()
+            .map(|a| format!("{PORTAL_BASE}{}", a.id)),
         View::Help => None,
     }
 }
@@ -822,10 +1194,39 @@ fn yank_target(state: &AppState) -> Option<String> {
         }),
         View::ApimPolicy => crate::ui::views::apim_policy::yank_text(state)
             .or_else(|| state.apim.selected_operation_id.clone()),
+        View::AppGatewayBackends => crate::ui::views::appgw_backends::yank_text(state)
+            .or_else(|| state.selected_resource().map(|r| r.id.clone())),
         View::Subscriptions => state
             .subscriptions
             .get(state.subscription_cursor)
             .map(|s| s.id.clone()),
+        View::StorageAccounts => state
+            .storage
+            .filtered_accounts()
+            .get(state.storage.accounts_cursor)
+            .map(|a| a.id.clone()),
+        View::StorageAccountOverview => state
+            .storage
+            .selected_account
+            .as_ref()
+            .map(|a| a.id.clone()),
+        View::StorageContainers => {
+            let acc = state.storage.selected_account.as_ref()?;
+            state
+                .storage
+                .filtered_containers(&acc.id)
+                .get(state.storage.containers_cursor)
+                .map(|c| format!("{}/{}", acc.name, c.name))
+        }
+        View::StorageBlobs => crate::ui::views::storage_blobs::yank_text(state),
+        View::StorageBlobDetail => {
+            crate::ui::views::storage_blob_detail::yank_text(state).or_else(|| {
+                let acc = state.storage.selected_account.as_ref()?;
+                let cont = state.storage.selected_container.as_deref()?;
+                let blob = state.storage.selected_blob.as_deref()?;
+                Some(format!("{}/{}/{}", acc.name, cont, blob))
+            })
+        }
         View::Help => None,
     }
 }
@@ -862,14 +1263,22 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::Back => {
-            match state.view_stack.pop() {
-                Some(prev) => state.view = prev,
-                // Empty stack: open the quit-confirmation modal instead of
-                // hard-quitting. The event loop's top-priority handler
-                // routes y/n until the user resolves it. `:q` and friends in
-                // `run_command` bypass this and quit immediately — that's
-                // explicit intent.
+            // Esc / q goes one abstraction level *up* in the breadcrumb tree —
+            // not back through navigation history. So opening Storage with `S`
+            // from a Function-App Logs view and then pressing Esc takes you to
+            // `Subscriptions` (the parent of `StorageAccounts`), not back to
+            // the Logs view you came from. Help stays modal: it pops the stack
+            // so `?` from anywhere round-trips correctly.
+            if state.view == View::Help {
+                if let Some(prev) = state.view_stack.pop() {
+                    state.view = prev;
+                    return true;
+                }
+            }
+            match semantic_parent(state.view) {
+                Some(parent) => state.view = parent,
                 None => {
+                    // Root view (Subscriptions): open quit-confirm modal.
                     state.quit_confirm = true;
                     state.quit_confirm_yes = false;
                 }
@@ -890,7 +1299,53 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
             }
             true
         }
+        Action::OpenStorage => {
+            // Capital `S` from any non-storage view enters top-level Storage
+            // mode. Pushing the current view onto the stack lets Esc walk
+            // back the way the user came. Idempotent within the storage
+            // chain so repeated presses don't grow the stack.
+            if !matches!(
+                state.view,
+                View::StorageAccounts
+                    | View::StorageAccountOverview
+                    | View::StorageContainers
+                    | View::StorageBlobs
+                    | View::StorageBlobDetail
+            ) {
+                state.view_stack.push(state.view);
+                state.view = View::StorageAccounts;
+                state.storage.accounts_cursor = 0;
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+/// Returns the view one abstraction level up from `view` — the parent in the
+/// breadcrumb tree. `None` means `view` is the root (Subscriptions); Esc on
+/// the root opens the quit-confirm modal. `Help` is treated as modal and
+/// handled separately via `view_stack` so `?` can be used from anywhere
+/// without losing the underlying location.
+fn semantic_parent(view: View) -> Option<View> {
+    match view {
+        View::Subscriptions => None,
+        View::Help => None,
+        View::List => Some(View::Subscriptions),
+        View::Detail => Some(View::List),
+        View::Logs => Some(View::Detail),
+        View::LogDetail => Some(View::Logs),
+        View::AppGatewayBackends => Some(View::List),
+        View::ApimApis => Some(View::Detail),
+        View::ApimOperations => Some(View::ApimApis),
+        View::ApimPolicy => Some(View::ApimOperations),
+        View::StorageAccounts => Some(View::Subscriptions),
+        // Overview sits between accounts and containers. Esc from overview
+        // returns to the accounts list — the parent in the breadcrumb tree.
+        View::StorageAccountOverview => Some(View::StorageAccounts),
+        View::StorageContainers => Some(View::StorageAccountOverview),
+        View::StorageBlobs => Some(View::StorageContainers),
+        View::StorageBlobDetail => Some(View::StorageBlobs),
     }
 }
 
@@ -907,6 +1362,7 @@ fn after_action(
         // appropriate to whatever the new view is.
         Action::OpenSelected
         | Action::OpenLogs
+        | Action::OpenStorage
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
@@ -1038,6 +1494,118 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::AppGatewayBackends => {
+            // The drilled-into gateway is whatever is currently under the list
+            // cursor; the view module's `gateway_id` helper enforces the kind
+            // filter for us.
+            if let Some(gw_id) = crate::ui::views::appgw_backends::gateway_id(state) {
+                let cached = state.appgw.pools.contains_key(&gw_id);
+                let in_flight = state.appgw.pools_pending.contains(&gw_id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.appgw.pools.remove(&gw_id);
+                        state.appgw.pools_error.remove(&gw_id);
+                    }
+                    state.appgw.pools_pending.insert(gw_id.clone());
+                    spawn_load_appgw_backends(auth.clone(), gw_id, tx.clone());
+                }
+            }
+        }
+        View::StorageAccounts => {
+            // Use the same subscription-scope rule as the resource list: a
+            // single pinned subscription if one is selected, else everything
+            // the credential can see.
+            let cached = state.storage.accounts.is_some();
+            let in_flight = state.storage.accounts_pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.storage.accounts = None;
+                    state.storage.accounts_error = None;
+                }
+                state.storage.accounts_pending = true;
+                spawn_load_storage_accounts(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::StorageAccountOverview => {
+            // Overview is the new landing pad for an account: spawn the five
+            // Azure Monitor calls only on first entry (or explicit Refresh).
+            // The metrics are daily-resolution server-side, so re-fetching on
+            // every revisit would just burn ARM quota for stale data.
+            if let Some(account) = state.storage.selected_account.clone() {
+                let cached = state.storage.overview_stats.contains_key(&account.id);
+                let in_flight = state.storage.overview_pending.contains(&account.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.overview_stats.remove(&account.id);
+                        state.storage.overview_error.remove(&account.id);
+                    }
+                    state.storage.overview_pending.insert(account.id.clone());
+                    spawn_load_storage_overview(auth.clone(), account, tx.clone());
+                }
+            }
+        }
+        View::StorageContainers => {
+            if let Some(account) = state.storage.selected_account.clone() {
+                let cached = state.storage.containers.contains_key(&account.id);
+                let in_flight = state.storage.containers_pending.contains(&account.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.containers.remove(&account.id);
+                        state.storage.containers_error.remove(&account.id);
+                    }
+                    state.storage.containers_pending.insert(account.id.clone());
+                    spawn_load_storage_containers(auth.clone(), account, tx.clone());
+                }
+            }
+        }
+        View::StorageBlobs => {
+            if let (Some(acc), Some(container)) = (
+                state.storage.selected_account.clone(),
+                state.storage.selected_container.clone(),
+            ) {
+                let key = crate::ui::state::StorageCache::blobs_key(&acc.name, &container);
+                let cached = state.storage.blobs.contains_key(&key);
+                let in_flight = state.storage.blobs_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.blobs.remove(&key);
+                        state.storage.blobs_error.remove(&key);
+                    }
+                    state.storage.blobs_pending.insert(key);
+                    spawn_load_storage_blobs(auth.clone(), acc.name, container, tx.clone());
+                }
+            }
+        }
+        View::StorageBlobDetail => {
+            if let (Some(acc), Some(container), Some(blob)) = (
+                state.storage.selected_account.clone(),
+                state.storage.selected_container.clone(),
+                state.storage.selected_blob.clone(),
+            ) {
+                let key =
+                    crate::ui::state::StorageCache::blob_preview_key(&acc.name, &container, &blob);
+                let cached = state.storage.blob_preview.contains_key(&key);
+                let in_flight = state.storage.blob_preview_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.blob_preview.remove(&key);
+                        state.storage.blob_preview_error.remove(&key);
+                    }
+                    state.storage.blob_preview_pending.insert(key);
+                    spawn_load_storage_blob_preview(
+                        auth.clone(),
+                        acc.name,
+                        container,
+                        blob,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -1083,10 +1651,20 @@ fn drain_fetch_more_requested(
 }
 
 fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // Reserve a single-row strip at the very top for the global breadcrumb
+    // bar, so every view sees the same `path > to > here` line. Carve before
+    // the command/status rows so the breadcrumb is always at the top edge.
+    let mut remaining = area;
+    let breadcrumb_area = if remaining.height > 0 {
+        let (row, below) = split_off_top_row(remaining);
+        remaining = below;
+        Some(row)
+    } else {
+        None
+    };
     // Reserve bottom rows for, in order from the bottom up: the command bar
     // (when active) and the status hint (whenever `status_message` is set).
     // Both shrink the view area so the underlying view never overlaps them.
-    let mut remaining = area;
     let command_area = if state.command_active && remaining.height > 0 {
         let (above, row) = split_off_bottom_row(remaining);
         remaining = above;
@@ -1103,6 +1681,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
     };
     let view_area = remaining;
 
+    if let Some(ba) = breadcrumb_area {
+        crate::ui::breadcrumb::render(f, ba, state, theme);
+    }
+
     match state.view {
         View::Subscriptions => crate::ui::views::subscriptions::render(f, view_area, state, theme),
         View::List => crate::ui::views::list::render(f, view_area, state, theme),
@@ -1114,6 +1696,22 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::apim_operations::render(f, view_area, state, theme)
         }
         View::ApimPolicy => crate::ui::views::apim_policy::render(f, view_area, state, theme),
+        View::AppGatewayBackends => {
+            crate::ui::views::appgw_backends::render(f, view_area, state, theme)
+        }
+        View::StorageAccounts => {
+            crate::ui::views::storage_accounts::render(f, view_area, state, theme)
+        }
+        View::StorageAccountOverview => {
+            crate::ui::views::storage_account_overview::render(f, view_area, state, theme)
+        }
+        View::StorageContainers => {
+            crate::ui::views::storage_containers::render(f, view_area, state, theme)
+        }
+        View::StorageBlobs => crate::ui::views::storage_blobs::render(f, view_area, state, theme),
+        View::StorageBlobDetail => {
+            crate::ui::views::storage_blob_detail::render(f, view_area, state, theme)
+        }
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -1133,6 +1731,24 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
     if let Some(ca) = command_area {
         render_command_bar(f, ca, state, theme);
     }
+}
+
+/// Split a single-row strip off the top of `area`, returning the row itself
+/// and the area below. Assumes `area.height >= 1`.
+fn split_off_top_row(area: Rect) -> (Rect, Rect) {
+    let row = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let below = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height - 1,
+    };
+    (row, below)
 }
 
 /// Split a single-row strip off the bottom of `area`, returning the area
@@ -1500,11 +2116,16 @@ fn render_command_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState, them
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
 
-    let p = Paragraph::new(Line::from(vec![
+    let buffer = state.command_input.value();
+    let ghost = palette_ghost_hint(buffer);
+    let mut spans = vec![
         Span::styled(":", Style::default().fg(theme.accent)),
-        Span::styled(state.command_input.value(), Style::default().fg(theme.fg)),
-        Span::styled("█", Style::default().fg(theme.accent)),
-    ]));
+        Span::styled(buffer, Style::default().fg(theme.fg)),
+    ];
+    if !ghost.is_empty() {
+        spans.push(Span::styled(ghost, Style::default().fg(theme.muted)));
+    }
+    let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
 
@@ -1760,6 +2381,107 @@ fn spawn_load_apim_operation_policy(
     });
 }
 
+fn spawn_load_appgw_backends(auth: AzureAuth, resource_id: String, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::appgw_backends::list_backend_pools(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::AppGatewayBackendsLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_storage_accounts(
+    auth: AzureAuth,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::storage::list_accounts(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageAccountsLoaded(result));
+    });
+}
+
+fn spawn_load_storage_containers(
+    auth: AzureAuth,
+    account: crate::azure::storage::StorageAccount,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let account_id = account.id.clone();
+        let result = crate::azure::storage::list_containers(&auth, &account)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageContainersLoaded { account_id, result });
+    });
+}
+
+/// Five concurrent Azure Monitor calls (account scope + blob / file / queue /
+/// table services) feeding the storage account overview panel. Cached behind
+/// `overview_pending` / `overview_stats` to avoid re-fetching on re-entry —
+/// these metrics update at most a few times per day server-side.
+fn spawn_load_storage_overview(
+    auth: AzureAuth,
+    account: crate::azure::storage::StorageAccount,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let account_id = account.id.clone();
+        let result = crate::azure::storage::fetch_account_overview_stats(&auth, &account)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageOverviewLoaded { account_id, result });
+    });
+}
+
+fn spawn_load_storage_blobs(
+    auth: AzureAuth,
+    account_name: String,
+    container: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
+        // Filtering is now client-side, so we always fetch the full container
+        // and pass `None` as the server-side prefix to `list_blobs`.
+        let result = crate::azure::storage::list_blobs(&auth, &account_name, &container, None)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageBlobsLoaded { key, result });
+    });
+}
+
+/// Hard cap on how many bytes [`spawn_load_storage_blob_preview`] asks the
+/// backend to fetch. Matches the documented "64 KB preview" contract.
+const STORAGE_PREVIEW_MAX_BYTES: u64 = 64 * 1024;
+
+fn spawn_load_storage_blob_preview(
+    auth: AzureAuth,
+    account_name: String,
+    container: String,
+    blob: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key =
+            crate::ui::state::StorageCache::blob_preview_key(&account_name, &container, &blob);
+        let result = crate::azure::storage::preview_blob(
+            &auth,
+            &account_name,
+            &container,
+            &blob,
+            STORAGE_PREVIEW_MAX_BYTES,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageBlobPreviewLoaded { key, result });
+    });
+}
+
 fn spawn_load_logs(
     auth: AzureAuth,
     resource: Resource,
@@ -1907,6 +2629,200 @@ mod tests {
     }
 
     #[test]
+    fn command_mode_storage_aliases_switch_view() {
+        for cmd in ["storage", "s"] {
+            let mut state = fresh_state();
+            state.view = View::List;
+            run_command(&mut state, cmd);
+            assert_eq!(
+                state.view,
+                View::StorageAccounts,
+                "{cmd} should open storage"
+            );
+            assert_eq!(state.view_stack, vec![View::List]);
+            assert!(state.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn command_mode_resources_aliases_switch_view() {
+        // `apis` is the canonical name; `a`, `resources`, and `r` are legacy
+        // aliases that still route to the same view.
+        for cmd in ["apis", "a", "resources", "r"] {
+            let mut state = fresh_state();
+            state.view = View::StorageAccounts;
+            run_command(&mut state, cmd);
+            assert_eq!(state.view, View::List, "{cmd} should land in apis list");
+            assert!(state.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn command_mode_subscriptions_aliases_switch_view() {
+        for cmd in ["subscriptions", "subs"] {
+            let mut state = fresh_state();
+            state.view = View::List;
+            run_command(&mut state, cmd);
+            assert_eq!(
+                state.view,
+                View::Subscriptions,
+                "{cmd} should open subscription picker"
+            );
+            assert!(state.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn command_mode_help_aliases_open_help() {
+        for cmd in ["help", "h", "?"] {
+            let mut state = fresh_state();
+            state.view = View::List;
+            run_command(&mut state, cmd);
+            assert_eq!(state.view, View::Help, "{cmd} should open help");
+            assert!(state.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn command_mode_help_does_not_stack_help_on_itself() {
+        // Regression guard: if the user is already on the Help view, `:h`
+        // must not push Help onto its own stack (which would break Esc).
+        let mut state = fresh_state();
+        state.view = View::Help;
+        run_command(&mut state, "help");
+        assert_eq!(state.view, View::Help);
+        assert!(state.view_stack.is_empty(), "no self-push allowed");
+    }
+
+    #[test]
+    fn palette_tab_completion_matches_prefix() {
+        // Empty prefix lists every registered name.
+        let all = palette_tab_candidates("");
+        assert!(all.contains(&"storage".to_string()));
+        assert!(all.contains(&"apis".to_string()));
+        // `resources` lingers as a legacy alias so muscle memory still works.
+        assert!(all.contains(&"resources".to_string()));
+        assert!(all.contains(&"subscriptions".to_string()));
+        assert!(all.contains(&"refresh".to_string()));
+        assert!(all.contains(&"quit".to_string()));
+
+        // `s` matches both `storage` and `subscriptions` (and `subs`).
+        let with_s = palette_tab_candidates("s");
+        assert!(with_s.iter().any(|c| c == "storage"));
+        assert!(with_s.iter().any(|c| c == "subscriptions"));
+        assert!(with_s.iter().any(|c| c == "subs"));
+
+        // `ap` narrows to `apis`.
+        let with_ap = palette_tab_candidates("ap");
+        assert!(with_ap.iter().any(|c| c == "apis"));
+        assert!(!with_ap.iter().any(|c| c == "storage"));
+
+        // `re` narrows to `resources` (legacy alias) / `refresh`.
+        let with_re = palette_tab_candidates("re");
+        assert!(with_re.iter().any(|c| c == "resources"));
+        assert!(with_re.iter().any(|c| c == "refresh"));
+        assert!(!with_re.iter().any(|c| c == "storage"));
+
+        // Nonsense prefix returns nothing.
+        assert!(palette_tab_candidates("zzz").is_empty());
+    }
+
+    #[test]
+    fn palette_ghost_hint_shows_remainder_of_first_candidate() {
+        // `st` → only `storage` matches, hint is the rest of the word.
+        assert_eq!(palette_ghost_hint("st"), "orage");
+        // `s` → first candidate (in registration order) is `storage`.
+        assert_eq!(palette_ghost_hint("s"), "torage");
+        // `re` → first candidate is `resources`.
+        assert_eq!(palette_ghost_hint("re"), "sources");
+        // Exact match: nothing left to suggest.
+        assert_eq!(palette_ghost_hint("storage"), "");
+        // No prefix match: no hint.
+        assert_eq!(palette_ghost_hint("zzz"), "");
+        // Empty buffer: no hint (don't show the first command as a phantom).
+        assert_eq!(palette_ghost_hint(""), "");
+        // Whitespace-only buffer is treated as empty.
+        assert_eq!(palette_ghost_hint("  "), "");
+    }
+
+    #[test]
+    fn palette_tab_cycle_forward_then_backward() {
+        let mut state = fresh_state();
+        state.command_active = true;
+        state.command_input = Input::default().with_value("s".to_string());
+
+        // First forward Tab: fills in the first match.
+        step_palette_tab_cycle(&mut state, true);
+        let first = state.command_input.value().to_string();
+        assert!(
+            first.starts_with('s'),
+            "first cycle pick should start with s, got {first}"
+        );
+
+        // Second forward Tab: rotates to the next candidate.
+        step_palette_tab_cycle(&mut state, true);
+        let second = state.command_input.value().to_string();
+        // Must still match the original prefix and (in this fixture) differ
+        // from the first pick because there are multiple `s` candidates.
+        assert!(second.starts_with('s'));
+        assert_ne!(first, second);
+
+        // Shift+Tab walks back to the first pick.
+        step_palette_tab_cycle(&mut state, false);
+        let back = state.command_input.value().to_string();
+        assert_eq!(back, first, "backward step should land on prior candidate");
+    }
+
+    #[test]
+    fn palette_tab_cycle_empty_buffer_lists_everything_starting_first() {
+        let mut state = fresh_state();
+        state.command_active = true;
+        // Empty buffer: every command name is a candidate.
+        step_palette_tab_cycle(&mut state, true);
+        let pick = state.command_input.value().to_string();
+        assert!(!pick.is_empty(), "should have inserted a candidate");
+        // First candidate per registration order is `storage`.
+        assert_eq!(pick, "storage");
+    }
+
+    #[test]
+    fn palette_tab_cycle_no_match_is_noop() {
+        let mut state = fresh_state();
+        state.command_active = true;
+        state.command_input = Input::default().with_value("zzz".to_string());
+        step_palette_tab_cycle(&mut state, true);
+        // Buffer is unchanged because there are no candidates.
+        assert_eq!(state.command_input.value(), "zzz");
+        assert!(state.command_tab_cycle.is_none());
+    }
+
+    #[test]
+    fn palette_refresh_command_is_recognized() {
+        // `:refresh` doesn't change the view by itself — the dispatcher
+        // routes it through `kick_off_loads_for_view`. We just verify here
+        // that `run_command` doesn't surface an "unknown command" status.
+        let mut state = fresh_state();
+        state.view = View::List;
+        run_command(&mut state, "refresh");
+        assert!(
+            state.status_message.is_none(),
+            "refresh should not be unknown"
+        );
+    }
+
+    #[test]
+    fn command_forwarding_excludes_tab_and_backtab() {
+        // Tab / Shift+Tab are reserved for completion and must not flow into
+        // the input widget. Esc and Enter were already covered upstream.
+        let mut state = fresh_state();
+        state.command_active = true;
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let backtab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert!(!should_forward_to_command(&state, tab));
+        assert!(!should_forward_to_command(&state, backtab));
+    }
+
+    #[test]
     fn command_mode_empty_is_silent() {
         let mut state = fresh_state();
         run_command(&mut state, "");
@@ -1940,10 +2856,9 @@ mod tests {
 
     #[test]
     fn back_navigation_unwinds_full_stack_without_bouncing() {
-        // Regression: previous_view was a single-slot stack of depth 1, so
-        // Subs -> List -> Detail -> Esc landed in List with previous_view set
-        // to Detail; the next Esc warped back into Detail. With view_stack
-        // (Vec<View>) the breadcrumb chain is preserved and Back unwinds it.
+        // Esc walks the semantic-parent tree (Detail → List → Subscriptions →
+        // quit modal) regardless of the history that led there. view_stack is
+        // no longer manipulated by Back — it's reserved for Help's modal pop.
         use crate::azure::resources::{Resource, ResourceKind};
         use crate::azure::subscriptions::Subscription;
 
@@ -1963,6 +2878,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub-1".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         };
         state.view = View::Subscriptions;
 
@@ -1986,14 +2903,14 @@ mod tests {
         assert_eq!(state.view, View::Detail);
         assert_eq!(state.view_stack, vec![View::Subscriptions, View::List]);
 
-        // Back from Detail: view-local handler must NOT consume it; global pops List.
+        // Back from Detail: view-local handler must NOT consume it; semantic
+        // parent of Detail is List.
         assert!(!crate::ui::views::detail::handle(Action::Back, &mut state));
         assert!(apply_navigation_action(Action::Back, &mut state));
         assert_eq!(state.view, View::List, "first Esc lands in List");
-        assert_eq!(state.view_stack, vec![View::Subscriptions]);
         assert!(!state.should_quit);
 
-        // Back from List: pops Subscriptions — must NOT bounce back into Detail.
+        // Back from List: semantic parent is Subscriptions — must NOT bounce back into Detail.
         assert!(!crate::ui::views::list::handle(Action::Back, &mut state));
         assert!(apply_navigation_action(Action::Back, &mut state));
         assert_eq!(
@@ -2001,7 +2918,6 @@ mod tests {
             View::Subscriptions,
             "second Esc lands in Subscriptions, never Detail"
         );
-        assert!(state.view_stack.is_empty());
         assert!(!state.should_quit);
 
         // Back from Subscriptions with empty stack: opens the quit-confirm
@@ -2028,18 +2944,22 @@ mod tests {
     }
 
     #[test]
-    fn back_with_nonempty_stack_does_not_open_modal() {
+    fn back_from_non_root_view_does_not_open_modal() {
+        // Back from any view with a semantic parent navigates there; the modal
+        // only opens at the root (Subscriptions). view_stack content is
+        // irrelevant to navigation now.
         let mut state = fresh_state();
-        // Start in List with Subscriptions on the stack (typical after Open).
         state.view = View::List;
-        state.view_stack.push(View::Subscriptions);
 
         assert!(apply_navigation_action(Action::Back, &mut state));
-        assert_eq!(state.view, View::Subscriptions, "Back popped the stack");
-        assert!(state.view_stack.is_empty());
+        assert_eq!(
+            state.view,
+            View::Subscriptions,
+            "Back from List walks to its semantic parent Subscriptions"
+        );
         assert!(
             !state.quit_confirm,
-            "popping a non-empty stack must not open the quit modal"
+            "navigating to a parent must not open the quit modal"
         );
         assert!(!state.should_quit);
     }
@@ -2076,6 +2996,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         };
         state.resources = vec![resource.clone()];
 
@@ -2145,6 +3067,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }];
         state.list_cursor = 0;
         state.view = View::Logs;
@@ -2172,6 +3096,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }];
         state.list_cursor = 0;
         state.view = View::Logs;
@@ -2211,6 +3137,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "sub".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }];
         state.list_cursor = 0;
         state.view = View::LogDetail;
@@ -2250,6 +3178,8 @@ mod tests {
             resource_group: "rg".into(),
             subscription_id: "X".into(),
             state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
         }];
         state.list_cursor = 0;
         state.view = View::LogDetail;

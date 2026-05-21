@@ -1,10 +1,9 @@
 # azpect
 
-A terminal UI for observing the health of Azure APIs at a glance.
+A terminal UI for inspecting the health of Azure APIs at a glance.
 Inspired by [k9s](https://github.com/derailed/k9s) and [flowrs](https://github.com/jvanbuel/flowrs), with vim-like keybindings.
 
 `azpect` lists Function Apps, API Management instances, Container Apps, and Application Gateways across every subscription you can access.
-For Function Apps and Container Apps it also tails the most recent logs (with an "errors only" filter) via Log Analytics.
 
 ## Install
 
@@ -26,8 +25,14 @@ Upgrade later with `brew upgrade azpect`.
 ## Configuration
 
 State (favorites, last subscription, theme, default time window) is
-stored under `${XDG_CONFIG_HOME:-~/.config}/azpect/config.toml`. The
-file is created on first run.
+stored under `${XDG_CONFIG_HOME:-~/.config}/azpect/config.toml`.
+The file is created on first run.
+
+## Authentication
+
+`azpect` uses the [azure_identity](https://docs.rs/azure_identity/latest/azure_identity/) crate's
+`DefaultAzureCredential`, which picks up your existing `az login` session.
+`az` must be on your `PATH`.
 
 ## License
 
