@@ -173,6 +173,27 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             }
             s
         }
+
+        View::Registries => vec![subscription_segment(state), "registries".to_string()],
+
+        View::RegistryRepositories => {
+            let mut s = vec![subscription_segment(state), "registries".to_string()];
+            if let Some(reg) = state.registry.selected_registry.as_ref() {
+                s.push(reg.name.clone());
+            }
+            s
+        }
+
+        View::RegistryTags => {
+            let mut s = vec![subscription_segment(state), "registries".to_string()];
+            if let Some(reg) = state.registry.selected_registry.as_ref() {
+                s.push(reg.name.clone());
+            }
+            if let Some(repo) = state.registry.selected_repository.as_deref() {
+                s.push(repo.to_string());
+            }
+            s
+        }
     }
 }
 

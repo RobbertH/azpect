@@ -122,6 +122,22 @@ pub enum AppEvent {
         key: String,
         result: Result<crate::azure::storage::BlobPreview, String>,
     },
+    /// Background load completion: list of container registries for the
+    /// current subscription scope.
+    RegistriesLoaded(Result<Vec<crate::azure::registries::Registry>, String>),
+    /// Background load completion: list of repositories inside one registry,
+    /// keyed by registry ARM id.
+    RegistryRepositoriesLoaded {
+        registry_id: String,
+        result: Result<Vec<crate::azure::registries::Repository>, String>,
+    },
+    /// Background load completion: list of tags for one repository, keyed by
+    /// the `(registry_id, repository)` pair flattened by
+    /// [`crate::ui::state::RegistryCache::tags_key`].
+    RegistryTagsLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::registries::Tag>, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →
@@ -156,6 +172,9 @@ pub enum Action {
     /// Open the top-level Storage mode (blob accounts list). Bound to `S`
     /// (capital so it doesn't collide with `s` = switch subscription).
     OpenStorage,
+    /// Open the top-level Container Registries mode. Bound to `R` (capital so
+    /// it doesn't collide with `r` = refresh).
+    OpenRegistries,
     Refresh,
     SetWindowHour,
     SetWindowDay,
@@ -267,6 +286,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('/') => Action::StartSearch,
         KeyCode::Char('s') => Action::SwitchSubscription,
         KeyCode::Char('S') => Action::OpenStorage,
+        KeyCode::Char('R') => Action::OpenRegistries,
         KeyCode::Char('r') => Action::Refresh,
         // Digit-keyed time-range shortcuts, grouped numerically:
         // `0` → 1h (less than a day), `1` → 1d, `7` → 7d (a week).

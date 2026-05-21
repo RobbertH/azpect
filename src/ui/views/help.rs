@@ -91,6 +91,17 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Container registries (ACR)",
+        &[
+            ("R", "enter registries mode"),
+            ("Enter", "drill: registries > repositories > tags"),
+            ("/", "filter registries / repos / tags by name (substring)"),
+            ("y", "yank registry id / repo name / pull ref"),
+            ("o", "open registry in Azure Portal"),
+            ("r", "refresh current panel"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -106,6 +117,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (":", "open command palette"),
             ("Tab / S-Tab", "cycle prefix matches"),
             (":storage / :s", "enter storage mode"),
+            (":registries / :reg", "enter registries mode"),
             (":apis / :a", "back to apis list"),
             (":subscriptions / :subs", "subscription picker"),
             (":help / :h / :?", "open help"),

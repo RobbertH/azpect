@@ -13,6 +13,145 @@ use crate::azure::resources::Resource;
 use crate::azure::subscriptions::Subscription;
 use crate::config::Config;
 
+/// One of the top-level resource categories the app surfaces. Adding a new
+/// resource type means: define a new `Category` variant, list its views via
+/// [`Category::contains`], slot it into [`Category::ALL`], and implement
+/// [`Category::clear_cache`] / [`Category::reset_root_cursor`] /
+/// [`Category::palette_aliases`]. Every other piece of cross-cutting wiring
+/// (subscription-switch cache flush, palette routing, `OpenX` action handlers,
+/// `last_category` tracking) flows through this enum rather than living as
+/// scattered `match state.view` arms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Category {
+    /// Function Apps / APIM / Container Apps / Application Gateways list.
+    Apis,
+    /// Blob storage accounts and the container / blob / blob-preview chain.
+    Storage,
+    /// Azure Container Registries and the repository / tag chain.
+    Registries,
+}
+
+impl Category {
+    /// Every category, in stable order. Iterate this to register palette
+    /// commands, flush every category's cache on subscription switch, or list
+    /// the categories in help output.
+    pub const ALL: &'static [Category] = &[Category::Apis, Category::Storage, Category::Registries];
+
+    /// The top-level list view for this category — the screen the user lands
+    /// on after picking a subscription, after pressing the category keybind
+    /// (`S` / `R`), or after running the palette command.
+    pub fn root_view(self) -> View {
+        match self {
+            Category::Apis => View::List,
+            Category::Storage => View::StorageAccounts,
+            Category::Registries => View::Registries,
+        }
+    }
+
+    /// Does `view` live inside this category's drill chain? Used by
+    /// idempotency checks ("don't push the root onto the stack if I'm already
+    /// inside the chain") and by [`Category::of`].
+    pub fn contains(self, view: View) -> bool {
+        matches!(
+            (self, view),
+            (
+                Category::Apis,
+                View::List
+                    | View::Detail
+                    | View::Logs
+                    | View::LogDetail
+                    | View::ApimApis
+                    | View::ApimOperations
+                    | View::ApimPolicy
+                    | View::AppGatewayBackends,
+            ) | (
+                Category::Storage,
+                View::StorageAccounts
+                    | View::StorageAccountOverview
+                    | View::StorageContainers
+                    | View::StorageBlobs
+                    | View::StorageBlobDetail,
+            ) | (
+                Category::Registries,
+                View::Registries | View::RegistryRepositories | View::RegistryTags,
+            )
+        )
+    }
+
+    /// Which category does `view` belong to, if any? Returns `None` for
+    /// non-category views (`Subscriptions`, `Help`) since they're modal-ish
+    /// entry points outside any drill chain.
+    pub fn of(view: View) -> Option<Category> {
+        Self::ALL.iter().copied().find(|c| c.contains(view))
+    }
+
+    /// Reset this category's subscription-scoped cache so the next
+    /// `kick_off_loads_for_view` re-fetches against the freshly-pinned
+    /// subscription. Called once per category on subscription switch.
+    ///
+    /// Note: per-resource-id caches that hang off the Apis category (metrics,
+    /// logs, health, container_app_limits, apim) are intentionally *not*
+    /// cleared here. Their keys are resource ids (subscription-scoped on the
+    /// Azure side); they go dormant once `resources` is cleared and are
+    /// effectively dead memory until the user re-pins a sub that re-exposes
+    /// the same id. Leaving them alone matches the pre-refactor behavior.
+    pub fn clear_cache(self, state: &mut AppState) {
+        match self {
+            Category::Apis => {
+                state.resources.clear();
+                state.appgw = AppGatewayBackendsCache::default();
+            }
+            Category::Storage => {
+                state.storage = StorageCache::default();
+            }
+            Category::Registries => {
+                state.registry = RegistryCache::default();
+            }
+        }
+    }
+
+    /// Reset the cursor on this category's root view. Called by
+    /// [`enter_category`] so re-entering a category from elsewhere lands the
+    /// cursor at the top instead of stale positions from a prior session.
+    pub fn reset_root_cursor(self, state: &mut AppState) {
+        match self {
+            Category::Apis => state.list_cursor = 0,
+            Category::Storage => state.storage.accounts_cursor = 0,
+            Category::Registries => state.registry.registries_cursor = 0,
+        }
+    }
+
+    /// Palette command names (canonical + aliases) that route into this
+    /// category. The list is flat — `palette_completion_candidates` uses it
+    /// directly, and `run_command` linear-scans it. Keep the canonical (full)
+    /// name first so it sorts to the top of Tab completion.
+    pub fn palette_aliases(self) -> &'static [&'static str] {
+        match self {
+            Category::Apis => &["apis", "a", "resources", "r"],
+            Category::Storage => &["storage", "s"],
+            Category::Registries => &["registries", "reg", "acr"],
+        }
+    }
+}
+
+/// Mark `category` as the user's active top-level section, route them to its
+/// root view (if not already inside the chain), reset the root cursor, and
+/// push the previous view onto the back-nav stack. Idempotent inside the
+/// chain so repeated presses don't grow the stack or disrupt drill-in state.
+///
+/// Single source of truth for "enter a resource category": called from the
+/// `OpenStorage` / `OpenRegistries` actions and from every category palette
+/// command. New resource types added via [`Category`] flow through here
+/// automatically.
+pub fn enter_category(state: &mut AppState, category: Category) {
+    if !category.contains(state.view) {
+        state.view_stack.push(state.view);
+        state.view = category.root_view();
+        category.reset_root_cursor(state);
+    }
+    state.last_category = category;
+}
+
 /// Which screen we are currently rendering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum View {
@@ -52,6 +191,18 @@ pub enum View {
     /// Metadata + bounded body preview for the selected blob. Opened with Enter
     /// from `StorageBlobs`.
     StorageBlobDetail,
+    /// Top-level "Container registries" mode entry point — lists ACR registries
+    /// across the selected subscriptions. Opened with `R` from any non-modal
+    /// view.
+    Registries,
+    /// List of repositories (Docker image names) inside the pinned registry.
+    /// Opened with Enter from `Registries`. Data-plane call — requires the
+    /// signed-in identity to have `AcrPull` on the registry.
+    RegistryRepositories,
+    /// List of tags for the pinned repository inside the pinned registry.
+    /// Opened with Enter from `RegistryRepositories`. Same data-plane
+    /// permission requirement as the repositories list.
+    RegistryTags,
     /// Application-Gateway-only: backend pools (and their members) for the
     /// selected gateway. Opened with Enter from `List` when the resource is
     /// `ResourceKind::AppGateway`.
@@ -322,6 +473,101 @@ impl StorageCache {
     }
 }
 
+/// State for the Container Registries drill-in views. Mirrors `StorageCache`
+/// (minus the per-account-overview metrics layer, which ACR doesn't have):
+/// each level of the chain (registries → repositories → tags) has its own
+/// in-memory cache, pending set, error map, cursor, and a client-side filter.
+#[derive(Clone, Default)]
+pub struct RegistryCache {
+    /// All registries discovered for the current subscription scope. Wrapped
+    /// in `Option` so the view can distinguish "never fetched" from
+    /// "fetched and empty".
+    pub registries: Option<Vec<crate::azure::registries::Registry>>,
+    pub registries_pending: bool,
+    pub registries_error: Option<String>,
+    pub registries_cursor: usize,
+    /// Client-side case-insensitive substring filter applied to the registries
+    /// list by name. Mirrors the storage filter inputs.
+    pub registries_filter: Input,
+    pub registries_filter_active: bool,
+    /// Pinned registry the user drilled into.
+    pub selected_registry: Option<crate::azure::registries::Registry>,
+
+    /// Keyed by registry resource id.
+    pub repositories: HashMap<String, Vec<crate::azure::registries::Repository>>,
+    pub repositories_pending: HashSet<String>,
+    pub repositories_error: HashMap<String, String>,
+    pub repositories_cursor: usize,
+    pub repositories_filter: Input,
+    pub repositories_filter_active: bool,
+    /// Pinned repository name the user drilled into.
+    pub selected_repository: Option<String>,
+
+    /// Keyed by `"{registry_id}/{repository_name}"`.
+    pub tags: HashMap<String, Vec<crate::azure::registries::Tag>>,
+    pub tags_pending: HashSet<String>,
+    pub tags_error: HashMap<String, String>,
+    pub tags_cursor: usize,
+    pub tags_filter: Input,
+    pub tags_filter_active: bool,
+}
+
+impl RegistryCache {
+    /// Cache key for the tags map.
+    pub fn tags_key(registry_id: &str, repository: &str) -> String {
+        format!("{registry_id}/{repository}")
+    }
+
+    /// Apply `registries_filter` to `registries` as a case-insensitive
+    /// substring match on the registry name. Returns an empty vector when
+    /// registries haven't been fetched yet. An empty filter passes everything
+    /// through.
+    pub fn filtered_registries(&self) -> Vec<&crate::azure::registries::Registry> {
+        let needle = self.registries_filter.value().to_lowercase();
+        match self.registries.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|r| needle.is_empty() || r.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `repositories_filter` to the repositories under `registry_id` as
+    /// a case-insensitive substring match on the repository name.
+    pub fn filtered_repositories(
+        &self,
+        registry_id: &str,
+    ) -> Vec<&crate::azure::registries::Repository> {
+        let needle = self.repositories_filter.value().to_lowercase();
+        match self.repositories.get(registry_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|r| needle.is_empty() || r.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `tags_filter` to the tags under `(registry_id, repository)` as a
+    /// case-insensitive substring match on the tag name.
+    pub fn filtered_tags(
+        &self,
+        registry_id: &str,
+        repository: &str,
+    ) -> Vec<&crate::azure::registries::Tag> {
+        let needle = self.tags_filter.value().to_lowercase();
+        let key = Self::tags_key(registry_id, repository);
+        match self.tags.get(&key) {
+            Some(rows) => rows
+                .iter()
+                .filter(|t| needle.is_empty() || t.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -376,6 +622,11 @@ pub struct AppState {
     /// transition (e.g. Subs -> List -> Detail -> Logs); `Action::Back` pops.
     /// Empty stack + Back triggers a quit.
     pub view_stack: Vec<View>,
+    /// Which top-level resource category the user was most recently inside.
+    /// Sticky across the subscription picker, so switching subscriptions
+    /// returns the user to the same category list (under the new scope)
+    /// instead of always landing them on apis. Updated by [`enter_category`].
+    pub last_category: Category,
 
     pub subscriptions: Vec<Subscription>,
     pub selected_subscription: Option<String>,
@@ -397,6 +648,7 @@ pub struct AppState {
     pub apim: ApimCache,
     pub appgw: AppGatewayBackendsCache,
     pub storage: StorageCache,
+    pub registry: RegistryCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -453,6 +705,7 @@ impl AppState {
         Self {
             view: View::Subscriptions,
             view_stack: Vec::new(),
+            last_category: Category::Apis,
             subscriptions: Vec::new(),
             selected_subscription: config.last_subscription_id.clone(),
             subscription_cursor: 0,
@@ -477,6 +730,7 @@ impl AppState {
             apim: ApimCache::default(),
             appgw: AppGatewayBackendsCache::default(),
             storage: StorageCache::default(),
+            registry: RegistryCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -560,7 +814,8 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_subsequence;
+    use super::*;
+    use crate::config::Config;
 
     #[test]
     fn subsequence_basic_matches() {
@@ -579,5 +834,150 @@ mod tests {
     fn subsequence_exact_substring_still_matches() {
         assert!(is_subsequence("file", "filemonitor"));
         assert!(is_subsequence("monitor", "filemonitor"));
+    }
+
+    #[test]
+    fn category_of_classifies_every_resource_view() {
+        // Every view that lives inside a category's drill chain must resolve
+        // to that category. Acts as a structural lock: adding a new view
+        // variant without claiming it via a Category::contains arm will trip
+        // this test (the new view will resolve to `None`).
+        assert_eq!(Category::of(View::List), Some(Category::Apis));
+        assert_eq!(Category::of(View::Detail), Some(Category::Apis));
+        assert_eq!(Category::of(View::Logs), Some(Category::Apis));
+        assert_eq!(Category::of(View::LogDetail), Some(Category::Apis));
+        assert_eq!(Category::of(View::ApimApis), Some(Category::Apis));
+        assert_eq!(Category::of(View::ApimOperations), Some(Category::Apis));
+        assert_eq!(Category::of(View::ApimPolicy), Some(Category::Apis));
+        assert_eq!(Category::of(View::AppGatewayBackends), Some(Category::Apis));
+        assert_eq!(Category::of(View::StorageAccounts), Some(Category::Storage));
+        assert_eq!(
+            Category::of(View::StorageAccountOverview),
+            Some(Category::Storage)
+        );
+        assert_eq!(
+            Category::of(View::StorageContainers),
+            Some(Category::Storage)
+        );
+        assert_eq!(Category::of(View::StorageBlobs), Some(Category::Storage));
+        assert_eq!(
+            Category::of(View::StorageBlobDetail),
+            Some(Category::Storage)
+        );
+        assert_eq!(Category::of(View::Registries), Some(Category::Registries));
+        assert_eq!(
+            Category::of(View::RegistryRepositories),
+            Some(Category::Registries)
+        );
+        assert_eq!(Category::of(View::RegistryTags), Some(Category::Registries));
+        // Subscriptions and Help are modal entry points — outside any chain.
+        assert_eq!(Category::of(View::Subscriptions), None);
+        assert_eq!(Category::of(View::Help), None);
+    }
+
+    #[test]
+    fn category_root_view_round_trips() {
+        // Every category's `root_view` must itself belong to that category.
+        // A typo (e.g. `Category::Storage::root_view() = View::Registries`)
+        // would be a navigation bomb — this guarantees the invariant.
+        for category in Category::ALL {
+            assert_eq!(
+                Category::of(category.root_view()),
+                Some(*category),
+                "{category:?}.root_view() must belong to {category:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn enter_category_from_outside_chain_pushes_stack_and_resets_cursor() {
+        let mut state = AppState::new(Config::default());
+        state.view = View::Subscriptions;
+        // Pretend an old cursor was lingering from a previous session.
+        state.storage.accounts_cursor = 7;
+        enter_category(&mut state, Category::Storage);
+        assert_eq!(state.view, View::StorageAccounts);
+        assert_eq!(state.last_category, Category::Storage);
+        assert_eq!(state.view_stack.last(), Some(&View::Subscriptions));
+        assert_eq!(
+            state.storage.accounts_cursor, 0,
+            "root cursor should reset on enter",
+        );
+    }
+
+    #[test]
+    fn enter_category_from_within_chain_is_idempotent() {
+        // User is already deep in the storage chain. Pressing `S` (or
+        // running `:storage`) again must NOT push the stack or move the view
+        // — they're already where they wanted to be. Only `last_category`
+        // gets re-asserted.
+        let mut state = AppState::new(Config::default());
+        state.view = View::StorageBlobs;
+        state.storage.accounts_cursor = 4; // user's place — leave alone
+        let stack_before = state.view_stack.clone();
+        enter_category(&mut state, Category::Storage);
+        assert_eq!(state.view, View::StorageBlobs, "view must not move");
+        assert_eq!(state.view_stack, stack_before, "stack must not grow");
+        assert_eq!(state.storage.accounts_cursor, 4, "cursor must not reset");
+        assert_eq!(state.last_category, Category::Storage);
+    }
+
+    #[test]
+    fn category_clear_cache_wipes_only_its_own_caches() {
+        // Each category's clear_cache should reset *its* state without
+        // touching the others. Catches the kind of cross-contamination bug
+        // where Storage::clear accidentally wiped registries.
+        let mut state = AppState::new(Config::default());
+        state.resources.push(crate::azure::resources::Resource {
+            id: "r1".into(),
+            name: "n".into(),
+            kind: crate::azure::resources::ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: None,
+            created_at: None,
+            modified_at: None,
+        });
+        state.storage.accounts = Some(Vec::new());
+        state.registry.registries = Some(Vec::new());
+
+        Category::Storage.clear_cache(&mut state);
+        assert!(state.storage.accounts.is_none(), "storage cleared");
+        assert!(
+            !state.resources.is_empty(),
+            "apis untouched by storage clear"
+        );
+        assert!(
+            state.registry.registries.is_some(),
+            "registries untouched by storage clear"
+        );
+
+        Category::Registries.clear_cache(&mut state);
+        assert!(state.registry.registries.is_none(), "registries cleared");
+        assert!(
+            !state.resources.is_empty(),
+            "apis untouched by registries clear"
+        );
+
+        Category::Apis.clear_cache(&mut state);
+        assert!(state.resources.is_empty(), "apis cleared");
+    }
+
+    #[test]
+    fn category_palette_aliases_are_disjoint() {
+        // Aliases must not collide across categories — otherwise `:s` could
+        // route to two different categories depending on whichever
+        // `Category::ALL` lookup arrived first. This locks the invariant.
+        use std::collections::HashSet;
+        let mut seen: HashSet<&str> = HashSet::new();
+        for category in Category::ALL {
+            for alias in category.palette_aliases() {
+                assert!(
+                    seen.insert(*alias),
+                    "alias `{alias}` is claimed by more than one category",
+                );
+            }
+        }
     }
 }

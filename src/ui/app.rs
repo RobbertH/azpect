@@ -356,6 +356,27 @@ async fn event_loop(
                     state.storage.accounts_cursor = 0;
                     continue;
                 }
+                if should_forward_to_registries_filter(state, key) {
+                    state
+                        .registry
+                        .registries_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.registry.registries_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_repositories_filter(state, key) {
+                    state
+                        .registry
+                        .repositories_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.registry.repositories_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_tags_filter(state, key) {
+                    state.registry.tags_filter.handle_event(&CtEvent::Key(key));
+                    state.registry.tags_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -635,6 +656,51 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::RegistriesLoaded(res) => {
+                state.registry.registries_pending = false;
+                match res {
+                    Ok(rows) => {
+                        state.registry.registries_error = None;
+                        if !rows.is_empty() && state.registry.registries_cursor >= rows.len() {
+                            state.registry.registries_cursor = rows.len() - 1;
+                        }
+                        state.registry.registries = Some(rows);
+                    }
+                    Err(e) => {
+                        state.registry.registries = None;
+                        state.registry.registries_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::RegistryRepositoriesLoaded {
+                registry_id,
+                result,
+            } => {
+                state.registry.repositories_pending.remove(&registry_id);
+                match result {
+                    Ok(rows) => {
+                        state.registry.repositories_error.remove(&registry_id);
+                        state.registry.repositories.insert(registry_id, rows);
+                    }
+                    Err(e) => {
+                        state.registry.repositories.remove(&registry_id);
+                        state.registry.repositories_error.insert(registry_id, e);
+                    }
+                }
+            }
+            AppEvent::RegistryTagsLoaded { key, result } => {
+                state.registry.tags_pending.remove(&key);
+                match result {
+                    Ok(rows) => {
+                        state.registry.tags_error.remove(&key);
+                        state.registry.tags.insert(key, rows);
+                    }
+                    Err(e) => {
+                        state.registry.tags.remove(&key);
+                        state.registry.tags_error.insert(key, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -817,25 +883,77 @@ fn should_forward_to_accounts_filter(state: &AppState, key: crossterm::event::Ke
         )
 }
 
-/// Registered palette commands: `(canonical, aliases, description)`. Each
-/// entry produces one canonical name plus zero or more aliases that resolve
-/// to the same action in [`run_command`]. The list also feeds Tab-completion
-/// — every name (canonical + aliases) is a candidate for prefix-matching.
-const PALETTE_COMMANDS: &[(&str, &[&str])] = &[
-    ("storage", &["s"]),
-    ("apis", &["a", "resources", "r"]),
+/// Mirror of `should_forward_to_filter` for the registries-list filter.
+fn should_forward_to_registries_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::Registries
+        && state.registry.registries_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the registry-repositories filter.
+fn should_forward_to_repositories_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::RegistryRepositories
+        && state.registry.repositories_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the registry-tags filter.
+fn should_forward_to_tags_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::RegistryTags
+        && state.registry.tags_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Palette commands that aren't tied to a [`Category`]. Subscriptions / help
+/// / quit / refresh are global so they sit here as a small static table;
+/// every other command flows through [`Category::palette_aliases`].
+const PALETTE_FIXED_COMMANDS: &[(&str, &[&str])] = &[
     ("subscriptions", &["subs"]),
     ("help", &["h", "?"]),
     ("quit", &["q"]),
     ("refresh", &[]),
 ];
 
-/// Flattened list of every palette name (canonical + aliases) plus the legacy
-/// vim-style quit aliases. Returned in deterministic order so Tab-completion
-/// cycles predictably.
+/// Flattened list of every palette name (category aliases + fixed commands +
+/// the legacy vim-style quit aliases). Returned in deterministic order so
+/// Tab-completion cycles predictably: categories first (in
+/// [`crate::ui::state::Category::ALL`] order), then fixed commands, then the
+/// legacy quit aliases.
 fn palette_completion_candidates() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (canonical, aliases) in PALETTE_COMMANDS {
+    for category in crate::ui::state::Category::ALL {
+        for alias in category.palette_aliases() {
+            out.push((*alias).to_string());
+        }
+    }
+    for (canonical, aliases) in PALETTE_FIXED_COMMANDS {
         out.push((*canonical).to_string());
         for a in *aliases {
             out.push((*a).to_string());
@@ -853,36 +971,32 @@ fn palette_completion_candidates() -> Vec<String> {
 /// status message instead of crashing; empty input is silently ignored.
 fn run_command(state: &mut AppState, cmd: &str) {
     let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // `:q` and friends quit immediately and intentionally bypass the
+    // quit-confirmation modal: typing `:q` is explicit user intent, not an
+    // accidental Esc press.
+    if matches!(trimmed, "q" | "quit" | "qa" | "qa!" | "quitall") {
+        state.should_quit = true;
+        return;
+    }
+
+    // Category routing: every `:storage` / `:s` / `:registries` / `:reg` /
+    // `:acr` / `:apis` / `:a` / `:resources` / `:r` flows through the same
+    // `enter_category` helper as the keybinds. Adding a new resource type
+    // means adding a `Category` variant — this loop picks it up for free.
+    if let Some(category) = crate::ui::state::Category::ALL
+        .iter()
+        .copied()
+        .find(|c| c.palette_aliases().contains(&trimmed))
+    {
+        crate::ui::state::enter_category(state, category);
+        return;
+    }
+
     match trimmed {
-        "" => {} // empty: silently ignore
-        // `:q` and friends quit immediately and intentionally bypass the
-        // quit-confirmation modal: typing `:q` is explicit user intent, not
-        // an accidental Esc press.
-        "q" | "quit" | "qa" | "qa!" | "quitall" => state.should_quit = true,
-        // Top-level Storage mode. Mirrors the `S` key path: push the current
-        // view onto the stack so Esc walks back; reset the cursor; load on
-        // arrival is handled by the after-action side-effect chain — for
-        // palette commands we trigger that via `apply_palette_command`.
-        "storage" | "s" => {
-            if !matches!(
-                state.view,
-                View::StorageAccounts
-                    | View::StorageAccountOverview
-                    | View::StorageContainers
-                    | View::StorageBlobs
-                    | View::StorageBlobDetail
-            ) {
-                state.view_stack.push(state.view);
-                state.view = View::StorageAccounts;
-                state.storage.accounts_cursor = 0;
-            }
-        }
-        "apis" | "a" | "resources" | "r" => {
-            if state.view != View::List {
-                state.view_stack.push(state.view);
-                state.view = View::List;
-            }
-        }
         "subscriptions" | "subs" => {
             if state.view != View::Subscriptions {
                 state.view_stack.push(state.view);
@@ -995,7 +1109,10 @@ fn decide_action(
         || state.logs.search_active
         || (state.view == View::StorageBlobs && state.storage.blobs_filter_active)
         || (state.view == View::StorageContainers && state.storage.containers_filter_active)
-        || (state.view == View::StorageAccounts && state.storage.accounts_filter_active);
+        || (state.view == View::StorageAccounts && state.storage.accounts_filter_active)
+        || (state.view == View::Registries && state.registry.registries_filter_active)
+        || (state.view == View::RegistryRepositories && state.registry.repositories_filter_active)
+        || (state.view == View::RegistryTags && state.registry.tags_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1044,6 +1161,11 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::StorageContainers => crate::ui::views::storage_containers::handle(action, state),
         View::StorageBlobs => crate::ui::views::storage_blobs::handle(action, state),
         View::StorageBlobDetail => crate::ui::views::storage_blob_detail::handle(action, state),
+        View::Registries => crate::ui::views::registries::handle(action, state),
+        View::RegistryRepositories => {
+            crate::ui::views::registry_repositories::handle(action, state)
+        }
+        View::RegistryTags => crate::ui::views::registry_tags::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -1163,6 +1285,21 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_account
             .as_ref()
             .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+        // Registry views land on the registry's **repository** blade — the
+        // overview page is just a metadata panel, whereas the repository
+        // blade is where users actually browse images and is what the
+        // in-app drill-in shows. Matches the pattern we use for APIM (open
+        // on the APIs blade, not the service overview).
+        View::Registries => state
+            .registry
+            .filtered_registries()
+            .get(state.registry.registries_cursor)
+            .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
+        View::RegistryRepositories | View::RegistryTags => state
+            .registry
+            .selected_registry
+            .as_ref()
+            .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
         View::Help => None,
     }
 }
@@ -1227,6 +1364,28 @@ fn yank_target(state: &AppState) -> Option<String> {
                 Some(format!("{}/{}/{}", acc.name, cont, blob))
             })
         }
+        View::Registries => state
+            .registry
+            .filtered_registries()
+            .get(state.registry.registries_cursor)
+            .map(|r| r.id.clone()),
+        View::RegistryRepositories => {
+            let registry = state.registry.selected_registry.as_ref()?;
+            state
+                .registry
+                .filtered_repositories(&registry.id)
+                .get(state.registry.repositories_cursor)
+                .map(|r| format!("{}/{}", registry.login_server_or_default(), r.name))
+        }
+        View::RegistryTags => crate::ui::views::registry_tags::yank_text(state).or_else(|| {
+            let registry = state.registry.selected_registry.as_ref()?;
+            let repository = state.registry.selected_repository.as_deref()?;
+            Some(format!(
+                "{}/{}",
+                registry.login_server_or_default(),
+                repository
+            ))
+        }),
         View::Help => None,
     }
 }
@@ -1300,22 +1459,11 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::OpenStorage => {
-            // Capital `S` from any non-storage view enters top-level Storage
-            // mode. Pushing the current view onto the stack lets Esc walk
-            // back the way the user came. Idempotent within the storage
-            // chain so repeated presses don't grow the stack.
-            if !matches!(
-                state.view,
-                View::StorageAccounts
-                    | View::StorageAccountOverview
-                    | View::StorageContainers
-                    | View::StorageBlobs
-                    | View::StorageBlobDetail
-            ) {
-                state.view_stack.push(state.view);
-                state.view = View::StorageAccounts;
-                state.storage.accounts_cursor = 0;
-            }
+            crate::ui::state::enter_category(state, crate::ui::state::Category::Storage);
+            true
+        }
+        Action::OpenRegistries => {
+            crate::ui::state::enter_category(state, crate::ui::state::Category::Registries);
             true
         }
         _ => false,
@@ -1346,6 +1494,9 @@ fn semantic_parent(view: View) -> Option<View> {
         View::StorageContainers => Some(View::StorageAccountOverview),
         View::StorageBlobs => Some(View::StorageContainers),
         View::StorageBlobDetail => Some(View::StorageBlobs),
+        View::Registries => Some(View::Subscriptions),
+        View::RegistryRepositories => Some(View::Registries),
+        View::RegistryTags => Some(View::RegistryRepositories),
     }
 }
 
@@ -1363,6 +1514,7 @@ fn after_action(
         Action::OpenSelected
         | Action::OpenLogs
         | Action::OpenStorage
+        | Action::OpenRegistries
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
@@ -1606,6 +1758,57 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::Registries => {
+            let cached = state.registry.registries.is_some();
+            let in_flight = state.registry.registries_pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.registry.registries = None;
+                    state.registry.registries_error = None;
+                }
+                state.registry.registries_pending = true;
+                spawn_load_registries(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::RegistryRepositories => {
+            if let Some(registry) = state.registry.selected_registry.clone() {
+                let cached = state.registry.repositories.contains_key(&registry.id);
+                let in_flight = state.registry.repositories_pending.contains(&registry.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.registry.repositories.remove(&registry.id);
+                        state.registry.repositories_error.remove(&registry.id);
+                    }
+                    state
+                        .registry
+                        .repositories_pending
+                        .insert(registry.id.clone());
+                    spawn_load_repositories(auth.clone(), registry, tx.clone());
+                }
+            }
+        }
+        View::RegistryTags => {
+            if let (Some(registry), Some(repository)) = (
+                state.registry.selected_registry.clone(),
+                state.registry.selected_repository.clone(),
+            ) {
+                let key = crate::ui::state::RegistryCache::tags_key(&registry.id, &repository);
+                let cached = state.registry.tags.contains_key(&key);
+                let in_flight = state.registry.tags_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.registry.tags.remove(&key);
+                        state.registry.tags_error.remove(&key);
+                    }
+                    state.registry.tags_pending.insert(key);
+                    spawn_load_tags(auth.clone(), registry, repository, tx.clone());
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -1712,6 +1915,11 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::StorageBlobDetail => {
             crate::ui::views::storage_blob_detail::render(f, view_area, state, theme)
         }
+        View::Registries => crate::ui::views::registries::render(f, view_area, state, theme),
+        View::RegistryRepositories => {
+            crate::ui::views::registry_repositories::render(f, view_area, state, theme)
+        }
+        View::RegistryTags => crate::ui::views::registry_tags::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -2482,6 +2690,47 @@ fn spawn_load_storage_blob_preview(
     });
 }
 
+fn spawn_load_registries(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::registries::list_registries(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistriesLoaded(result));
+    });
+}
+
+fn spawn_load_repositories(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let registry_id = registry.id.clone();
+        let result = crate::azure::registries::list_repositories(&auth, &registry)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryRepositoriesLoaded {
+            registry_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_tags(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    repository: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::RegistryCache::tags_key(&registry.id, &repository);
+        let result = crate::azure::registries::list_tags(&auth, &registry, &repository)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryTagsLoaded { key, result });
+    });
+}
+
 fn spawn_load_logs(
     auth: AzureAuth,
     resource: Resource,
@@ -2731,9 +2980,12 @@ mod tests {
     fn palette_ghost_hint_shows_remainder_of_first_candidate() {
         // `st` → only `storage` matches, hint is the rest of the word.
         assert_eq!(palette_ghost_hint("st"), "orage");
-        // `s` → first candidate (in registration order) is `storage`.
+        // `s` → first `s*` candidate is `storage` (Storage's canonical alias
+        // sorts before its `s` shortcut; both come after the `Apis` category
+        // in `Category::ALL`).
         assert_eq!(palette_ghost_hint("s"), "torage");
-        // `re` → first candidate is `resources`.
+        // `re` → first match is `resources` (alias of Apis, which comes
+        // first in `Category::ALL`); `registries` is also reachable via Tab.
         assert_eq!(palette_ghost_hint("re"), "sources");
         // Exact match: nothing left to suggest.
         assert_eq!(palette_ghost_hint("storage"), "");
@@ -2781,8 +3033,9 @@ mod tests {
         step_palette_tab_cycle(&mut state, true);
         let pick = state.command_input.value().to_string();
         assert!(!pick.is_empty(), "should have inserted a candidate");
-        // First candidate per registration order is `storage`.
-        assert_eq!(pick, "storage");
+        // First candidate is `apis` — the canonical alias of the first
+        // category in `Category::ALL`.
+        assert_eq!(pick, "apis");
     }
 
     #[test]

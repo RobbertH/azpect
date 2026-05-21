@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str = "j/k move  Enter open  y yank id  o portal  r refresh  ? help  q quit";
@@ -159,11 +159,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.selected_subscription = Some(sub.id.clone());
                 state.config.last_subscription_id = Some(sub.id.clone());
                 state.view_stack.push(state.view);
-                state.view = View::List;
+                // Every subscription-scoped cache is stale for the new scope.
+                // Loop over `Category::ALL` so adding a new resource type
+                // (a new `Category` variant) automatically gets its cache
+                // flushed here — no risk of a future ACR-style "stale data
+                // sticks around" bug.
+                for category in crate::ui::state::Category::ALL {
+                    category.clear_cache(state);
+                }
+                // Land back on whichever category the user was most recently
+                // inside, so switching subscriptions feels like "re-scope what
+                // I'm looking at" rather than "throw me back to apis".
+                // Defaults to `Category::Apis` on first launch.
+                state.view = state.last_category.root_view();
                 state.list_cursor = 0;
-                state.resources.clear();
-                state.storage = crate::ui::state::StorageCache::default();
-                state.appgw = crate::ui::state::AppGatewayBackendsCache::default();
             }
             true
         }
@@ -189,6 +198,7 @@ mod tests {
     use super::*;
     use crate::azure::subscriptions::Subscription;
     use crate::config::Config;
+    use crate::ui::state::View;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -253,6 +263,73 @@ mod tests {
             "picking a sub should update the persisted last_subscription_id",
         );
         assert!(state.resources.is_empty());
+    }
+
+    #[test]
+    fn open_selected_lands_on_remembered_top_level_view() {
+        use crate::ui::state::Category;
+        // User was last viewing Registries; switching subscription should
+        // route them back to Registries (under the new scope) instead of
+        // dumping them into the apis list.
+        let mut state = fixture();
+        state.last_category = Category::Registries;
+        state.subscription_cursor = 1;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::Registries);
+
+        // Same shape for storage.
+        let mut state = fixture();
+        state.last_category = Category::Storage;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::StorageAccounts);
+    }
+
+    #[test]
+    fn open_selected_flushes_every_subscription_scoped_cache() {
+        // Picking a sub must wipe ALL three category caches — leaving stale
+        // entries from the previous scope is the bug the user reported for
+        // ACR (and the same bug applied to storage/appgw before).
+        use crate::azure::registries::Registry;
+        use crate::azure::storage::StorageAccount;
+
+        let mut state = fixture();
+        state.registry.registries = Some(vec![Registry {
+            id: "/subs/old/.../myreg".into(),
+            name: "myreg".into(),
+            resource_group: "rg".into(),
+            subscription_id: "11111111-1111-1111-1111-111111111111".into(),
+            location: "westeurope".into(),
+            sku: None,
+            login_server: None,
+            admin_user_enabled: None,
+            public_network_access: None,
+            anonymous_pull_enabled: None,
+            created_at: None,
+        }]);
+        state.storage.accounts = Some(vec![StorageAccount {
+            id: "/subs/old/.../sa".into(),
+            name: "sa".into(),
+            resource_group: "rg".into(),
+            subscription_id: "11111111-1111-1111-1111-111111111111".into(),
+            location: "westeurope".into(),
+            kind: None,
+            sku: None,
+            access_tier: None,
+            is_hns_enabled: None,
+            https_only: None,
+            allow_blob_public_access: None,
+            created_at: None,
+        }]);
+        state.subscription_cursor = 1;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(
+            state.registry.registries.is_none(),
+            "registry cache must be cleared on subscription switch"
+        );
+        assert!(
+            state.storage.accounts.is_none(),
+            "storage cache must be cleared on subscription switch"
+        );
     }
 
     #[test]

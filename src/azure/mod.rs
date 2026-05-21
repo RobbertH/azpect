@@ -11,6 +11,7 @@ pub mod container_app_workspace;
 pub mod health;
 pub mod logs;
 pub mod metrics;
+pub mod registries;
 pub mod resource_health;
 pub mod resources;
 pub mod storage;
