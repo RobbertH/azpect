@@ -8,6 +8,7 @@ pub mod client;
 pub mod container_app_limits;
 pub mod container_app_revisions;
 pub mod container_app_workspace;
+pub mod cosmos;
 pub mod health;
 pub mod logs;
 pub mod metrics;

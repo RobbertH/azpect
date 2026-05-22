@@ -194,6 +194,42 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             }
             s
         }
+
+        View::CosmosAccounts => vec![subscription_segment(state), "cosmos".to_string()],
+
+        View::CosmosDatabases => {
+            let mut s = vec![subscription_segment(state), "cosmos".to_string()];
+            if let Some(acc) = state.cosmos.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            s
+        }
+
+        View::CosmosContainers => {
+            let mut s = vec![subscription_segment(state), "cosmos".to_string()];
+            if let Some(acc) = state.cosmos.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            if let Some(db) = state.cosmos.selected_database.as_deref() {
+                s.push(db.to_string());
+            }
+            s
+        }
+
+        View::CosmosItem => {
+            let mut s = vec![subscription_segment(state), "cosmos".to_string()];
+            if let Some(acc) = state.cosmos.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            if let Some(db) = state.cosmos.selected_database.as_deref() {
+                s.push(db.to_string());
+            }
+            if let Some(coll) = state.cosmos.selected_container.as_deref() {
+                s.push(coll.to_string());
+            }
+            s.push("items".to_string());
+            s
+        }
     }
 }
 

@@ -29,13 +29,22 @@ pub enum Category {
     Storage,
     /// Azure Container Registries and the repository / tag chain.
     Registries,
+    /// Cosmos DB (SQL/Core API) accounts and the database / container / items
+    /// chain. Reaches the item preview via Cosmos data-plane auth — see
+    /// [`crate::azure::cosmos`].
+    Cosmos,
 }
 
 impl Category {
     /// Every category, in stable order. Iterate this to register palette
     /// commands, flush every category's cache on subscription switch, or list
     /// the categories in help output.
-    pub const ALL: &'static [Category] = &[Category::Apis, Category::Storage, Category::Registries];
+    pub const ALL: &'static [Category] = &[
+        Category::Apis,
+        Category::Storage,
+        Category::Registries,
+        Category::Cosmos,
+    ];
 
     /// The top-level list view for this category — the screen the user lands
     /// on after picking a subscription, after pressing the category keybind
@@ -45,6 +54,7 @@ impl Category {
             Category::Apis => View::List,
             Category::Storage => View::StorageAccounts,
             Category::Registries => View::Registries,
+            Category::Cosmos => View::CosmosAccounts,
         }
     }
 
@@ -74,6 +84,12 @@ impl Category {
             ) | (
                 Category::Registries,
                 View::Registries | View::RegistryRepositories | View::RegistryTags,
+            ) | (
+                Category::Cosmos,
+                View::CosmosAccounts
+                    | View::CosmosDatabases
+                    | View::CosmosContainers
+                    | View::CosmosItem,
             )
         )
     }
@@ -107,6 +123,9 @@ impl Category {
             Category::Registries => {
                 state.registry = RegistryCache::default();
             }
+            Category::Cosmos => {
+                state.cosmos = CosmosCache::default();
+            }
         }
     }
 
@@ -118,6 +137,7 @@ impl Category {
             Category::Apis => state.list_cursor = 0,
             Category::Storage => state.storage.accounts_cursor = 0,
             Category::Registries => state.registry.registries_cursor = 0,
+            Category::Cosmos => state.cosmos.accounts_cursor = 0,
         }
     }
 
@@ -127,9 +147,13 @@ impl Category {
     /// name first so it sorts to the top of Tab completion.
     pub fn palette_aliases(self) -> &'static [&'static str] {
         match self {
-            Category::Apis => &["apis", "a", "resources", "r"],
-            Category::Storage => &["storage", "s"],
+            // Single-letter aliases were dropped — they cluttered Tab
+            // completion and the keybinds (`S`, `R`) already cover muscle
+            // memory for the most common entries.
+            Category::Apis => &["apis"],
+            Category::Storage => &["storage"],
             Category::Registries => &["registries", "reg", "acr"],
+            Category::Cosmos => &["cosmos"],
         }
     }
 }
@@ -203,6 +227,20 @@ pub enum View {
     /// Opened with Enter from `RegistryRepositories`. Same data-plane
     /// permission requirement as the repositories list.
     RegistryTags,
+    /// Top-level "Cosmos DB" mode entry point — lists SQL/Core API Cosmos
+    /// accounts across the selected subscriptions. Opened via the `:cosmos`
+    /// palette command (no keybind).
+    CosmosAccounts,
+    /// List of SQL databases inside the pinned Cosmos account. Opened with
+    /// Enter from `CosmosAccounts`. Control-plane call — `Reader` suffices.
+    CosmosDatabases,
+    /// List of SQL containers (collections) inside the pinned database. Opened
+    /// with Enter from `CosmosDatabases`. Control-plane call.
+    CosmosContainers,
+    /// First-20 item preview for the pinned container. Opened with Enter from
+    /// `CosmosContainers`. Data-plane call — requires the signed-in identity
+    /// to have `Cosmos DB Built-in Data Reader` at the account scope.
+    CosmosItem,
     /// Application-Gateway-only: backend pools (and their members) for the
     /// selected gateway. Opened with Enter from `List` when the resource is
     /// `ResourceKind::AppGateway`.
@@ -568,6 +606,110 @@ impl RegistryCache {
     }
 }
 
+/// State for the Cosmos DB drill-in views (SQL/Core API only). Same layered
+/// shape as [`RegistryCache`] / [`StorageCache`], extended one level deep so
+/// the item preview can live in the same per-key cache discipline as the
+/// blob preview. The data plane (only the item-preview tier) carries its own
+/// auth via `SCOPE_COSMOS` — the first three tiers all flow through ARM.
+#[derive(Clone, Default)]
+pub struct CosmosCache {
+    /// All Cosmos accounts discovered for the current subscription scope.
+    /// Wrapped in `Option` so the view can distinguish "never fetched" from
+    /// "fetched and empty".
+    pub accounts: Option<Vec<crate::azure::cosmos::CosmosAccount>>,
+    pub accounts_pending: bool,
+    pub accounts_error: Option<String>,
+    pub accounts_cursor: usize,
+    pub accounts_filter: Input,
+    pub accounts_filter_active: bool,
+    /// Pinned account the user drilled into.
+    pub selected_account: Option<crate::azure::cosmos::CosmosAccount>,
+
+    /// Keyed by account resource id.
+    pub databases: HashMap<String, Vec<crate::azure::cosmos::CosmosDatabase>>,
+    pub databases_pending: HashSet<String>,
+    pub databases_error: HashMap<String, String>,
+    pub databases_cursor: usize,
+    pub databases_filter: Input,
+    pub databases_filter_active: bool,
+    /// Pinned database name the user drilled into.
+    pub selected_database: Option<String>,
+
+    /// Keyed by `"{account_id}/{db_name}"`.
+    pub containers: HashMap<String, Vec<crate::azure::cosmos::CosmosContainer>>,
+    pub containers_pending: HashSet<String>,
+    pub containers_error: HashMap<String, String>,
+    pub containers_cursor: usize,
+    pub containers_filter: Input,
+    pub containers_filter_active: bool,
+    /// Pinned container name the user drilled into.
+    pub selected_container: Option<String>,
+
+    /// Keyed by `"{account_id}/{db_name}/{coll_name}"`.
+    pub items: HashMap<String, crate::azure::cosmos::CosmosItemPreview>,
+    pub items_pending: HashSet<String>,
+    pub items_error: HashMap<String, String>,
+    /// Vertical scroll offset inside the item preview pane.
+    pub items_scroll: u16,
+}
+
+impl CosmosCache {
+    /// Cache key for the containers map: `{account_id}/{db}`.
+    pub fn containers_key(account_id: &str, db: &str) -> String {
+        format!("{account_id}/{db}")
+    }
+
+    /// Cache key for the items map: `{account_id}/{db}/{coll}`.
+    pub fn items_key(account_id: &str, db: &str, coll: &str) -> String {
+        format!("{account_id}/{db}/{coll}")
+    }
+
+    /// Apply `accounts_filter` to `accounts` as a case-insensitive substring
+    /// match on the account name. Empty filter passes everything through.
+    pub fn filtered_accounts(&self) -> Vec<&crate::azure::cosmos::CosmosAccount> {
+        let needle = self.accounts_filter.value().to_lowercase();
+        match self.accounts.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|a| needle.is_empty() || a.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `databases_filter` to the databases under `account_id`.
+    pub fn filtered_databases(
+        &self,
+        account_id: &str,
+    ) -> Vec<&crate::azure::cosmos::CosmosDatabase> {
+        let needle = self.databases_filter.value().to_lowercase();
+        match self.databases.get(account_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|d| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `containers_filter` to the containers under `(account_id, db)`.
+    pub fn filtered_containers(
+        &self,
+        account_id: &str,
+        db: &str,
+    ) -> Vec<&crate::azure::cosmos::CosmosContainer> {
+        let needle = self.containers_filter.value().to_lowercase();
+        let key = Self::containers_key(account_id, db);
+        match self.containers.get(&key) {
+            Some(rows) => rows
+                .iter()
+                .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -649,6 +791,7 @@ pub struct AppState {
     pub appgw: AppGatewayBackendsCache,
     pub storage: StorageCache,
     pub registry: RegistryCache,
+    pub cosmos: CosmosCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -731,6 +874,7 @@ impl AppState {
             appgw: AppGatewayBackendsCache::default(),
             storage: StorageCache::default(),
             registry: RegistryCache::default(),
+            cosmos: CosmosCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -870,6 +1014,10 @@ mod tests {
             Some(Category::Registries)
         );
         assert_eq!(Category::of(View::RegistryTags), Some(Category::Registries));
+        assert_eq!(Category::of(View::CosmosAccounts), Some(Category::Cosmos));
+        assert_eq!(Category::of(View::CosmosDatabases), Some(Category::Cosmos));
+        assert_eq!(Category::of(View::CosmosContainers), Some(Category::Cosmos));
+        assert_eq!(Category::of(View::CosmosItem), Some(Category::Cosmos));
         // Subscriptions and Help are modal entry points — outside any chain.
         assert_eq!(Category::of(View::Subscriptions), None);
         assert_eq!(Category::of(View::Help), None);
@@ -941,6 +1089,7 @@ mod tests {
         });
         state.storage.accounts = Some(Vec::new());
         state.registry.registries = Some(Vec::new());
+        state.cosmos.accounts = Some(Vec::new());
 
         Category::Storage.clear_cache(&mut state);
         assert!(state.storage.accounts.is_none(), "storage cleared");
@@ -952,6 +1101,10 @@ mod tests {
             state.registry.registries.is_some(),
             "registries untouched by storage clear"
         );
+        assert!(
+            state.cosmos.accounts.is_some(),
+            "cosmos untouched by storage clear"
+        );
 
         Category::Registries.clear_cache(&mut state);
         assert!(state.registry.registries.is_none(), "registries cleared");
@@ -959,9 +1112,40 @@ mod tests {
             !state.resources.is_empty(),
             "apis untouched by registries clear"
         );
+        assert!(
+            state.cosmos.accounts.is_some(),
+            "cosmos untouched by registries clear"
+        );
+
+        Category::Cosmos.clear_cache(&mut state);
+        assert!(state.cosmos.accounts.is_none(), "cosmos cleared");
+        assert!(
+            !state.resources.is_empty(),
+            "apis untouched by cosmos clear"
+        );
 
         Category::Apis.clear_cache(&mut state);
         assert!(state.resources.is_empty(), "apis cleared");
+    }
+
+    #[test]
+    fn palette_aliases_drop_single_letters() {
+        // Single-letter palette aliases were dropped to keep Tab completion
+        // clean. The keybind shortcuts (`S` / `R`) are unaffected.
+        let apis = Category::Apis.palette_aliases();
+        assert!(
+            !apis.contains(&"a") && !apis.contains(&"r") && !apis.contains(&"resources"),
+            "Apis should expose only `apis`, got {apis:?}"
+        );
+        let storage = Category::Storage.palette_aliases();
+        assert!(
+            !storage.contains(&"s"),
+            "Storage should not expose `s`, got {storage:?}"
+        );
+        assert!(
+            Category::Cosmos.palette_aliases().contains(&"cosmos"),
+            "Cosmos palette alias missing"
+        );
     }
 
     #[test]

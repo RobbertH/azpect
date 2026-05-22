@@ -102,6 +102,20 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Cosmos DB (SQL/Core API)",
+        &[
+            (":cosmos", "enter cosmos mode (palette only — no keybind)"),
+            ("Enter", "drill: accounts > databases > containers > items"),
+            ("/", "filter accounts / databases / containers by name"),
+            ("y", "yank account id / db name / container / item json"),
+            ("o", "open account's Data Explorer in Azure Portal"),
+            (
+                "r",
+                "refresh current panel (item preview costs RU — see title bar)",
+            ),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -116,9 +130,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             (":", "open command palette"),
             ("Tab / S-Tab", "cycle prefix matches"),
-            (":storage / :s", "enter storage mode"),
-            (":registries / :reg", "enter registries mode"),
-            (":apis / :a", "back to apis list"),
+            (":storage", "enter storage mode"),
+            (":registries / :reg / :acr", "enter registries mode"),
+            (":cosmos", "enter cosmos mode"),
+            (":apis", "back to apis list"),
             (":subscriptions / :subs", "subscription picker"),
             (":help / :h / :?", "open help"),
             (":refresh", "force-refresh current view"),
@@ -235,8 +250,12 @@ mod tests {
 
     #[test]
     fn renders_without_panic() {
+        // Backend has to be tall enough to fit the help popup's column with
+        // the most content. Adding new sections (Cosmos, etc.) pushes the
+        // right-column footers further down — bump backend height if you add
+        // sections that grow either column past ~30 lines.
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(100, 30);
+        let backend = TestBackend::new(100, 40);
         let mut term = Terminal::new(backend).unwrap();
         let state = AppState::new(Config::default());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -244,6 +263,7 @@ mod tests {
         assert!(s.to_lowercase().contains("help"));
         assert!(s.contains("Navigation"));
         assert!(s.contains("Global"));
+        assert!(s.contains("Cosmos"), "Cosmos section should render");
     }
 
     #[test]

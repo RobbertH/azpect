@@ -138,6 +138,29 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::registries::Tag>, String>,
     },
+    /// Background load completion: list of Cosmos DB (SQL/Core) accounts for
+    /// the current subscription scope.
+    CosmosAccountsLoaded(Result<Vec<crate::azure::cosmos::CosmosAccount>, String>),
+    /// Background load completion: list of SQL databases inside one Cosmos
+    /// account, keyed by account ARM id.
+    CosmosDatabasesLoaded {
+        account_id: String,
+        result: Result<Vec<crate::azure::cosmos::CosmosDatabase>, String>,
+    },
+    /// Background load completion: list of SQL containers inside one database.
+    /// `key` is the `(account_id, db_name)` pair flattened by
+    /// [`crate::ui::state::CosmosCache::containers_key`].
+    CosmosContainersLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::cosmos::CosmosContainer>, String>,
+    },
+    /// Background load completion: first-20 item preview for one container.
+    /// `key` is the `(account_id, db, coll)` triple flattened by
+    /// [`crate::ui::state::CosmosCache::items_key`].
+    CosmosItemsLoaded {
+        key: String,
+        result: Result<crate::azure::cosmos::CosmosItemPreview, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →

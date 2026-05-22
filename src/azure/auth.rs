@@ -35,6 +35,14 @@ pub const SCOPE_LOGS: &str = "https://api.loganalytics.io/.default";
 /// `Storage Blob Data Reader` role (or stronger) on the account.
 pub const SCOPE_STORAGE: &str = "https://storage.azure.com/.default";
 
+/// OAuth scope for the Azure Cosmos DB **data plane** (`*.documents.azure.com`).
+/// Account control-plane operations (list databases, list containers, fetch
+/// container properties) go through ARM (`SCOPE_ARM`); reading items via
+/// `POST /dbs/{db}/colls/{coll}/docs` requires this dedicated audience plus the
+/// `Cosmos DB Built-in Data Reader` role assigned at the account scope via
+/// `dataPlaneRoleDefinitions` — control-plane `Reader` is not enough.
+pub const SCOPE_COSMOS: &str = "https://cosmos.azure.com/.default";
+
 /// Refresh tokens this far before their stated expiry.
 pub const REFRESH_BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -194,5 +202,6 @@ mod tests {
         assert_eq!(SCOPE_ARM, "https://management.azure.com/.default");
         assert_eq!(SCOPE_LOGS, "https://api.loganalytics.io/.default");
         assert_eq!(SCOPE_STORAGE, "https://storage.azure.com/.default");
+        assert_eq!(SCOPE_COSMOS, "https://cosmos.azure.com/.default");
     }
 }

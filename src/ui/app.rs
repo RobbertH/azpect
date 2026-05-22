@@ -377,6 +377,30 @@ async fn event_loop(
                     state.registry.tags_cursor = 0;
                     continue;
                 }
+                if should_forward_to_cosmos_accounts_filter(state, key) {
+                    state
+                        .cosmos
+                        .accounts_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.cosmos.accounts_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_cosmos_databases_filter(state, key) {
+                    state
+                        .cosmos
+                        .databases_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.cosmos.databases_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_cosmos_containers_filter(state, key) {
+                    state
+                        .cosmos
+                        .containers_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.cosmos.containers_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -701,6 +725,61 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::CosmosAccountsLoaded(res) => {
+                state.cosmos.accounts_pending = false;
+                match res {
+                    Ok(rows) => {
+                        state.cosmos.accounts_error = None;
+                        if !rows.is_empty() && state.cosmos.accounts_cursor >= rows.len() {
+                            state.cosmos.accounts_cursor = rows.len() - 1;
+                        }
+                        state.cosmos.accounts = Some(rows);
+                    }
+                    Err(e) => {
+                        state.cosmos.accounts = None;
+                        state.cosmos.accounts_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::CosmosDatabasesLoaded { account_id, result } => {
+                state.cosmos.databases_pending.remove(&account_id);
+                match result {
+                    Ok(rows) => {
+                        state.cosmos.databases_error.remove(&account_id);
+                        state.cosmos.databases.insert(account_id, rows);
+                    }
+                    Err(e) => {
+                        state.cosmos.databases.remove(&account_id);
+                        state.cosmos.databases_error.insert(account_id, e);
+                    }
+                }
+            }
+            AppEvent::CosmosContainersLoaded { key, result } => {
+                state.cosmos.containers_pending.remove(&key);
+                match result {
+                    Ok(rows) => {
+                        state.cosmos.containers_error.remove(&key);
+                        state.cosmos.containers.insert(key, rows);
+                    }
+                    Err(e) => {
+                        state.cosmos.containers.remove(&key);
+                        state.cosmos.containers_error.insert(key, e);
+                    }
+                }
+            }
+            AppEvent::CosmosItemsLoaded { key, result } => {
+                state.cosmos.items_pending.remove(&key);
+                match result {
+                    Ok(preview) => {
+                        state.cosmos.items_error.remove(&key);
+                        state.cosmos.items.insert(key, preview);
+                    }
+                    Err(e) => {
+                        state.cosmos.items.remove(&key);
+                        state.cosmos.items_error.insert(key, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -931,6 +1010,60 @@ fn should_forward_to_tags_filter(state: &AppState, key: crossterm::event::KeyEve
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the cosmos-accounts name filter.
+fn should_forward_to_cosmos_accounts_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::CosmosAccounts
+        && state.cosmos.accounts_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the cosmos-databases name filter.
+fn should_forward_to_cosmos_databases_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::CosmosDatabases
+        && state.cosmos.databases_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the cosmos-containers name filter.
+fn should_forward_to_cosmos_containers_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::CosmosContainers
+        && state.cosmos.containers_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Palette commands that aren't tied to a [`Category`]. Subscriptions / help
 /// / quit / refresh are global so they sit here as a small static table;
 /// every other command flows through [`Category::palette_aliases`].
@@ -983,10 +1116,10 @@ fn run_command(state: &mut AppState, cmd: &str) {
         return;
     }
 
-    // Category routing: every `:storage` / `:s` / `:registries` / `:reg` /
-    // `:acr` / `:apis` / `:a` / `:resources` / `:r` flows through the same
-    // `enter_category` helper as the keybinds. Adding a new resource type
-    // means adding a `Category` variant — this loop picks it up for free.
+    // Category routing: every `:storage` / `:registries` / `:reg` / `:acr` /
+    // `:apis` / `:cosmos` flows through the same `enter_category` helper as
+    // the keybinds. Adding a new resource type means adding a `Category`
+    // variant — this loop picks it up for free.
     if let Some(category) = crate::ui::state::Category::ALL
         .iter()
         .copied()
@@ -1112,7 +1245,10 @@ fn decide_action(
         || (state.view == View::StorageAccounts && state.storage.accounts_filter_active)
         || (state.view == View::Registries && state.registry.registries_filter_active)
         || (state.view == View::RegistryRepositories && state.registry.repositories_filter_active)
-        || (state.view == View::RegistryTags && state.registry.tags_filter_active);
+        || (state.view == View::RegistryTags && state.registry.tags_filter_active)
+        || (state.view == View::CosmosAccounts && state.cosmos.accounts_filter_active)
+        || (state.view == View::CosmosDatabases && state.cosmos.databases_filter_active)
+        || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1166,6 +1302,10 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
             crate::ui::views::registry_repositories::handle(action, state)
         }
         View::RegistryTags => crate::ui::views::registry_tags::handle(action, state),
+        View::CosmosAccounts => crate::ui::views::cosmos_accounts::handle(action, state),
+        View::CosmosDatabases => crate::ui::views::cosmos_databases::handle(action, state),
+        View::CosmosContainers => crate::ui::views::cosmos_containers::handle(action, state),
+        View::CosmosItem => crate::ui::views::cosmos_item::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -1300,6 +1440,18 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_registry
             .as_ref()
             .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
+        // Cosmos views land on the account's Data Explorer blade — that's
+        // where the user can act on what they were browsing in the TUI.
+        View::CosmosAccounts => state
+            .cosmos
+            .filtered_accounts()
+            .get(state.cosmos.accounts_cursor)
+            .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+        View::CosmosDatabases | View::CosmosContainers | View::CosmosItem => state
+            .cosmos
+            .selected_account
+            .as_ref()
+            .map(|a| format!("{PORTAL_BASE}{}", a.id)),
         View::Help => None,
     }
 }
@@ -1385,6 +1537,34 @@ fn yank_target(state: &AppState) -> Option<String> {
                 registry.login_server_or_default(),
                 repository
             ))
+        }),
+        View::CosmosAccounts => state
+            .cosmos
+            .filtered_accounts()
+            .get(state.cosmos.accounts_cursor)
+            .map(|a| a.id.clone()),
+        View::CosmosDatabases => {
+            let account = state.cosmos.selected_account.as_ref()?;
+            state
+                .cosmos
+                .filtered_databases(&account.id)
+                .get(state.cosmos.databases_cursor)
+                .map(|d| format!("{}/{}", account.name, d.name))
+        }
+        View::CosmosContainers => {
+            let account = state.cosmos.selected_account.as_ref()?;
+            let db = state.cosmos.selected_database.as_deref()?;
+            state
+                .cosmos
+                .filtered_containers(&account.id, db)
+                .get(state.cosmos.containers_cursor)
+                .map(|c| format!("{}/{}/{}", account.name, db, c.name))
+        }
+        View::CosmosItem => crate::ui::views::cosmos_item::yank_text(state).or_else(|| {
+            let account = state.cosmos.selected_account.as_ref()?;
+            let db = state.cosmos.selected_database.as_deref()?;
+            let coll = state.cosmos.selected_container.as_deref()?;
+            Some(format!("{}/{}/{}", account.name, db, coll))
         }),
         View::Help => None,
     }
@@ -1497,6 +1677,10 @@ fn semantic_parent(view: View) -> Option<View> {
         View::Registries => Some(View::Subscriptions),
         View::RegistryRepositories => Some(View::Registries),
         View::RegistryTags => Some(View::RegistryRepositories),
+        View::CosmosAccounts => Some(View::Subscriptions),
+        View::CosmosDatabases => Some(View::CosmosAccounts),
+        View::CosmosContainers => Some(View::CosmosDatabases),
+        View::CosmosItem => Some(View::CosmosContainers),
     }
 }
 
@@ -1809,6 +1993,73 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::CosmosAccounts => {
+            let cached = state.cosmos.accounts.is_some();
+            let in_flight = state.cosmos.accounts_pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.cosmos.accounts = None;
+                    state.cosmos.accounts_error = None;
+                }
+                state.cosmos.accounts_pending = true;
+                spawn_load_cosmos_accounts(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::CosmosDatabases => {
+            if let Some(account) = state.cosmos.selected_account.clone() {
+                let cached = state.cosmos.databases.contains_key(&account.id);
+                let in_flight = state.cosmos.databases_pending.contains(&account.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.cosmos.databases.remove(&account.id);
+                        state.cosmos.databases_error.remove(&account.id);
+                    }
+                    state.cosmos.databases_pending.insert(account.id.clone());
+                    spawn_load_cosmos_databases(auth.clone(), account, tx.clone());
+                }
+            }
+        }
+        View::CosmosContainers => {
+            if let (Some(account), Some(db)) = (
+                state.cosmos.selected_account.clone(),
+                state.cosmos.selected_database.clone(),
+            ) {
+                let key = crate::ui::state::CosmosCache::containers_key(&account.id, &db);
+                let cached = state.cosmos.containers.contains_key(&key);
+                let in_flight = state.cosmos.containers_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.cosmos.containers.remove(&key);
+                        state.cosmos.containers_error.remove(&key);
+                    }
+                    state.cosmos.containers_pending.insert(key);
+                    spawn_load_cosmos_containers(auth.clone(), account, db, tx.clone());
+                }
+            }
+        }
+        View::CosmosItem => {
+            if let (Some(account), Some(db), Some(coll)) = (
+                state.cosmos.selected_account.clone(),
+                state.cosmos.selected_database.clone(),
+                state.cosmos.selected_container.clone(),
+            ) {
+                let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+                let cached = state.cosmos.items.contains_key(&key);
+                let in_flight = state.cosmos.items_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.cosmos.items.remove(&key);
+                        state.cosmos.items_error.remove(&key);
+                    }
+                    state.cosmos.items_pending.insert(key);
+                    spawn_load_cosmos_items(auth.clone(), account, db, coll, tx.clone());
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -1920,6 +2171,16 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::registry_repositories::render(f, view_area, state, theme)
         }
         View::RegistryTags => crate::ui::views::registry_tags::render(f, view_area, state, theme),
+        View::CosmosAccounts => {
+            crate::ui::views::cosmos_accounts::render(f, view_area, state, theme)
+        }
+        View::CosmosDatabases => {
+            crate::ui::views::cosmos_databases::render(f, view_area, state, theme)
+        }
+        View::CosmosContainers => {
+            crate::ui::views::cosmos_containers::render(f, view_area, state, theme)
+        }
+        View::CosmosItem => crate::ui::views::cosmos_item::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -2731,6 +2992,64 @@ fn spawn_load_tags(
     });
 }
 
+fn spawn_load_cosmos_accounts(
+    auth: AzureAuth,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::cosmos::list_accounts(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::CosmosAccountsLoaded(result));
+    });
+}
+
+fn spawn_load_cosmos_databases(
+    auth: AzureAuth,
+    account: crate::azure::cosmos::CosmosAccount,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let account_id = account.id.clone();
+        let result = crate::azure::cosmos::list_databases(&auth, &account)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::CosmosDatabasesLoaded { account_id, result });
+    });
+}
+
+fn spawn_load_cosmos_containers(
+    auth: AzureAuth,
+    account: crate::azure::cosmos::CosmosAccount,
+    db: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::CosmosCache::containers_key(&account.id, &db);
+        let result = crate::azure::cosmos::list_containers(&auth, &account, &db)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::CosmosContainersLoaded { key, result });
+    });
+}
+
+fn spawn_load_cosmos_items(
+    auth: AzureAuth,
+    account: crate::azure::cosmos::CosmosAccount,
+    db: String,
+    coll: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+        let result = crate::azure::cosmos::query_top_items(&auth, &account, &db, &coll)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::CosmosItemsLoaded { key, result });
+    });
+}
+
 fn spawn_load_logs(
     auth: AzureAuth,
     resource: Resource,
@@ -2878,31 +3197,58 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_storage_aliases_switch_view() {
-        for cmd in ["storage", "s"] {
-            let mut state = fresh_state();
-            state.view = View::List;
-            run_command(&mut state, cmd);
-            assert_eq!(
-                state.view,
-                View::StorageAccounts,
-                "{cmd} should open storage"
-            );
-            assert_eq!(state.view_stack, vec![View::List]);
-            assert!(state.status_message.is_none());
-        }
+    fn command_mode_storage_alias_switches_view() {
+        // Single-letter aliases (`:s`) were dropped — only the canonical name
+        // routes. `:s` now hits the `unknown command` fallback (covered by a
+        // separate test below).
+        let mut state = fresh_state();
+        state.view = View::List;
+        run_command(&mut state, "storage");
+        assert_eq!(state.view, View::StorageAccounts);
+        assert_eq!(state.view_stack, vec![View::List]);
+        assert!(state.status_message.is_none());
     }
 
     #[test]
-    fn command_mode_resources_aliases_switch_view() {
-        // `apis` is the canonical name; `a`, `resources`, and `r` are legacy
-        // aliases that still route to the same view.
-        for cmd in ["apis", "a", "resources", "r"] {
+    fn command_mode_apis_alias_switches_view() {
+        // `:apis` is the only alias for the Apis category after the cleanup
+        // (legacy `a`, `resources`, `r` were dropped because they made
+        // Tab-completion noisy).
+        let mut state = fresh_state();
+        state.view = View::StorageAccounts;
+        run_command(&mut state, "apis");
+        assert_eq!(state.view, View::List);
+        assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn command_mode_cosmos_alias_switches_view() {
+        let mut state = fresh_state();
+        state.view = View::List;
+        run_command(&mut state, "cosmos");
+        assert_eq!(state.view, View::CosmosAccounts);
+        assert_eq!(state.view_stack, vec![View::List]);
+        assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn command_mode_dropped_single_letter_aliases_are_unknown() {
+        // Regression guard: dropping `s` / `a` / `r` / `resources` from the
+        // palette aliases means those buffers must surface "unknown command"
+        // rather than silently routing.
+        for cmd in ["s", "a", "r", "resources"] {
             let mut state = fresh_state();
-            state.view = View::StorageAccounts;
+            state.view = View::List;
             run_command(&mut state, cmd);
-            assert_eq!(state.view, View::List, "{cmd} should land in apis list");
-            assert!(state.status_message.is_none());
+            assert_eq!(state.view, View::List, "{cmd} must not move the view");
+            assert!(
+                state
+                    .status_message
+                    .as_deref()
+                    .map(|m| m.contains("unknown command"))
+                    .unwrap_or(false),
+                "{cmd} should surface unknown-command status"
+            );
         }
     }
 
@@ -2949,13 +3295,16 @@ mod tests {
         let all = palette_tab_candidates("");
         assert!(all.contains(&"storage".to_string()));
         assert!(all.contains(&"apis".to_string()));
-        // `resources` lingers as a legacy alias so muscle memory still works.
-        assert!(all.contains(&"resources".to_string()));
+        assert!(all.contains(&"cosmos".to_string()));
         assert!(all.contains(&"subscriptions".to_string()));
         assert!(all.contains(&"refresh".to_string()));
         assert!(all.contains(&"quit".to_string()));
+        // Legacy `resources` alias was dropped from the palette to keep
+        // Tab-completion focused on canonical names.
+        assert!(!all.contains(&"resources".to_string()));
 
-        // `s` matches both `storage` and `subscriptions` (and `subs`).
+        // `s` matches `storage` and `subscriptions` (and `subs`) — no
+        // single-letter category aliases remain.
         let with_s = palette_tab_candidates("s");
         assert!(with_s.iter().any(|c| c == "storage"));
         assert!(with_s.iter().any(|c| c == "subscriptions"));
@@ -2966,11 +3315,16 @@ mod tests {
         assert!(with_ap.iter().any(|c| c == "apis"));
         assert!(!with_ap.iter().any(|c| c == "storage"));
 
-        // `re` narrows to `resources` (legacy alias) / `refresh`.
+        // `re` narrows to `registries` / `reg` / `refresh` — `resources` is
+        // gone from the alias list.
         let with_re = palette_tab_candidates("re");
-        assert!(with_re.iter().any(|c| c == "resources"));
+        assert!(with_re.iter().any(|c| c == "registries"));
         assert!(with_re.iter().any(|c| c == "refresh"));
-        assert!(!with_re.iter().any(|c| c == "storage"));
+        assert!(!with_re.iter().any(|c| c == "resources"));
+
+        // `co` narrows to `cosmos`.
+        let with_co = palette_tab_candidates("co");
+        assert!(with_co.iter().any(|c| c == "cosmos"));
 
         // Nonsense prefix returns nothing.
         assert!(palette_tab_candidates("zzz").is_empty());
@@ -2980,13 +3334,12 @@ mod tests {
     fn palette_ghost_hint_shows_remainder_of_first_candidate() {
         // `st` → only `storage` matches, hint is the rest of the word.
         assert_eq!(palette_ghost_hint("st"), "orage");
-        // `s` → first `s*` candidate is `storage` (Storage's canonical alias
-        // sorts before its `s` shortcut; both come after the `Apis` category
-        // in `Category::ALL`).
+        // `s` → first `s*` candidate is `storage` (Apis no longer has an `s`
+        // alias).
         assert_eq!(palette_ghost_hint("s"), "torage");
-        // `re` → first match is `resources` (alias of Apis, which comes
-        // first in `Category::ALL`); `registries` is also reachable via Tab.
-        assert_eq!(palette_ghost_hint("re"), "sources");
+        // `re` → first match is `registries` (Apis dropped its `resources`
+        // alias). `refresh` is reachable via Tab.
+        assert_eq!(palette_ghost_hint("re"), "gistries");
         // Exact match: nothing left to suggest.
         assert_eq!(palette_ghost_hint("storage"), "");
         // No prefix match: no hint.
