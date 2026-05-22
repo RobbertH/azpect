@@ -161,6 +161,16 @@ pub enum AppEvent {
         key: String,
         result: Result<crate::azure::cosmos::CosmosItemPreview, String>,
     },
+    /// Background load completion: list of Key Vaults for the current
+    /// subscription scope. Resource Graph control-plane call.
+    KeyVaultsLoaded(Result<Vec<crate::azure::key_vault::KeyVault>, String>),
+    /// Background load completion: list of secrets *or* certificates inside
+    /// one vault. `key` is the `(vault_id, kind)` pair flattened by
+    /// [`crate::ui::state::KeyVaultCache::items_key`]. Data-plane call.
+    KeyVaultItemsLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::key_vault::KeyVaultItem>, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →

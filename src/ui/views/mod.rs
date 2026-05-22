@@ -11,6 +11,8 @@ pub mod cosmos_databases;
 pub mod cosmos_item;
 pub mod detail;
 pub mod help;
+pub mod key_vault_items;
+pub mod key_vaults;
 pub mod list;
 pub mod logs;
 pub mod logs_detail;

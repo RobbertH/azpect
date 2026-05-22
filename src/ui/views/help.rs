@@ -116,6 +116,18 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Key Vaults (metadata only)",
+        &[
+            (":keyvaults / :kv", "enter key vault mode (palette only)"),
+            ("Enter", "drill: vaults > items (secrets + certificates)"),
+            ("Tab / S-Tab", "toggle secrets ↔ certificates"),
+            ("/", "filter vaults / items by name (substring)"),
+            ("y", "yank vault id / item name"),
+            ("o", "open vault in Azure Portal (values live there)"),
+            ("r", "refresh current panel"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -133,6 +145,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (":storage", "enter storage mode"),
             (":registries / :reg / :acr", "enter registries mode"),
             (":cosmos", "enter cosmos mode"),
+            (":keyvaults / :kv / :vaults", "enter key vault mode"),
             (":apis", "back to apis list"),
             (":subscriptions / :subs", "subscription picker"),
             (":help / :h / :?", "open help"),

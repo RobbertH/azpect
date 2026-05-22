@@ -43,6 +43,15 @@ pub const SCOPE_STORAGE: &str = "https://storage.azure.com/.default";
 /// `dataPlaneRoleDefinitions` — control-plane `Reader` is not enough.
 pub const SCOPE_COSMOS: &str = "https://cosmos.azure.com/.default";
 
+/// OAuth scope for the Azure Key Vault **data plane** (`*.vault.azure.net`).
+/// The vault list comes from Resource Graph / ARM (`SCOPE_ARM`); enumerating
+/// secrets / keys / certificates inside a vault requires this dedicated
+/// audience. The signed-in identity needs either a `list`-permitting access
+/// policy or an RBAC role like `Key Vault Reader` (control-plane `Reader` is
+/// not enough). Note the audience host has no trailing path — Key Vault is
+/// one of the older services that uses a host-form audience.
+pub const SCOPE_KEY_VAULT: &str = "https://vault.azure.net/.default";
+
 /// Refresh tokens this far before their stated expiry.
 pub const REFRESH_BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -203,5 +212,6 @@ mod tests {
         assert_eq!(SCOPE_LOGS, "https://api.loganalytics.io/.default");
         assert_eq!(SCOPE_STORAGE, "https://storage.azure.com/.default");
         assert_eq!(SCOPE_COSMOS, "https://cosmos.azure.com/.default");
+        assert_eq!(SCOPE_KEY_VAULT, "https://vault.azure.net/.default");
     }
 }

@@ -401,6 +401,22 @@ async fn event_loop(
                     state.cosmos.containers_cursor = 0;
                     continue;
                 }
+                if should_forward_to_key_vaults_filter(state, key) {
+                    state
+                        .key_vault
+                        .vaults_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.key_vault.vaults_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_key_vault_items_filter(state, key) {
+                    state
+                        .key_vault
+                        .items_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.key_vault.items_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -780,6 +796,35 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::KeyVaultsLoaded(res) => {
+                state.key_vault.vaults_pending = false;
+                match res {
+                    Ok(rows) => {
+                        state.key_vault.vaults_error = None;
+                        if !rows.is_empty() && state.key_vault.vaults_cursor >= rows.len() {
+                            state.key_vault.vaults_cursor = rows.len() - 1;
+                        }
+                        state.key_vault.vaults = Some(rows);
+                    }
+                    Err(e) => {
+                        state.key_vault.vaults = None;
+                        state.key_vault.vaults_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::KeyVaultItemsLoaded { key, result } => {
+                state.key_vault.items_pending.remove(&key);
+                match result {
+                    Ok(rows) => {
+                        state.key_vault.items_error.remove(&key);
+                        state.key_vault.items.insert(key, rows);
+                    }
+                    Err(e) => {
+                        state.key_vault.items.remove(&key);
+                        state.key_vault.items_error.insert(key, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -1064,6 +1109,39 @@ fn should_forward_to_cosmos_containers_filter(
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the key-vault list name filter.
+fn should_forward_to_key_vaults_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::KeyVaults
+        && state.key_vault.vaults_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the key-vault items name filter.
+fn should_forward_to_key_vault_items_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::KeyVaultItems
+        && state.key_vault.items_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Palette commands that aren't tied to a [`Category`]. Subscriptions / help
 /// / quit / refresh are global so they sit here as a small static table;
 /// every other command flows through [`Category::palette_aliases`].
@@ -1248,7 +1326,9 @@ fn decide_action(
         || (state.view == View::RegistryTags && state.registry.tags_filter_active)
         || (state.view == View::CosmosAccounts && state.cosmos.accounts_filter_active)
         || (state.view == View::CosmosDatabases && state.cosmos.databases_filter_active)
-        || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active);
+        || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active)
+        || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
+        || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1306,6 +1386,8 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::CosmosDatabases => crate::ui::views::cosmos_databases::handle(action, state),
         View::CosmosContainers => crate::ui::views::cosmos_containers::handle(action, state),
         View::CosmosItem => crate::ui::views::cosmos_item::handle(action, state),
+        View::KeyVaults => crate::ui::views::key_vaults::handle(action, state),
+        View::KeyVaultItems => crate::ui::views::key_vault_items::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -1452,6 +1534,20 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_account
             .as_ref()
             .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+        // Key Vault views land on the vault's overview blade; the Azure
+        // portal's secrets/certs panes are reachable via the side nav from
+        // there. The cursor indexes into the *filtered* view so `o` follows
+        // what's on screen.
+        View::KeyVaults => state
+            .key_vault
+            .filtered_vaults()
+            .get(state.key_vault.vaults_cursor)
+            .map(|v| format!("{PORTAL_BASE}{}", v.id)),
+        View::KeyVaultItems => state
+            .key_vault
+            .selected_vault
+            .as_ref()
+            .map(|v| format!("{PORTAL_BASE}{}", v.id)),
         View::Help => None,
     }
 }
@@ -1565,6 +1661,15 @@ fn yank_target(state: &AppState) -> Option<String> {
             let db = state.cosmos.selected_database.as_deref()?;
             let coll = state.cosmos.selected_container.as_deref()?;
             Some(format!("{}/{}/{}", account.name, db, coll))
+        }),
+        View::KeyVaults => state
+            .key_vault
+            .filtered_vaults()
+            .get(state.key_vault.vaults_cursor)
+            .map(|v| v.id.clone()),
+        View::KeyVaultItems => crate::ui::views::key_vault_items::yank_text(state).or_else(|| {
+            let vault = state.key_vault.selected_vault.as_ref()?;
+            Some(vault.id.clone())
         }),
         View::Help => None,
     }
@@ -1681,6 +1786,8 @@ fn semantic_parent(view: View) -> Option<View> {
         View::CosmosDatabases => Some(View::CosmosAccounts),
         View::CosmosContainers => Some(View::CosmosDatabases),
         View::CosmosItem => Some(View::CosmosContainers),
+        View::KeyVaults => Some(View::Subscriptions),
+        View::KeyVaultItems => Some(View::KeyVaults),
     }
 }
 
@@ -2060,6 +2167,38 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::KeyVaults => {
+            let cached = state.key_vault.vaults.is_some();
+            let in_flight = state.key_vault.vaults_pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.key_vault.vaults = None;
+                    state.key_vault.vaults_error = None;
+                }
+                state.key_vault.vaults_pending = true;
+                spawn_load_key_vaults(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::KeyVaultItems => {
+            if let Some(vault) = state.key_vault.selected_vault.clone() {
+                let kind = state.key_vault.items_kind;
+                let key = crate::ui::state::KeyVaultCache::items_key(&vault.id, kind);
+                let cached = state.key_vault.items.contains_key(&key);
+                let in_flight = state.key_vault.items_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.key_vault.items.remove(&key);
+                        state.key_vault.items_error.remove(&key);
+                    }
+                    state.key_vault.items_pending.insert(key);
+                    spawn_load_key_vault_items(auth.clone(), vault, kind, tx.clone());
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -2181,6 +2320,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::cosmos_containers::render(f, view_area, state, theme)
         }
         View::CosmosItem => crate::ui::views::cosmos_item::render(f, view_area, state, theme),
+        View::KeyVaults => crate::ui::views::key_vaults::render(f, view_area, state, theme),
+        View::KeyVaultItems => {
+            crate::ui::views::key_vault_items::render(f, view_area, state, theme)
+        }
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -3047,6 +3190,30 @@ fn spawn_load_cosmos_items(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::CosmosItemsLoaded { key, result });
+    });
+}
+
+fn spawn_load_key_vaults(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::key_vault::list_vaults(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::KeyVaultsLoaded(result));
+    });
+}
+
+fn spawn_load_key_vault_items(
+    auth: AzureAuth,
+    vault: crate::azure::key_vault::KeyVault,
+    kind: crate::azure::key_vault::ItemKind,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::KeyVaultCache::items_key(&vault.id, kind);
+        let result = crate::azure::key_vault::list_items(&auth, &vault, kind)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::KeyVaultItemsLoaded { key, result });
     });
 }
 

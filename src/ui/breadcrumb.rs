@@ -230,6 +230,17 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s.push("items".to_string());
             s
         }
+
+        View::KeyVaults => vec![subscription_segment(state), "key vaults".to_string()],
+
+        View::KeyVaultItems => {
+            let mut s = vec![subscription_segment(state), "key vaults".to_string()];
+            if let Some(v) = state.key_vault.selected_vault.as_ref() {
+                s.push(v.name.clone());
+            }
+            s.push(state.key_vault.items_kind.path_segment().to_string());
+            s
+        }
     }
 }
 

@@ -33,6 +33,10 @@ pub enum Category {
     /// chain. Reaches the item preview via Cosmos data-plane auth — see
     /// [`crate::azure::cosmos`].
     Cosmos,
+    /// Key Vaults and the secrets / certificates drill-in. Data-plane auth via
+    /// `https://vault.azure.net/.default`; metadata only — see
+    /// [`crate::azure::key_vault`].
+    KeyVaults,
 }
 
 impl Category {
@@ -44,6 +48,7 @@ impl Category {
         Category::Storage,
         Category::Registries,
         Category::Cosmos,
+        Category::KeyVaults,
     ];
 
     /// The top-level list view for this category — the screen the user lands
@@ -55,6 +60,7 @@ impl Category {
             Category::Storage => View::StorageAccounts,
             Category::Registries => View::Registries,
             Category::Cosmos => View::CosmosAccounts,
+            Category::KeyVaults => View::KeyVaults,
         }
     }
 
@@ -90,7 +96,7 @@ impl Category {
                     | View::CosmosDatabases
                     | View::CosmosContainers
                     | View::CosmosItem,
-            )
+            ) | (Category::KeyVaults, View::KeyVaults | View::KeyVaultItems,)
         )
     }
 
@@ -126,6 +132,9 @@ impl Category {
             Category::Cosmos => {
                 state.cosmos = CosmosCache::default();
             }
+            Category::KeyVaults => {
+                state.key_vault = KeyVaultCache::default();
+            }
         }
     }
 
@@ -138,6 +147,7 @@ impl Category {
             Category::Storage => state.storage.accounts_cursor = 0,
             Category::Registries => state.registry.registries_cursor = 0,
             Category::Cosmos => state.cosmos.accounts_cursor = 0,
+            Category::KeyVaults => state.key_vault.vaults_cursor = 0,
         }
     }
 
@@ -154,6 +164,7 @@ impl Category {
             Category::Storage => &["storage"],
             Category::Registries => &["registries", "reg", "acr"],
             Category::Cosmos => &["cosmos"],
+            Category::KeyVaults => &["keyvaults", "kv", "vaults"],
         }
     }
 }
@@ -245,6 +256,15 @@ pub enum View {
     /// selected gateway. Opened with Enter from `List` when the resource is
     /// `ResourceKind::AppGateway`.
     AppGatewayBackends,
+    /// Top-level "Key Vaults" mode entry point — lists vaults across the
+    /// selected subscriptions. Opened via the `:keyvaults` palette command
+    /// (no keybind — `V` is unused but reserved in case we want it later).
+    KeyVaults,
+    /// Metadata-only list of secrets *or* certificates inside the pinned
+    /// vault. Opened with Enter from `KeyVaults`. Data-plane call — requires
+    /// the signed-in identity to have a `list`-permitting role (RBAC) or
+    /// access policy on the vault. Press `s`/`c` to toggle between kinds.
+    KeyVaultItems,
     Help,
 }
 
@@ -710,6 +730,76 @@ impl CosmosCache {
     }
 }
 
+/// State for the Key Vault drill-in views. Two levels deep: vaults → items
+/// (secrets / certs / — keys deferred). Same per-key cache discipline as
+/// [`RegistryCache`]; the items map is keyed by `(vault_id, kind)` so the two
+/// kinds coexist in the cache and toggling `s`/`c` doesn't blow away the
+/// other side.
+#[derive(Clone, Default)]
+pub struct KeyVaultCache {
+    /// All Key Vaults discovered for the current subscription scope. Wrapped
+    /// in `Option` so the view can distinguish "never fetched" from "fetched
+    /// and empty".
+    pub vaults: Option<Vec<crate::azure::key_vault::KeyVault>>,
+    pub vaults_pending: bool,
+    pub vaults_error: Option<String>,
+    pub vaults_cursor: usize,
+    pub vaults_filter: Input,
+    pub vaults_filter_active: bool,
+    /// Pinned vault the user drilled into.
+    pub selected_vault: Option<crate::azure::key_vault::KeyVault>,
+
+    /// Which item kind the items view is currently showing for the pinned
+    /// vault. Toggled with `s` (secrets) / `c` (certificates).
+    pub items_kind: crate::azure::key_vault::ItemKind,
+
+    /// Keyed by `(vault_id, kind)` via [`Self::items_key`]. Holds both
+    /// secrets and certs simultaneously so the kind toggle is instant if the
+    /// other side is already cached.
+    pub items: HashMap<String, Vec<crate::azure::key_vault::KeyVaultItem>>,
+    pub items_pending: HashSet<String>,
+    pub items_error: HashMap<String, String>,
+    pub items_cursor: usize,
+    pub items_filter: Input,
+    pub items_filter_active: bool,
+}
+
+impl KeyVaultCache {
+    /// Cache key for the items map: `{vault_id}/{kind.path_segment()}`. The
+    /// kind segment is fixed-string (`secrets`/`certificates`) so the key is
+    /// stable across the toggle.
+    pub fn items_key(vault_id: &str, kind: crate::azure::key_vault::ItemKind) -> String {
+        format!("{vault_id}/{}", kind.path_segment())
+    }
+
+    /// Apply `vaults_filter` to `vaults` as a case-insensitive substring match
+    /// on the vault name. Empty filter passes everything through.
+    pub fn filtered_vaults(&self) -> Vec<&crate::azure::key_vault::KeyVault> {
+        let needle = self.vaults_filter.value().to_lowercase();
+        match self.vaults.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|v| needle.is_empty() || v.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `items_filter` to the items under `(vault_id, items_kind)` as a
+    /// case-insensitive substring match on the item name.
+    pub fn filtered_items(&self, vault_id: &str) -> Vec<&crate::azure::key_vault::KeyVaultItem> {
+        let needle = self.items_filter.value().to_lowercase();
+        let key = Self::items_key(vault_id, self.items_kind);
+        match self.items.get(&key) {
+            Some(rows) => rows
+                .iter()
+                .filter(|i| needle.is_empty() || i.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -792,6 +882,7 @@ pub struct AppState {
     pub storage: StorageCache,
     pub registry: RegistryCache,
     pub cosmos: CosmosCache,
+    pub key_vault: KeyVaultCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -875,6 +966,7 @@ impl AppState {
             storage: StorageCache::default(),
             registry: RegistryCache::default(),
             cosmos: CosmosCache::default(),
+            key_vault: KeyVaultCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -1018,6 +1110,8 @@ mod tests {
         assert_eq!(Category::of(View::CosmosDatabases), Some(Category::Cosmos));
         assert_eq!(Category::of(View::CosmosContainers), Some(Category::Cosmos));
         assert_eq!(Category::of(View::CosmosItem), Some(Category::Cosmos));
+        assert_eq!(Category::of(View::KeyVaults), Some(Category::KeyVaults));
+        assert_eq!(Category::of(View::KeyVaultItems), Some(Category::KeyVaults));
         // Subscriptions and Help are modal entry points — outside any chain.
         assert_eq!(Category::of(View::Subscriptions), None);
         assert_eq!(Category::of(View::Help), None);
@@ -1090,6 +1184,7 @@ mod tests {
         state.storage.accounts = Some(Vec::new());
         state.registry.registries = Some(Vec::new());
         state.cosmos.accounts = Some(Vec::new());
+        state.key_vault.vaults = Some(Vec::new());
 
         Category::Storage.clear_cache(&mut state);
         assert!(state.storage.accounts.is_none(), "storage cleared");
@@ -1104,6 +1199,10 @@ mod tests {
         assert!(
             state.cosmos.accounts.is_some(),
             "cosmos untouched by storage clear"
+        );
+        assert!(
+            state.key_vault.vaults.is_some(),
+            "key vaults untouched by storage clear"
         );
 
         Category::Registries.clear_cache(&mut state);
@@ -1123,6 +1222,13 @@ mod tests {
             !state.resources.is_empty(),
             "apis untouched by cosmos clear"
         );
+        assert!(
+            state.key_vault.vaults.is_some(),
+            "key vaults untouched by cosmos clear"
+        );
+
+        Category::KeyVaults.clear_cache(&mut state);
+        assert!(state.key_vault.vaults.is_none(), "key vaults cleared");
 
         Category::Apis.clear_cache(&mut state);
         assert!(state.resources.is_empty(), "apis cleared");
@@ -1145,6 +1251,11 @@ mod tests {
         assert!(
             Category::Cosmos.palette_aliases().contains(&"cosmos"),
             "Cosmos palette alias missing"
+        );
+        let kv = Category::KeyVaults.palette_aliases();
+        assert!(
+            kv.contains(&"keyvaults") && kv.contains(&"kv"),
+            "Key Vault palette aliases missing, got {kv:?}"
         );
     }
 
