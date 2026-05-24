@@ -37,6 +37,11 @@ pub enum Category {
     /// `https://vault.azure.net/.default`; metadata only — see
     /// [`crate::azure::key_vault`].
     KeyVaults,
+    /// Service Bus namespaces and the entities (queues / topics) → subscriptions
+    /// chain. Control-plane only — message and dead-letter counts come from the
+    /// ARM `countDetails` block, so `Reader` suffices. See
+    /// [`crate::azure::service_bus`].
+    ServiceBus,
 }
 
 impl Category {
@@ -49,6 +54,7 @@ impl Category {
         Category::Registries,
         Category::Cosmos,
         Category::KeyVaults,
+        Category::ServiceBus,
     ];
 
     /// The top-level list view for this category — the screen the user lands
@@ -61,6 +67,7 @@ impl Category {
             Category::Registries => View::Registries,
             Category::Cosmos => View::CosmosAccounts,
             Category::KeyVaults => View::KeyVaults,
+            Category::ServiceBus => View::ServiceBusNamespaces,
         }
     }
 
@@ -97,6 +104,12 @@ impl Category {
                     | View::CosmosContainers
                     | View::CosmosItem,
             ) | (Category::KeyVaults, View::KeyVaults | View::KeyVaultItems,)
+                | (
+                    Category::ServiceBus,
+                    View::ServiceBusNamespaces
+                        | View::ServiceBusEntities
+                        | View::ServiceBusSubscriptions,
+                )
         )
     }
 
@@ -135,6 +148,9 @@ impl Category {
             Category::KeyVaults => {
                 state.key_vault = KeyVaultCache::default();
             }
+            Category::ServiceBus => {
+                state.service_bus = ServiceBusCache::default();
+            }
         }
     }
 
@@ -148,6 +164,7 @@ impl Category {
             Category::Registries => state.registry.registries_cursor = 0,
             Category::Cosmos => state.cosmos.accounts_cursor = 0,
             Category::KeyVaults => state.key_vault.vaults_cursor = 0,
+            Category::ServiceBus => state.service_bus.namespaces_cursor = 0,
         }
     }
 
@@ -165,6 +182,7 @@ impl Category {
             Category::Registries => &["registries", "reg", "acr"],
             Category::Cosmos => &["cosmos"],
             Category::KeyVaults => &["keyvaults", "kv", "vaults"],
+            Category::ServiceBus => &["servicebus", "sb", "bus"],
         }
     }
 }
@@ -265,6 +283,18 @@ pub enum View {
     /// the signed-in identity to have a `list`-permitting role (RBAC) or
     /// access policy on the vault. Press `s`/`c` to toggle between kinds.
     KeyVaultItems,
+    /// Top-level "Service Bus" mode entry point — lists namespaces across the
+    /// selected subscriptions. Opened via the `:servicebus` / `:sb` palette
+    /// command (no keybind).
+    ServiceBusNamespaces,
+    /// Queues *or* topics inside the pinned namespace. Opened with Enter from
+    /// `ServiceBusNamespaces`. Control-plane call. Tab / Shift-Tab toggles
+    /// between queues and topics. Enter on a topic drills into
+    /// `ServiceBusSubscriptions`; queues are terminal.
+    ServiceBusEntities,
+    /// Subscriptions on the pinned topic, with their active / dead-letter
+    /// counts. Opened with Enter from `ServiceBusEntities` while viewing topics.
+    ServiceBusSubscriptions,
     Help,
 }
 
@@ -800,6 +830,124 @@ impl KeyVaultCache {
     }
 }
 
+/// State for the Service Bus drill-in views. Three levels: namespaces →
+/// entities (queues / topics, toggled with Tab) → subscriptions (topics only).
+/// Same per-key cache discipline as [`CosmosCache`]. Queues and topics share
+/// the `entities_cursor` / `entities_filter` (mirroring the Key Vault
+/// secrets/certs toggle) but live in separate maps because their row types
+/// differ. Everything is control-plane — no second auth tier.
+#[derive(Clone, Default)]
+pub struct ServiceBusCache {
+    /// All namespaces discovered for the current subscription scope. Wrapped in
+    /// `Option` so the view can distinguish "never fetched" from "fetched and
+    /// empty".
+    pub namespaces: Option<Vec<crate::azure::service_bus::ServiceBusNamespace>>,
+    pub namespaces_pending: bool,
+    pub namespaces_error: Option<String>,
+    pub namespaces_cursor: usize,
+    pub namespaces_filter: Input,
+    pub namespaces_filter_active: bool,
+    /// Pinned namespace the user drilled into.
+    pub selected_namespace: Option<crate::azure::service_bus::ServiceBusNamespace>,
+
+    /// Which entity kind the entities view is currently showing. Toggled with
+    /// Tab / Shift-Tab.
+    pub entity_kind: crate::azure::service_bus::EntityKind,
+    /// Shared cursor + filter across the queue and topic lists; reset on toggle.
+    pub entities_cursor: usize,
+    pub entities_filter: Input,
+    pub entities_filter_active: bool,
+
+    /// Queues keyed by namespace resource id.
+    pub queues: HashMap<String, Vec<crate::azure::service_bus::ServiceBusQueue>>,
+    pub queues_pending: HashSet<String>,
+    pub queues_error: HashMap<String, String>,
+
+    /// Topics keyed by namespace resource id.
+    pub topics: HashMap<String, Vec<crate::azure::service_bus::ServiceBusTopic>>,
+    pub topics_pending: HashSet<String>,
+    pub topics_error: HashMap<String, String>,
+
+    /// Pinned topic name the user drilled into (for the subscriptions view).
+    pub selected_topic: Option<String>,
+
+    /// Subscriptions keyed by `"{namespace_id}/{topic_name}"`.
+    pub subscriptions: HashMap<String, Vec<crate::azure::service_bus::ServiceBusSubscription>>,
+    pub subscriptions_pending: HashSet<String>,
+    pub subscriptions_error: HashMap<String, String>,
+    pub subscriptions_cursor: usize,
+    pub subscriptions_filter: Input,
+    pub subscriptions_filter_active: bool,
+}
+
+impl ServiceBusCache {
+    /// Cache key for the subscriptions map: `{namespace_id}/{topic}`.
+    pub fn subscriptions_key(namespace_id: &str, topic: &str) -> String {
+        format!("{namespace_id}/{topic}")
+    }
+
+    /// Apply `namespaces_filter` to `namespaces` as a case-insensitive
+    /// substring match on the namespace name. Empty filter passes everything.
+    pub fn filtered_namespaces(&self) -> Vec<&crate::azure::service_bus::ServiceBusNamespace> {
+        let needle = self.namespaces_filter.value().to_lowercase();
+        match self.namespaces.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|n| needle.is_empty() || n.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `entities_filter` to the queues under `namespace_id`.
+    pub fn filtered_queues(
+        &self,
+        namespace_id: &str,
+    ) -> Vec<&crate::azure::service_bus::ServiceBusQueue> {
+        let needle = self.entities_filter.value().to_lowercase();
+        match self.queues.get(namespace_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|q| needle.is_empty() || q.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `entities_filter` to the topics under `namespace_id`.
+    pub fn filtered_topics(
+        &self,
+        namespace_id: &str,
+    ) -> Vec<&crate::azure::service_bus::ServiceBusTopic> {
+        let needle = self.entities_filter.value().to_lowercase();
+        match self.topics.get(namespace_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|t| needle.is_empty() || t.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `subscriptions_filter` to the subscriptions under
+    /// `(namespace_id, topic)`.
+    pub fn filtered_subscriptions(
+        &self,
+        namespace_id: &str,
+        topic: &str,
+    ) -> Vec<&crate::azure::service_bus::ServiceBusSubscription> {
+        let needle = self.subscriptions_filter.value().to_lowercase();
+        let key = Self::subscriptions_key(namespace_id, topic);
+        match self.subscriptions.get(&key) {
+            Some(rows) => rows
+                .iter()
+                .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -883,6 +1031,7 @@ pub struct AppState {
     pub registry: RegistryCache,
     pub cosmos: CosmosCache,
     pub key_vault: KeyVaultCache,
+    pub service_bus: ServiceBusCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -967,6 +1116,7 @@ impl AppState {
             registry: RegistryCache::default(),
             cosmos: CosmosCache::default(),
             key_vault: KeyVaultCache::default(),
+            service_bus: ServiceBusCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -1112,6 +1262,18 @@ mod tests {
         assert_eq!(Category::of(View::CosmosItem), Some(Category::Cosmos));
         assert_eq!(Category::of(View::KeyVaults), Some(Category::KeyVaults));
         assert_eq!(Category::of(View::KeyVaultItems), Some(Category::KeyVaults));
+        assert_eq!(
+            Category::of(View::ServiceBusNamespaces),
+            Some(Category::ServiceBus)
+        );
+        assert_eq!(
+            Category::of(View::ServiceBusEntities),
+            Some(Category::ServiceBus)
+        );
+        assert_eq!(
+            Category::of(View::ServiceBusSubscriptions),
+            Some(Category::ServiceBus)
+        );
         // Subscriptions and Help are modal entry points — outside any chain.
         assert_eq!(Category::of(View::Subscriptions), None);
         assert_eq!(Category::of(View::Help), None);
@@ -1185,6 +1347,7 @@ mod tests {
         state.registry.registries = Some(Vec::new());
         state.cosmos.accounts = Some(Vec::new());
         state.key_vault.vaults = Some(Vec::new());
+        state.service_bus.namespaces = Some(Vec::new());
 
         Category::Storage.clear_cache(&mut state);
         assert!(state.storage.accounts.is_none(), "storage cleared");
@@ -1229,6 +1392,16 @@ mod tests {
 
         Category::KeyVaults.clear_cache(&mut state);
         assert!(state.key_vault.vaults.is_none(), "key vaults cleared");
+        assert!(
+            state.service_bus.namespaces.is_some(),
+            "service bus untouched by key vaults clear"
+        );
+
+        Category::ServiceBus.clear_cache(&mut state);
+        assert!(
+            state.service_bus.namespaces.is_none(),
+            "service bus cleared"
+        );
 
         Category::Apis.clear_cache(&mut state);
         assert!(state.resources.is_empty(), "apis cleared");

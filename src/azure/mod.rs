@@ -16,5 +16,6 @@ pub mod metrics;
 pub mod registries;
 pub mod resource_health;
 pub mod resources;
+pub mod service_bus;
 pub mod storage;
 pub mod subscriptions;

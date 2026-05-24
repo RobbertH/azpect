@@ -128,6 +128,19 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Service Bus (control plane)",
+        &[
+            (":servicebus / :sb", "enter service bus mode (palette only)"),
+            ("Enter", "drill: namespaces > queues/topics > subs"),
+            ("Tab / S-Tab", "toggle queues ↔ topics"),
+            ("DLQ", "dead-letter depth, red when non-zero"),
+            ("/", "filter by name (substring)"),
+            ("y", "yank id / entity / subscription"),
+            ("o", "open namespace in Azure Portal"),
+            ("r", "refresh current panel"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -146,6 +159,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (":registries / :reg / :acr", "enter registries mode"),
             (":cosmos", "enter cosmos mode"),
             (":keyvaults / :kv / :vaults", "enter key vault mode"),
+            (":servicebus / :sb / :bus", "enter service bus mode"),
             (":apis", "back to apis list"),
             (":subscriptions / :subs", "subscription picker"),
             (":help / :h / :?", "open help"),
@@ -268,7 +282,7 @@ mod tests {
         // right-column footers further down — bump backend height if you add
         // sections that grow either column past ~30 lines.
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(100, 40);
+        let backend = TestBackend::new(100, 60);
         let mut term = Terminal::new(backend).unwrap();
         let state = AppState::new(Config::default());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -277,6 +291,10 @@ mod tests {
         assert!(s.contains("Navigation"));
         assert!(s.contains("Global"));
         assert!(s.contains("Cosmos"), "Cosmos section should render");
+        assert!(
+            s.contains("Service Bus"),
+            "Service Bus section should render"
+        );
     }
 
     #[test]

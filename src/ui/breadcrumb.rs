@@ -241,6 +241,31 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s.push(state.key_vault.items_kind.path_segment().to_string());
             s
         }
+
+        View::ServiceBusNamespaces => {
+            vec![subscription_segment(state), "service bus".to_string()]
+        }
+
+        View::ServiceBusEntities => {
+            let mut s = vec![subscription_segment(state), "service bus".to_string()];
+            if let Some(ns) = state.service_bus.selected_namespace.as_ref() {
+                s.push(ns.name.clone());
+            }
+            s.push(state.service_bus.entity_kind.label().to_string());
+            s
+        }
+
+        View::ServiceBusSubscriptions => {
+            let mut s = vec![subscription_segment(state), "service bus".to_string()];
+            if let Some(ns) = state.service_bus.selected_namespace.as_ref() {
+                s.push(ns.name.clone());
+            }
+            if let Some(topic) = state.service_bus.selected_topic.as_deref() {
+                s.push(topic.to_string());
+            }
+            s.push("subscriptions".to_string());
+            s
+        }
     }
 }
 

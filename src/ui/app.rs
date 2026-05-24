@@ -417,6 +417,30 @@ async fn event_loop(
                     state.key_vault.items_cursor = 0;
                     continue;
                 }
+                if should_forward_to_sb_namespaces_filter(state, key) {
+                    state
+                        .service_bus
+                        .namespaces_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.service_bus.namespaces_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_sb_entities_filter(state, key) {
+                    state
+                        .service_bus
+                        .entities_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.service_bus.entities_cursor = 0;
+                    continue;
+                }
+                if should_forward_to_sb_subscriptions_filter(state, key) {
+                    state
+                        .service_bus
+                        .subscriptions_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.service_bus.subscriptions_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -825,6 +849,67 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::ServiceBusNamespacesLoaded(res) => {
+                state.service_bus.namespaces_pending = false;
+                match res {
+                    Ok(rows) => {
+                        state.service_bus.namespaces_error = None;
+                        if !rows.is_empty() && state.service_bus.namespaces_cursor >= rows.len() {
+                            state.service_bus.namespaces_cursor = rows.len() - 1;
+                        }
+                        state.service_bus.namespaces = Some(rows);
+                    }
+                    Err(e) => {
+                        state.service_bus.namespaces = None;
+                        state.service_bus.namespaces_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::ServiceBusQueuesLoaded {
+                namespace_id,
+                result,
+            } => {
+                state.service_bus.queues_pending.remove(&namespace_id);
+                match result {
+                    Ok(rows) => {
+                        state.service_bus.queues_error.remove(&namespace_id);
+                        state.service_bus.queues.insert(namespace_id, rows);
+                    }
+                    Err(e) => {
+                        state.service_bus.queues.remove(&namespace_id);
+                        state.service_bus.queues_error.insert(namespace_id, e);
+                    }
+                }
+            }
+            AppEvent::ServiceBusTopicsLoaded {
+                namespace_id,
+                result,
+            } => {
+                state.service_bus.topics_pending.remove(&namespace_id);
+                match result {
+                    Ok(rows) => {
+                        state.service_bus.topics_error.remove(&namespace_id);
+                        state.service_bus.topics.insert(namespace_id, rows);
+                    }
+                    Err(e) => {
+                        state.service_bus.topics.remove(&namespace_id);
+                        state.service_bus.topics_error.insert(namespace_id, e);
+                    }
+                }
+            }
+            AppEvent::ServiceBusSubscriptionsLoaded { key, result } => {
+                state.service_bus.subscriptions_pending.remove(&key);
+                match result {
+                    Ok(rows) => {
+                        state.service_bus.subscriptions_error.remove(&key);
+                        state.service_bus.subscriptions.insert(key, rows);
+                    }
+                    Err(e) => {
+                        state.service_bus.subscriptions.remove(&key);
+                        state.service_bus.subscriptions_error.insert(key, e);
+                    }
+                }
+            }
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -1142,6 +1227,58 @@ fn should_forward_to_key_vault_items_filter(
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the service-bus namespaces filter.
+fn should_forward_to_sb_namespaces_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::ServiceBusNamespaces
+        && state.service_bus.namespaces_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the service-bus entities filter
+/// (shared across the queues and topics lists).
+fn should_forward_to_sb_entities_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::ServiceBusEntities
+        && state.service_bus.entities_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the service-bus subscriptions filter.
+fn should_forward_to_sb_subscriptions_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::ServiceBusSubscriptions
+        && state.service_bus.subscriptions_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Palette commands that aren't tied to a [`Category`]. Subscriptions / help
 /// / quit / refresh are global so they sit here as a small static table;
 /// every other command flows through [`Category::palette_aliases`].
@@ -1328,7 +1465,11 @@ fn decide_action(
         || (state.view == View::CosmosDatabases && state.cosmos.databases_filter_active)
         || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active)
         || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
-        || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active);
+        || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
+        || (state.view == View::ServiceBusNamespaces && state.service_bus.namespaces_filter_active)
+        || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
+        || (state.view == View::ServiceBusSubscriptions
+            && state.service_bus.subscriptions_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1388,6 +1529,13 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::CosmosItem => crate::ui::views::cosmos_item::handle(action, state),
         View::KeyVaults => crate::ui::views::key_vaults::handle(action, state),
         View::KeyVaultItems => crate::ui::views::key_vault_items::handle(action, state),
+        View::ServiceBusNamespaces => {
+            crate::ui::views::service_bus_namespaces::handle(action, state)
+        }
+        View::ServiceBusEntities => crate::ui::views::service_bus_entities::handle(action, state),
+        View::ServiceBusSubscriptions => {
+            crate::ui::views::service_bus_subscriptions::handle(action, state)
+        }
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -1548,6 +1696,19 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_vault
             .as_ref()
             .map(|v| format!("{PORTAL_BASE}{}", v.id)),
+        // Service Bus views land on the namespace overview blade; the portal
+        // exposes queues / topics / subscriptions from the side nav there. The
+        // cursor indexes into the *filtered* view so `o` follows the screen.
+        View::ServiceBusNamespaces => state
+            .service_bus
+            .filtered_namespaces()
+            .get(state.service_bus.namespaces_cursor)
+            .map(|n| format!("{PORTAL_BASE}{}", n.id)),
+        View::ServiceBusEntities | View::ServiceBusSubscriptions => state
+            .service_bus
+            .selected_namespace
+            .as_ref()
+            .map(|n| format!("{PORTAL_BASE}{}", n.id)),
         View::Help => None,
     }
 }
@@ -1671,6 +1832,25 @@ fn yank_target(state: &AppState) -> Option<String> {
             let vault = state.key_vault.selected_vault.as_ref()?;
             Some(vault.id.clone())
         }),
+        View::ServiceBusNamespaces => state
+            .service_bus
+            .filtered_namespaces()
+            .get(state.service_bus.namespaces_cursor)
+            .map(|n| n.id.clone()),
+        View::ServiceBusEntities => {
+            let ns = state.service_bus.selected_namespace.as_ref()?;
+            crate::ui::views::service_bus_entities::yank_text(state)
+                .map(|name| format!("{}/{}", ns.name, name))
+        }
+        View::ServiceBusSubscriptions => {
+            let ns = state.service_bus.selected_namespace.as_ref()?;
+            let topic = state.service_bus.selected_topic.as_deref()?;
+            state
+                .service_bus
+                .filtered_subscriptions(&ns.id, topic)
+                .get(state.service_bus.subscriptions_cursor)
+                .map(|s| format!("{}/{}/{}", ns.name, topic, s.name))
+        }
         View::Help => None,
     }
 }
@@ -1788,6 +1968,9 @@ fn semantic_parent(view: View) -> Option<View> {
         View::CosmosItem => Some(View::CosmosContainers),
         View::KeyVaults => Some(View::Subscriptions),
         View::KeyVaultItems => Some(View::KeyVaults),
+        View::ServiceBusNamespaces => Some(View::Subscriptions),
+        View::ServiceBusEntities => Some(View::ServiceBusNamespaces),
+        View::ServiceBusSubscriptions => Some(View::ServiceBusEntities),
     }
 }
 
@@ -1809,7 +1992,13 @@ fn after_action(
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
-        | Action::ToggleErrorsOnly => {
+        | Action::ToggleErrorsOnly
+        // NextPanel / PrevPanel toggle a sub-kind in place (Key Vault
+        // secrets↔certs, Service Bus queues↔topics). Kick off a load so the
+        // newly-selected kind fetches without an extra `r`; the per-key
+        // debounce in `kick_off_loads_for_view` makes it a no-op when cached.
+        | Action::NextPanel
+        | Action::PrevPanel => {
             kick_off_loads_for_view(state, auth, tx, /* force */ false);
         }
         _ => {}
@@ -2199,6 +2388,71 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::ServiceBusNamespaces => {
+            let cached = state.service_bus.namespaces.is_some();
+            let in_flight = state.service_bus.namespaces_pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.service_bus.namespaces = None;
+                    state.service_bus.namespaces_error = None;
+                }
+                state.service_bus.namespaces_pending = true;
+                spawn_load_sb_namespaces(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::ServiceBusEntities => {
+            if let Some(ns) = state.service_bus.selected_namespace.clone() {
+                // The active toggle decides whether we fetch queues or topics.
+                match state.service_bus.entity_kind {
+                    crate::azure::service_bus::EntityKind::Queue => {
+                        let cached = state.service_bus.queues.contains_key(&ns.id);
+                        let in_flight = state.service_bus.queues_pending.contains(&ns.id);
+                        if force || (!cached && !in_flight) {
+                            if force {
+                                state.service_bus.queues.remove(&ns.id);
+                                state.service_bus.queues_error.remove(&ns.id);
+                            }
+                            state.service_bus.queues_pending.insert(ns.id.clone());
+                            spawn_load_sb_queues(auth.clone(), ns, tx.clone());
+                        }
+                    }
+                    crate::azure::service_bus::EntityKind::Topic => {
+                        let cached = state.service_bus.topics.contains_key(&ns.id);
+                        let in_flight = state.service_bus.topics_pending.contains(&ns.id);
+                        if force || (!cached && !in_flight) {
+                            if force {
+                                state.service_bus.topics.remove(&ns.id);
+                                state.service_bus.topics_error.remove(&ns.id);
+                            }
+                            state.service_bus.topics_pending.insert(ns.id.clone());
+                            spawn_load_sb_topics(auth.clone(), ns, tx.clone());
+                        }
+                    }
+                }
+            }
+        }
+        View::ServiceBusSubscriptions => {
+            if let (Some(ns), Some(topic)) = (
+                state.service_bus.selected_namespace.clone(),
+                state.service_bus.selected_topic.clone(),
+            ) {
+                let key = crate::ui::state::ServiceBusCache::subscriptions_key(&ns.id, &topic);
+                let cached = state.service_bus.subscriptions.contains_key(&key);
+                let in_flight = state.service_bus.subscriptions_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.service_bus.subscriptions.remove(&key);
+                        state.service_bus.subscriptions_error.remove(&key);
+                    }
+                    state.service_bus.subscriptions_pending.insert(key);
+                    spawn_load_sb_subscriptions(auth.clone(), ns, topic, tx.clone());
+                }
+            }
+        }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
     }
@@ -2323,6 +2577,15 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::KeyVaults => crate::ui::views::key_vaults::render(f, view_area, state, theme),
         View::KeyVaultItems => {
             crate::ui::views::key_vault_items::render(f, view_area, state, theme)
+        }
+        View::ServiceBusNamespaces => {
+            crate::ui::views::service_bus_namespaces::render(f, view_area, state, theme)
+        }
+        View::ServiceBusEntities => {
+            crate::ui::views::service_bus_entities::render(f, view_area, state, theme)
+        }
+        View::ServiceBusSubscriptions => {
+            crate::ui::views::service_bus_subscriptions::render(f, view_area, state, theme)
         }
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
@@ -3214,6 +3477,64 @@ fn spawn_load_key_vault_items(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::KeyVaultItemsLoaded { key, result });
+    });
+}
+
+fn spawn_load_sb_namespaces(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::service_bus::list_namespaces(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded(result));
+    });
+}
+
+fn spawn_load_sb_queues(
+    auth: AzureAuth,
+    namespace: crate::azure::service_bus::ServiceBusNamespace,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let namespace_id = namespace.id.clone();
+        let result = crate::azure::service_bus::list_queues(&auth, &namespace)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ServiceBusQueuesLoaded {
+            namespace_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_sb_topics(
+    auth: AzureAuth,
+    namespace: crate::azure::service_bus::ServiceBusNamespace,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let namespace_id = namespace.id.clone();
+        let result = crate::azure::service_bus::list_topics(&auth, &namespace)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ServiceBusTopicsLoaded {
+            namespace_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_sb_subscriptions(
+    auth: AzureAuth,
+    namespace: crate::azure::service_bus::ServiceBusNamespace,
+    topic: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let key = crate::ui::state::ServiceBusCache::subscriptions_key(&namespace.id, &topic);
+        let result = crate::azure::service_bus::list_subscriptions(&auth, &namespace, &topic)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ServiceBusSubscriptionsLoaded { key, result });
     });
 }
 

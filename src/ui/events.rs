@@ -171,6 +171,28 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::key_vault::KeyVaultItem>, String>,
     },
+    /// Background load completion: list of Service Bus namespaces for the
+    /// current subscription scope. Resource Graph control-plane call.
+    ServiceBusNamespacesLoaded(Result<Vec<crate::azure::service_bus::ServiceBusNamespace>, String>),
+    /// Background load completion: list of queues inside one namespace, keyed
+    /// by namespace ARM id.
+    ServiceBusQueuesLoaded {
+        namespace_id: String,
+        result: Result<Vec<crate::azure::service_bus::ServiceBusQueue>, String>,
+    },
+    /// Background load completion: list of topics inside one namespace, keyed
+    /// by namespace ARM id.
+    ServiceBusTopicsLoaded {
+        namespace_id: String,
+        result: Result<Vec<crate::azure::service_bus::ServiceBusTopic>, String>,
+    },
+    /// Background load completion: list of subscriptions on one topic. `key` is
+    /// the `(namespace_id, topic)` pair flattened by
+    /// [`crate::ui::state::ServiceBusCache::subscriptions_key`].
+    ServiceBusSubscriptionsLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::service_bus::ServiceBusSubscription>, String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →

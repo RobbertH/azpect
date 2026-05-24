@@ -2,13 +2,17 @@
 //!
 //! ## Contract (do not change without coordinating with all lanes)
 //!
-//! - `AzureAuth::new()` resolves a credential chain (env → workload identity →
-//!   managed identity → Azure CLI → Azure PowerShell → azd). It must succeed if
-//!   *any* link in the chain produces a usable credential; the failure error
-//!   should explain which links were tried.
+//! - `AzureAuth::new()` resolves a credential chain. In `azure_identity` 0.27
+//!   that chain is the Azure CLI (`az`) followed by the Azure Developer CLI
+//!   (`azd`) — there is no managed-identity / IMDS probe link. It must succeed
+//!   if *any* link produces a usable credential.
 //! - `AzureAuth::token(scope)` returns a fresh bearer (no `Bearer ` prefix) for
 //!   the requested OAuth scope. The result is cached per scope and refreshed
-//!   when within `REFRESH_BEFORE_EXPIRY` of expiry.
+//!   when within `REFRESH_BEFORE_EXPIRY` of expiry. The underlying credential
+//!   shells out to `az account get-access-token`, which has no timeout of its
+//!   own — so this method bounds it with [`TOKEN_ACQUISITION_TIMEOUT`]. A hung
+//!   `az` then surfaces as an error (and the in-app login modal) instead of an
+//!   indefinite hang on the subscriptions screen.
 //! - Tokens MUST NOT appear in tracing output at any level. Use `Debug` impls
 //!   carefully.
 
@@ -54,6 +58,17 @@ pub const SCOPE_KEY_VAULT: &str = "https://vault.azure.net/.default";
 
 /// Refresh tokens this far before their stated expiry.
 pub const REFRESH_BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on a single token acquisition. The Azure CLI credential shells
+/// out to `az account get-access-token`, which can hang indefinitely (e.g. a
+/// stale session that needs `az login`, or a blocked AAD round-trip — a common
+/// case is broken IPv6, where the AAD endpoint resolves to an unroutable v6
+/// address and the connect never completes) rather than erroring promptly.
+/// Without this bound the app sits forever on "loading subscriptions…"; with
+/// it, a hung `az` becomes a clean error that drives the in-app login modal. A
+/// healthy `az` returns in well under a second, so 10s is ample headroom for a
+/// slow-but-working CLI cold start while still failing fast.
+pub const TOKEN_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A token with its absolute expiry. Cached per-scope inside [`AzureAuth`].
 #[derive(Clone)]
@@ -129,10 +144,28 @@ impl AzureAuth {
         }
 
         // Slow path: request a new token. Do this without holding any lock so
-        // concurrent requests for *different* scopes aren't serialized.
-        let access_token = self.credential.get_token(&[scope], None).await.context(
-            "failed to acquire Azure access token; try `az login` or check your environment",
-        )?;
+        // concurrent requests for *different* scopes aren't serialized. Bound
+        // the call so a hung `az account get-access-token` can't wedge the UI
+        // indefinitely — see [`TOKEN_ACQUISITION_TIMEOUT`].
+        let access_token = match tokio::time::timeout(
+            TOKEN_ACQUISITION_TIMEOUT,
+            self.credential.get_token(&[scope], None),
+        )
+        .await
+        {
+            Ok(result) => result.context(
+                "failed to acquire Azure access token; try `az login` or check your environment",
+            )?,
+            Err(_elapsed) => {
+                return Err(anyhow!(
+                    "timed out after {}s acquiring an Azure access token. The Azure CLI \
+                         (`az account get-access-token`) did not respond — it may be hanging or \
+                         need re-authentication. Try `az login` (or `az account clear` then \
+                         `az login`).",
+                    TOKEN_ACQUISITION_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         let token_string = access_token.token.secret().to_string();
         let expires_at = offset_datetime_to_chrono(access_token.expires_on);
