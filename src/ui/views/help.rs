@@ -62,9 +62,10 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Application Gateway",
         &[
             ("Enter", "show backend pools and their members"),
-            ("y", "yank gateway id / FQDN / IP / NIC id"),
+            ("H", "toggle live backend health (per-server probe)"),
+            ("y", "yank gateway id / FQDN / IP / NIC id / probe log"),
             ("o", "open gateway in Azure Portal"),
-            ("r", "refresh backend pools"),
+            ("r", "refresh backend pools / re-probe health"),
         ],
     ),
     (

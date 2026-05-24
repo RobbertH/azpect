@@ -626,6 +626,22 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::AppGatewayHealthLoaded {
+                resource_id,
+                result,
+            } => {
+                state.appgw.health_pending.remove(&resource_id);
+                match result {
+                    Ok(health) => {
+                        state.appgw.health_error.remove(&resource_id);
+                        state.appgw.health.insert(resource_id, health);
+                    }
+                    Err(e) => {
+                        state.appgw.health.remove(&resource_id);
+                        state.appgw.health_error.insert(resource_id, e);
+                    }
+                }
+            }
             AppEvent::StorageAccountsLoaded(res) => {
                 state.storage.accounts_pending = false;
                 match res {
@@ -1812,6 +1828,11 @@ fn after_action(
         | Action::ToggleErrorsOnly => {
             kick_off_loads_for_view(state, auth, tx, /* force */ false);
         }
+        // The view handler already flipped `show_health`; now make sure the
+        // data for the mode we just switched into is loading.
+        Action::ToggleBackendHealth => {
+            kick_off_loads_for_view(state, auth, tx, /* force */ false);
+        }
         _ => {}
     }
 }
@@ -1950,7 +1971,22 @@ fn kick_off_loads_for_view(
                         state.appgw.pools_error.remove(&gw_id);
                     }
                     state.appgw.pools_pending.insert(gw_id.clone());
-                    spawn_load_appgw_backends(auth.clone(), gw_id, tx.clone());
+                    spawn_load_appgw_backends(auth.clone(), gw_id.clone(), tx.clone());
+                }
+                // Live backend health is only fetched while the view is
+                // actually showing it — it's an async ARM operation (POST +
+                // poll), so we don't pay for it on plain config-view drill-in.
+                if state.appgw.show_health {
+                    let h_cached = state.appgw.health.contains_key(&gw_id);
+                    let h_in_flight = state.appgw.health_pending.contains(&gw_id);
+                    if force || (!h_cached && !h_in_flight) {
+                        if force {
+                            state.appgw.health.remove(&gw_id);
+                            state.appgw.health_error.remove(&gw_id);
+                        }
+                        state.appgw.health_pending.insert(gw_id.clone());
+                        spawn_load_appgw_health(auth.clone(), gw_id, tx.clone());
+                    }
                 }
             }
         }
@@ -2999,6 +3035,18 @@ fn spawn_load_appgw_backends(auth: AzureAuth, resource_id: String, tx: Unbounded
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::AppGatewayBackendsLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_appgw_health(auth: AzureAuth, resource_id: String, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::appgw_health::fetch_backend_health(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::AppGatewayHealthLoaded {
             resource_id,
             result,
         });

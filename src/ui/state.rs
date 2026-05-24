@@ -394,6 +394,18 @@ pub struct AppGatewayBackendsCache {
     /// rows + member rows interleaved). Lives here so it survives refresh /
     /// re-entry.
     pub cursor: usize,
+    /// Live backend health (per probed server), keyed by gateway resource id.
+    /// Populated lazily when the user toggles into health mode — it's an
+    /// async ARM operation, so we don't pay for it on plain drill-in.
+    pub health: HashMap<String, Vec<crate::azure::appgw_health::PoolHealth>>,
+    pub health_pending: HashSet<String>,
+    pub health_error: HashMap<String, String>,
+    /// Which mode the backends view is rendering: `false` = the configured
+    /// pool/member listing, `true` = live health. Toggled with `H`.
+    pub show_health: bool,
+    /// Separate cursor for health mode (its flattened row list differs from the
+    /// config view's), so toggling back and forth doesn't land on a stale row.
+    pub health_cursor: usize,
 }
 
 /// State for the Storage drill-in views. Mirrors `ApimCache`: each level of

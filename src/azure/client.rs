@@ -168,6 +168,30 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("request failed after retries")))
 }
 
+/// A raw ARM response: status + headers + parsed JSON body. Returned by the
+/// `*_raw` methods used to drive asynchronous (long-running) ARM operations,
+/// where the caller has to inspect the status code (200 vs 202) and the
+/// `Location` / `Azure-AsyncOperation` headers rather than just the body.
+pub struct ArmRaw {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    /// Parsed JSON body, or `Null` when the response had no body (common on a
+    /// bare 202 Accepted).
+    pub body: serde_json::Value,
+}
+
+impl ArmRaw {
+    /// Value of a response header as a string, lowercased lookup. Used to pull
+    /// the LRO poll URLs (`location`, `azure-asyncoperation`) which Azure may
+    /// emit with varying header-name casing.
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+}
+
 impl ArmClient {
     pub fn new(auth: AzureAuth) -> anyhow::Result<Self> {
         Ok(Self {
@@ -207,13 +231,86 @@ impl ArmClient {
         })
         .await
     }
+
+    /// `POST https://management.azure.com{path}` returning status + headers +
+    /// body. Unlike [`post`], this does not collapse the response into the
+    /// body — the caller needs the status (200 vs 202) and headers to drive an
+    /// async ARM operation (e.g. Application Gateway `/backendhealth`).
+    pub async fn post_raw(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        body: &serde_json::Value,
+    ) -> anyhow::Result<ArmRaw> {
+        let url = format!("{ARM_BASE}{path}");
+        let query_owned: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let body_owned = body.clone();
+        let resp = send_bytes_with_retry(
+            &self.http,
+            &self.auth,
+            SCOPE_ARM,
+            |http| {
+                http.request(Method::POST, &url)
+                    .query(&query_owned)
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&body_owned)
+            },
+            |headers| {
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            },
+        )
+        .await?;
+        into_arm_raw(resp)
+    }
+
+    /// `GET {url}` against an already-fully-qualified ARM URL (e.g. the
+    /// `Location` header handed back by an async operation, which arrives
+    /// absolute and pre-loaded with its own `api-version`). Returns status +
+    /// headers + body so the caller can decide whether the operation is still
+    /// running (202) or done (200).
+    pub async fn get_url_raw(&self, url: &str) -> anyhow::Result<ArmRaw> {
+        let url_owned = url.to_string();
+        let resp = send_bytes_with_retry(
+            &self.http,
+            &self.auth,
+            SCOPE_ARM,
+            |http| http.request(Method::GET, &url_owned),
+            |headers| {
+                headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            },
+        )
+        .await?;
+        into_arm_raw(resp)
+    }
+}
+
+/// Parse a [`BytesResponse`] into an [`ArmRaw`], decoding the body as JSON
+/// (empty body → `Null`, which is the normal shape of a bare 202).
+fn into_arm_raw(resp: BytesResponse) -> anyhow::Result<ArmRaw> {
+    let body = if resp.body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&resp.body).map_err(|e| anyhow!("parse json: {e}"))?
+    };
+    Ok(ArmRaw {
+        status: resp.status,
+        headers: resp.headers,
+        body,
+    })
 }
 
 /// Outcome of a successful blob data-plane request.
 ///
 /// Returned by [`send_bytes_with_retry`]. The `headers` map is always present
-/// (HEAD responses use it exclusively); `body` is empty for HEAD.
+/// (HEAD responses use it exclusively); `body` is empty for HEAD. `status` is
+/// the 2xx code that ended the retry loop — callers driving async ARM
+/// operations need it to tell `200 OK` (result inline) from `202 Accepted`
+/// (poll the `Location`/`Azure-AsyncOperation` header).
 pub struct BytesResponse {
+    pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
@@ -277,6 +374,7 @@ where
             let headers = resp.headers().clone();
             let bytes = resp.bytes().await.map_err(|e| anyhow!("read body: {e}"))?;
             return Ok(BytesResponse {
+                status,
                 headers,
                 body: bytes.to_vec(),
             });

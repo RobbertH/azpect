@@ -10,10 +10,10 @@
 //! extra ARM lookups per pool — only their `nic / ipconfig` names are surfaced
 //! so the user can see what's wired up.
 //!
-//! TODO: backend health. The `/backendhealth` endpoint is async (POST returns
-//! 202 plus a Location header pointing at a long-running operation that has to
-//! be polled) and the user explicitly asked for "what is it hooked up to", not
-//! health — so v1 skips it.
+//! Backend *health* (live per-server probe verdicts) lives in the sibling
+//! [`crate::azure::appgw_health`] module: it's an async ARM operation (POST
+//! `/backendhealth` → 202 + a polled long-running operation), so it's kept
+//! separate and fetched lazily when the user toggles the view into health mode.
 
 #![allow(dead_code)]
 

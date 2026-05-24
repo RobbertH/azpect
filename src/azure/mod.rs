@@ -2,6 +2,7 @@
 
 pub mod apim;
 pub mod appgw_backends;
+pub mod appgw_health;
 pub mod auth;
 pub mod az_login;
 pub mod client;

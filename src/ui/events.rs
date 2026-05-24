@@ -92,6 +92,14 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<Vec<crate::azure::appgw_backends::BackendPool>, String>,
     },
+    /// Background load completion: live backend *health* (per-server probe
+    /// verdicts) for one Application Gateway, keyed by gateway resource id.
+    /// Driven by the async `/backendhealth` operation, so this can land several
+    /// seconds after the toggle.
+    AppGatewayHealthLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::appgw_health::PoolHealth>, String>,
+    },
     /// Background load completion: list of storage accounts for the current
     /// subscription scope.
     StorageAccountsLoaded(Result<Vec<crate::azure::storage::StorageAccount>, String>),
@@ -208,6 +216,10 @@ pub enum Action {
     /// Open the top-level Container Registries mode. Bound to `R` (capital so
     /// it doesn't collide with `r` = refresh).
     OpenRegistries,
+    /// Toggle the Application Gateway backends view between the configured
+    /// pool/member listing and live backend health. Bound to `H`; a no-op in
+    /// every other view.
+    ToggleBackendHealth,
     Refresh,
     SetWindowHour,
     SetWindowDay,
@@ -320,6 +332,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('s') => Action::SwitchSubscription,
         KeyCode::Char('S') => Action::OpenStorage,
         KeyCode::Char('R') => Action::OpenRegistries,
+        KeyCode::Char('H') => Action::ToggleBackendHealth,
         KeyCode::Char('r') => Action::Refresh,
         // Digit-keyed time-range shortcuts, grouped numerically:
         // `0` → 1h (less than a day), `1` → 1d, `7` → 7d (a week).
