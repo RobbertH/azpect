@@ -140,9 +140,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let widths = [
                 Constraint::Length(name_w), // NAME
                 Constraint::Min(20),        // PARTITION KEY
+                Constraint::Length(7),      // PK KIND
+                Constraint::Length(10),     // INDEXING
                 Constraint::Length(8),      // TTL
             ];
-            let header_row = Row::new(vec!["CONTAINER", "PARTITION KEY", "TTL"]).style(
+            let header_row = Row::new(vec![
+                "CONTAINER",
+                "PARTITION KEY",
+                "PK KIND",
+                "INDEXING",
+                "TTL",
+            ])
+            .style(
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
@@ -156,10 +165,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     } else {
                         c.partition_key_paths.join(", ")
                     };
+                    let pk_kind = c.partition_key_kind.as_deref().unwrap_or("—").to_string();
+                    let indexing = c.indexing_mode.as_deref().unwrap_or("—").to_string();
                     let ttl = format_ttl(c.default_ttl);
                     Row::new(vec![
                         Cell::from(c.name.as_str()).style(Style::default().fg(theme.fg)),
                         Cell::from(pk).style(Style::default().fg(theme.muted)),
+                        Cell::from(pk_kind).style(Style::default().fg(theme.muted)),
+                        Cell::from(indexing).style(Style::default().fg(theme.muted)),
                         Cell::from(ttl).style(Style::default().fg(theme.muted)),
                     ])
                 })
@@ -349,6 +362,8 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("items"));
         assert!(buf.contains("/userId"));
+        assert!(buf.contains("Hash"));
+        assert!(buf.contains("consistent"));
         assert!(buf.contains("3600s"));
     }
 
