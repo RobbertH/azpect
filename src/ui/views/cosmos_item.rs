@@ -1,5 +1,5 @@
 //! Cosmos DB item preview panel. Reached from [`super::cosmos_containers`] via
-//! Enter. Runs `SELECT TOP 20 * FROM c` against the pinned container and
+//! Enter. Runs `SELECT * FROM c` (first 20 rows) against the pinned container and
 //! renders the rows as pretty-printed JSON in a scrollable `Paragraph`. The
 //! request charge (`x-ms-request-charge`) is surfaced in the title bar so the
 //! user can see the exploratory read cost at a glance.
@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Title surfaces the SELECT and the RU charge so the cost of the
     // exploratory read is visible at a glance.
     let title = if let Some(p) = preview {
-        let mut t = format!(" SELECT TOP 20 · {} rows", p.items.len());
+        let mut t = format!(" SELECT * · {} rows", p.items.len());
         if let Some(ru) = p.request_charge {
             t.push_str(&format!(" · {ru:.2} RU"));
         }
@@ -122,16 +122,20 @@ fn render_items(
     theme: &Theme,
 ) {
     let text = format_items_text(&preview.items);
-    let lines: Vec<Line> = text
-        .lines()
+    let all: Vec<&str> = text.lines().collect();
+    let view_h = area.height.max(1) as usize;
+    // Slice to just the visible window and render with no scroll offset. Handing
+    // ratatui a large `.scroll()` offset makes its `Paragraph` word-wrap every
+    // line above the window on every frame (cost ∝ offset), which pegged a CPU
+    // when scrolling up from `G`. Slicing keeps render cost O(viewport).
+    let max_scroll = all.len().saturating_sub(view_h);
+    let start = (scroll as usize).min(max_scroll);
+    let end = (start + view_h).min(all.len());
+    let lines: Vec<Line> = all[start..end]
+        .iter()
         .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg))))
         .collect();
-    let total = lines.len() as u16;
-    let max_scroll = total.saturating_sub(area.height.max(1).saturating_sub(1));
-    let clamped = scroll.min(max_scroll);
-    let p = Paragraph::new(lines)
-        .scroll((clamped, 0))
-        .wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 }
 

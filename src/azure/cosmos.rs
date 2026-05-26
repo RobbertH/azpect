@@ -14,7 +14,8 @@
 //!   (collections) under one database, including partition key + indexing mode
 //!   + default TTL from `properties.resource`.
 //! - [`query_top_items`] — Cosmos **data plane** `POST /dbs/{db}/colls/{coll}/docs`
-//!   running `SELECT TOP 20 * FROM c`. Requires the signed-in identity to have
+//!   running `SELECT * FROM c` capped to 20 rows via `x-ms-max-item-count`.
+//!   Requires the signed-in identity to have
 //!   the `Cosmos DB Built-in Data Reader` role assigned at the account scope
 //!   via `dataPlaneRoleDefinitions` — control-plane `Reader` is NOT enough.
 //!
@@ -33,8 +34,9 @@
 //!   per the Cosmos REST docs).
 //! - **Read-only**: account list + database list + container list + item query
 //!   only. No item write / DDL / throughput-change codepaths, even stubs.
-//! - **Item preview cap**: `SELECT TOP 20`; we don't follow `x-ms-continuation`
-//!   even if it appears — the UI sets `partial = true` and shows a warning.
+//! - **Item preview cap**: first page of `x-ms-max-item-count: 20`; we don't
+//!   follow `x-ms-continuation` even if it appears — the UI sets `partial =
+//!   true` and shows a warning.
 
 #![allow(dead_code, unused_variables)]
 
@@ -143,12 +145,15 @@ Resources
 | order by name asc
 "#;
 
-/// API version used for both `sqlDatabases` and `containers` endpoints.
+/// ARM control-plane API version for the `sqlDatabases`/`containers` endpoints.
 const COSMOS_API_VERSION: &str = "2024-05-15";
 
-/// Max items returned by `query_top_items`. We embed it in the SQL (`SELECT
-/// TOP N`) AND pass it as `x-ms-max-item-count` so the server caps the page
-/// regardless of statement.
+/// Cosmos data-plane REST API version (`x-ms-version`); distinct from the
+/// control-plane [`COSMOS_API_VERSION`].
+const COSMOS_DATA_PLANE_VERSION: &str = "2020-07-15";
+
+/// Max items returned by `query_top_items`, sent as `x-ms-max-item-count`
+/// (not `SELECT TOP N` — see the note in `query_top_items`).
 const MAX_ITEMS_PREVIEW: usize = 20;
 
 // ---------------------------------------------------------------------------
@@ -224,8 +229,9 @@ pub async fn list_containers(
     Ok(parse_containers_json(&resp))
 }
 
-/// Run `SELECT TOP {MAX_ITEMS_PREVIEW} * FROM c` against `coll_name` in
-/// `db_name`. Data-plane call — requires the identity to have
+/// Run `SELECT * FROM c` against `coll_name` in `db_name`, capped to
+/// [`MAX_ITEMS_PREVIEW`] rows via `x-ms-max-item-count` (the first page only).
+/// Data-plane call — requires the identity to have
 /// `Cosmos DB Built-in Data Reader` (or stronger) at the account scope.
 pub async fn query_top_items(
     auth: &AzureAuth,
@@ -261,7 +267,10 @@ pub async fn query_top_items(
         CONTENT_TYPE,
         HeaderValue::from_static("application/query+json"),
     );
-    headers.insert("x-ms-version", HeaderValue::from_static("2018-12-31"));
+    headers.insert(
+        "x-ms-version",
+        HeaderValue::from_static(COSMOS_DATA_PLANE_VERSION),
+    );
     headers.insert(
         "x-ms-date",
         HeaderValue::from_str(&rfc1123_now())
@@ -277,8 +286,10 @@ pub async fn query_top_items(
         HeaderValue::from_str(&MAX_ITEMS_PREVIEW.to_string()).unwrap(),
     );
 
+    // No `TOP N`: it makes a multi-partition query un-servable by the gateway
+    // (400 + query plan). `x-ms-max-item-count` caps the first page instead.
     let body = serde_json::json!({
-        "query": format!("SELECT TOP {MAX_ITEMS_PREVIEW} * FROM c"),
+        "query": "SELECT * FROM c",
         "parameters": [],
     });
 
