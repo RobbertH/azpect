@@ -10,6 +10,7 @@ pub mod cosmos_containers;
 pub mod cosmos_databases;
 pub mod cosmos_item;
 pub mod detail;
+pub mod env_vars;
 pub mod help;
 pub mod key_vault_items;
 pub mod key_vaults;

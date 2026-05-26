@@ -56,6 +56,13 @@ pub const SCOPE_COSMOS: &str = "https://cosmos.azure.com/.default";
 /// one of the older services that uses a host-form audience.
 pub const SCOPE_KEY_VAULT: &str = "https://vault.azure.net/.default";
 
+/// OAuth scope for Microsoft Graph (`graph.microsoft.com`). Used best-effort to
+/// resolve `systemData` author object-ids (service principals / managed
+/// identities) to display names. The signed-in identity needs directory read
+/// (e.g. `Directory.Read.All` / `Application.Read.All`); azpect degrades to
+/// showing the raw object-id when the token or permission is unavailable.
+pub const SCOPE_GRAPH: &str = "https://graph.microsoft.com/.default";
+
 /// Refresh tokens this far before their stated expiry.
 pub const REFRESH_BEFORE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(60);
 

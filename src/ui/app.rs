@@ -175,6 +175,11 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     let mut input = InputState::default();
 
+    // The app now lands directly on a resource list (no subscription gate), so
+    // kick off that view's load once up front — loads are otherwise only driven
+    // by user actions, which would leave the initial screen stuck on "loading".
+    kick_off_loads_for_view(state, auth, tx, /* force */ false);
+
     loop {
         terminal.draw(|f| dispatch_view(f, f.area(), state, theme))?;
 
@@ -462,10 +467,9 @@ async fn event_loop(
                         }
                         // No subs visible to this credential is almost always
                         // an auth/tenant problem — surface the login modal.
-                        if was_empty
-                            && state.view == View::Subscriptions
-                            && state.auth_prompt == AuthPrompt::Hidden
-                        {
+                        // (Checked regardless of view now that the app lands on
+                        // the resource list rather than the subscription gate.)
+                        if was_empty && state.auth_prompt == AuthPrompt::Hidden {
                             open_auth_prompt(state, None);
                         }
                     }
@@ -474,9 +478,7 @@ async fn event_loop(
                         state.set_status(format!("subscriptions: {msg}"));
                         // Same treatment for outright failures: the chain may
                         // simply have no usable credential.
-                        if state.view == View::Subscriptions
-                            && state.auth_prompt == AuthPrompt::Hidden
-                        {
+                        if state.auth_prompt == AuthPrompt::Hidden {
                             open_auth_prompt(state, Some(msg));
                         }
                     }
@@ -497,9 +499,11 @@ async fn event_loop(
                         if state.list_cursor >= state.resources.len() {
                             state.list_cursor = state.resources.len().saturating_sub(1);
                         }
-                        spawn_missing_list_metrics(state, auth, tx);
-                        spawn_missing_list_health(state, auth, tx);
-                        spawn_missing_container_app_limits(state, auth, tx);
+                        spawn_missing_list_metrics(state, auth, tx, /* force */ false);
+                        spawn_missing_list_health(state, auth, tx, /* force */ false);
+                        spawn_missing_container_app_overview(
+                            state, auth, tx, /* force */ false,
+                        );
                     }
                     Err(e) => state.set_status(format!("resources: {e}")),
                 }
@@ -571,13 +575,16 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::ContainerAppLimitsLoaded {
+            AppEvent::ContainerAppOverviewLoaded {
                 resource_id,
                 result,
             } => {
-                state.limits.pending.remove(&resource_id);
+                state.container_app_overview.pending.remove(&resource_id);
                 if let Ok(limits) = result {
-                    state.limits.by_resource.insert(resource_id, limits);
+                    state
+                        .container_app_overview
+                        .by_resource
+                        .insert(resource_id, limits);
                 }
                 // On error we silently leave the cache empty; the detail view
                 // just omits the "/ max" suffix rather than surfacing noise
@@ -591,6 +598,38 @@ async fn event_loop(
                     state.revision_meta.by_resource.insert(resource_id, meta);
                 }
                 // Same silent-on-error policy as limits: decorative.
+            }
+            AppEvent::FunctionAppSettingsLoaded {
+                resource_id,
+                result,
+            } => {
+                state.func_settings.pending.remove(&resource_id);
+                match result {
+                    Ok(vars) => {
+                        state.func_settings.failures.remove(&resource_id);
+                        state.func_settings.by_resource.insert(resource_id, vars);
+                    }
+                    // Keep the error (typically 403): the detail view turns it
+                    // into a "needs config/list permission" hint.
+                    Err(e) => {
+                        state.func_settings.by_resource.remove(&resource_id);
+                        state.func_settings.failures.insert(resource_id, e);
+                    }
+                }
+            }
+            AppEvent::PrincipalResolved { object_id, result } => {
+                state.principals.pending.remove(&object_id);
+                match result {
+                    Ok(Some(name)) => {
+                        state.principals.failed.remove(&object_id);
+                        state.principals.by_id.insert(object_id, name);
+                    }
+                    // Couldn't resolve (no name, or 403/404): remember the miss
+                    // so we don't keep hammering Graph; the UI shows the GUID.
+                    Ok(None) | Err(_) => {
+                        state.principals.failed.insert(object_id);
+                    }
+                }
             }
             AppEvent::ApimApisLoaded { service_id, result } => {
                 state.apim.apis_pending.remove(&service_id);
@@ -1507,6 +1546,7 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::Detail => crate::ui::views::detail::handle(action, state),
         View::Logs => crate::ui::views::logs::handle(action, state),
         View::LogDetail => crate::ui::views::logs_detail::handle(action, state),
+        View::EnvVars => crate::ui::views::env_vars::handle(action, state),
         View::ApimApis => crate::ui::views::apim_apis::handle(action, state),
         View::ApimOperations => crate::ui::views::apim_operations::handle(action, state),
         View::ApimPolicy => crate::ui::views::apim_policy::handle(action, state),
@@ -1614,7 +1654,7 @@ fn service_id_from_api_id(api_id: &str) -> Option<&str> {
 fn portal_url_for(state: &AppState) -> Option<String> {
     const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
     match state.view {
-        View::List | View::Detail => state
+        View::List | View::Detail | View::EnvVars => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         View::Logs | View::LogDetail => state
@@ -1721,6 +1761,7 @@ fn yank_target(state: &AppState) -> Option<String> {
         View::Logs => yank_from_logs(state),
         View::LogDetail => crate::ui::views::logs_detail::selected_line(state)
             .map(crate::ui::views::logs_detail::yank_text),
+        View::EnvVars => crate::ui::views::env_vars::yank_text(state),
         View::List | View::Detail => state.selected_resource().map(|r| r.id.clone()),
         View::ApimApis => state.selected_resource().and_then(|r| {
             state
@@ -1946,6 +1987,7 @@ fn semantic_parent(view: View) -> Option<View> {
         View::Help => None,
         View::List => Some(View::Subscriptions),
         View::Detail => Some(View::List),
+        View::EnvVars => Some(View::Detail),
         View::Logs => Some(View::Detail),
         View::LogDetail => Some(View::Logs),
         View::AppGatewayBackends => Some(View::List),
@@ -2027,19 +2069,42 @@ fn kick_off_loads_for_view(
                     Some(id) => vec![id.clone()],
                     None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
                 };
-                if force {
-                    // Drop cached badges so they refresh once the new resource
-                    // list arrives; in-flight fetches keep their pending entries.
-                    state.metrics.by_resource.clear();
-                    state.metrics.failures.clear();
-                    state.metrics.missing.clear();
-                }
                 state.loading_resources = true;
                 spawn_load_resources(auth.clone(), sub_ids, tx.clone());
+                if force {
+                    // Refresh per-row badges + Container App overview *in place*:
+                    // re-fetch without dropping the current values, so rows
+                    // update silently instead of flickering to LOADING. (The
+                    // resource list itself reloads above; new rows get filled by
+                    // the non-force `spawn_missing_*` in the ResourcesLoaded
+                    // handler.)
+                    spawn_missing_list_metrics(state, auth, tx, /* force */ true);
+                    spawn_missing_list_health(state, auth, tx, /* force */ true);
+                    spawn_missing_container_app_overview(state, auth, tx, /* force */ true);
+                }
             }
         }
         View::Detail => {
             if let Some(resource) = state.selected_resource().cloned() {
+                let id = resource.id.clone();
+                let kind = resource.kind;
+                // Capture the directory principals to resolve before `resource`
+                // is moved into the metrics fetch below.
+                let principal_candidates: Vec<String> = [
+                    (
+                        resource.meta.created_by.clone(),
+                        resource.meta.created_by_type.clone(),
+                    ),
+                    (
+                        resource.meta.modified_by.clone(),
+                        resource.meta.modified_by_type.clone(),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(by, ty)| {
+                    principal_to_resolve(by.as_deref(), ty.as_deref()).map(|s| s.to_string())
+                })
+                .collect();
                 if force || !state.metrics.loading {
                     if force {
                         state.metrics.failures.remove(&resource.id);
@@ -2047,6 +2112,85 @@ fn kick_off_loads_for_view(
                     state.metrics.loading = true;
                     state.metrics.pending.insert(resource.id.clone());
                     spawn_load_metrics(auth.clone(), resource, state.metrics.range, tx.clone());
+                }
+                // Health — and, for Container Apps, the active-revision metadata
+                // + overview that ride alongside it — is otherwise fetched once
+                // eagerly and never refreshed, so `r` after a deploy would keep
+                // showing the old active revision. Re-fetch on explicit refresh,
+                // but WITHOUT dropping the cached values: the old rows stay shown
+                // (and the header's "· refreshing…" signals the reload) until
+                // the fresh data arrives and overwrites them — no flicker.
+                if force {
+                    if !state.health.pending.contains(&id) {
+                        state.health.pending.insert(id.clone());
+                        spawn_load_health(auth.clone(), id.clone(), kind, tx.clone());
+                    }
+                    if kind == crate::azure::resources::ResourceKind::ContainerApp
+                        && !state.container_app_overview.pending.contains(&id)
+                    {
+                        state.container_app_overview.pending.insert(id.clone());
+                        spawn_load_container_app_overview(auth.clone(), id.clone(), tx.clone());
+                    }
+                }
+                // Function App OS env vars are lazy-loaded on Detail entry.
+                // (Container App env vars ride on the eagerly-fetched limits.)
+                // Guard against re-spawning while one is cached / in flight.
+                if kind == crate::azure::resources::ResourceKind::FunctionApp {
+                    let cached = state.func_settings.by_resource.contains_key(&id)
+                        || state.func_settings.failures.contains_key(&id);
+                    let in_flight = state.func_settings.pending.contains(&id);
+                    if force || (!cached && !in_flight) {
+                        if force {
+                            state.func_settings.by_resource.remove(&id);
+                            state.func_settings.failures.remove(&id);
+                        }
+                        state.func_settings.pending.insert(id.clone());
+                        spawn_load_function_app_settings(auth.clone(), id, tx.clone());
+                    }
+                }
+                // Resolve Application / ManagedIdentity authors to display names
+                // via Graph (best-effort, cached, deduped).
+                for oid in principal_candidates {
+                    if state.principals.by_id.contains_key(&oid)
+                        || state.principals.failed.contains(&oid)
+                        || state.principals.pending.contains(&oid)
+                    {
+                        continue;
+                    }
+                    state.principals.pending.insert(oid.clone());
+                    spawn_resolve_principal(auth.clone(), oid, tx.clone());
+                }
+            }
+        }
+        View::EnvVars => {
+            // The page is reached from Detail (which already fetched), but a
+            // refresh here should re-pull the selected resource's env vars.
+            if let Some(resource) = state.selected_resource().cloned() {
+                let id = resource.id;
+                match resource.kind {
+                    crate::azure::resources::ResourceKind::FunctionApp => {
+                        let cached = state.func_settings.by_resource.contains_key(&id)
+                            || state.func_settings.failures.contains_key(&id);
+                        let in_flight = state.func_settings.pending.contains(&id);
+                        if force || (!cached && !in_flight) {
+                            if force {
+                                state.func_settings.by_resource.remove(&id);
+                                state.func_settings.failures.remove(&id);
+                            }
+                            state.func_settings.pending.insert(id.clone());
+                            spawn_load_function_app_settings(auth.clone(), id, tx.clone());
+                        }
+                    }
+                    // Container App env vars ride on the overview fetch, so a
+                    // refresh re-pulls that (otherwise `r` keeps stale values).
+                    crate::azure::resources::ResourceKind::ContainerApp => {
+                        if force {
+                            state.container_app_overview.by_resource.remove(&id);
+                            state.container_app_overview.pending.insert(id.clone());
+                            spawn_load_container_app_overview(auth.clone(), id, tx.clone());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2536,6 +2680,7 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::Subscriptions => crate::ui::views::subscriptions::render(f, view_area, state, theme),
         View::List => crate::ui::views::list::render(f, view_area, state, theme),
         View::Detail => crate::ui::views::detail::render(f, view_area, state, theme),
+        View::EnvVars => crate::ui::views::env_vars::render(f, view_area, state, theme),
         View::Logs => crate::ui::views::logs::render(f, view_area, state, theme),
         View::LogDetail => crate::ui::views::logs_detail::render(f, view_area, state, theme),
         View::ApimApis => crate::ui::views::apim_apis::render(f, view_area, state, theme),
@@ -3096,13 +3241,18 @@ fn spawn_missing_list_metrics(
     state: &mut AppState,
     auth: &AzureAuth,
     tx: &UnboundedSender<AppEvent>,
+    force: bool,
 ) {
     let range = state.metrics.range;
+    // `force` (explicit refresh) re-fetches even already-cached rows so badges
+    // update in place; the `pending` guard still prevents duplicate in-flight
+    // fetches. Non-force only fills gaps (eager first-load).
     let to_fetch: Vec<Resource> = state
         .resources
         .iter()
         .filter(|r| {
-            !state.metrics.by_resource.contains_key(&r.id) && !state.metrics.pending.contains(&r.id)
+            (force || !state.metrics.by_resource.contains_key(&r.id))
+                && !state.metrics.pending.contains(&r.id)
         })
         .cloned()
         .collect();
@@ -3161,29 +3311,75 @@ fn spawn_load_health(
     });
 }
 
-fn spawn_load_container_app_limits(
+fn spawn_load_container_app_overview(
     auth: AzureAuth,
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        let result = crate::azure::container_app_limits::fetch(&auth, &resource_id)
+        let result = crate::azure::container_app_overview::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::ContainerAppLimitsLoaded {
+        let _ = tx.send(AppEvent::ContainerAppOverviewLoaded {
             resource_id,
             result,
         });
     });
 }
 
+fn spawn_load_function_app_settings(
+    auth: AzureAuth,
+    resource_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::function_app_settings::fetch(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::FunctionAppSettingsLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
+fn spawn_resolve_principal(auth: AzureAuth, object_id: String, tx: UnboundedSender<AppEvent>) {
+    tokio::spawn(async move {
+        let result = crate::azure::principals::resolve_display_name(&auth, &object_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::PrincipalResolved { object_id, result });
+    });
+}
+
+/// If `(by, by_type)` names a directory principal worth resolving via Graph —
+/// an `Application` / `ManagedIdentity` author, whose `by` is a GUID object-id —
+/// return that object-id. `User` authors are already UPNs and need no lookup.
+fn principal_to_resolve<'a>(by: Option<&'a str>, by_type: Option<&str>) -> Option<&'a str> {
+    match (by, by_type) {
+        (Some(id), Some("Application" | "ManagedIdentity")) if looks_like_guid(id) => Some(id),
+        _ => None,
+    }
+}
+
+/// Cheap shape check for a canonical GUID (`8-4-4-4-12` hex) so we never fire a
+/// Graph request at a malformed author value.
+fn looks_like_guid(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
 /// Kick off a Container App template fetch for every Container App that
 /// doesn't already have cached limits. Same eager-on-load pattern as
 /// `spawn_missing_list_health`.
-fn spawn_missing_container_app_limits(
+fn spawn_missing_container_app_overview(
     state: &mut AppState,
     auth: &AzureAuth,
     tx: &UnboundedSender<AppEvent>,
+    force: bool,
 ) {
     use crate::azure::resources::ResourceKind;
     let to_fetch: Vec<String> = state
@@ -3191,13 +3387,17 @@ fn spawn_missing_container_app_limits(
         .iter()
         .filter(|r| r.kind == ResourceKind::ContainerApp)
         .filter(|r| {
-            !state.limits.by_resource.contains_key(&r.id) && !state.limits.pending.contains(&r.id)
+            (force || !state.container_app_overview.by_resource.contains_key(&r.id))
+                && !state.container_app_overview.pending.contains(&r.id)
         })
         .map(|r| r.id.clone())
         .collect();
     for resource_id in to_fetch {
-        state.limits.pending.insert(resource_id.clone());
-        spawn_load_container_app_limits(auth.clone(), resource_id, tx.clone());
+        state
+            .container_app_overview
+            .pending
+            .insert(resource_id.clone());
+        spawn_load_container_app_overview(auth.clone(), resource_id, tx.clone());
     }
 }
 
@@ -3207,12 +3407,14 @@ fn spawn_missing_list_health(
     state: &mut AppState,
     auth: &AzureAuth,
     tx: &UnboundedSender<AppEvent>,
+    force: bool,
 ) {
     let to_fetch: Vec<(String, crate::azure::resources::ResourceKind)> = state
         .resources
         .iter()
         .filter(|r| {
-            !state.health.by_resource.contains_key(&r.id) && !state.health.pending.contains(&r.id)
+            (force || !state.health.by_resource.contains_key(&r.id))
+                && !state.health.pending.contains(&r.id)
         })
         .map(|r| (r.id.clone(), r.kind))
         .collect();
@@ -3974,6 +4176,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         };
         state.view = View::Subscriptions;
 
@@ -4025,6 +4228,8 @@ mod tests {
     #[test]
     fn back_with_empty_stack_opens_quit_modal() {
         let mut state = fresh_state();
+        // Subscriptions is the breadcrumb root that opens the quit modal on Esc.
+        state.view = View::Subscriptions;
         assert!(state.view_stack.is_empty());
         assert!(!state.quit_confirm);
         assert!(!state.should_quit);
@@ -4092,6 +4297,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         };
         state.resources = vec![resource.clone()];
 
@@ -4163,6 +4369,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::Logs;
@@ -4192,6 +4399,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::Logs;
@@ -4233,6 +4441,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::LogDetail;
@@ -4274,6 +4483,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::LogDetail;

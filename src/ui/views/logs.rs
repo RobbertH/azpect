@@ -1026,6 +1026,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }
     }
 

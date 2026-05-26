@@ -258,6 +258,7 @@ mod tests {
             state: None,
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::ApimApis;

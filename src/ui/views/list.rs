@@ -13,7 +13,7 @@ use crate::azure::health::{derive, HealthStatus};
 use crate::azure::logs::supports_logs;
 use crate::azure::resources::{Resource, ResourceKind};
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
@@ -27,6 +27,9 @@ const HALF_PAGE: usize = 10;
 /// space-padded.
 const NAME_COL_WIDTH: usize = 36;
 const RG_COL_WIDTH: usize = 20;
+/// Width of the SUBSCRIPTION column, shown only in all-subscriptions mode
+/// (mirrors the Storage / Registries / Cosmos / Key Vault / Service Bus lists).
+const SUB_COL_WIDTH: usize = 22;
 /// Width of the `CREATED` / `MODIFIED` columns: `YYYY-MM-DD` is 10 chars. We
 /// reserve exactly that — older resources with `None` for the timestamp render
 /// as an empty column, which keeps the next column aligned.
@@ -119,45 +122,34 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
         let max_name = NAME_COL_WIDTH;
         let max_rg = RG_COL_WIDTH;
+        // Only worth a subscription column when viewing across all of them.
+        let show_sub = state.selected_subscription.is_none();
 
         if let Some(ha) = header_area {
-            let header_spans = vec![
+            let hdr = |text: &str, width: usize| {
+                Span::styled(
+                    format!("{text:<width$}"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            let mut header_spans = vec![
                 Span::raw("    "), // selection prefix (2) + favorite glyph + space (2)
-                Span::styled(
-                    format!("{:<width$}", "NAME", width = max_name),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                hdr("NAME", max_name),
                 Span::raw("  "),
-                Span::styled(
-                    format!("{:<4}", "KIND"),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                hdr("KIND", 4),
                 Span::raw("    "), // badge glyph (●) + space + state column padding
-                Span::styled(
-                    format!("{:<8}", "STATUS"),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                hdr("STATUS", 8),
                 Span::raw("  "),
-                Span::styled(
-                    format!("{:<width$}", "RESOURCE GROUP", width = max_rg),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{:<width$}", "CREATED", width = DATE_COL_WIDTH),
-                    Style::default()
-                        .fg(theme.muted)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                hdr("RESOURCE GROUP", max_rg),
             ];
+            if show_sub {
+                header_spans.push(Span::raw("  "));
+                header_spans.push(hdr("SUBSCRIPTION", SUB_COL_WIDTH));
+            }
+            header_spans.push(Span::raw("  "));
+            header_spans.push(hdr("CREATED", DATE_COL_WIDTH));
             frame.render_widget(Paragraph::new(Line::from(header_spans)), ha);
         }
 
@@ -200,7 +192,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     width = DATE_COL_WIDTH
                 );
 
-                let spans = vec![
+                let mut spans = vec![
                     Span::raw(if selected { "▍ " } else { "  " }),
                     fav_glyph,
                     Span::raw(" "),
@@ -216,9 +208,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     ),
                     Span::raw("  "),
                     Span::styled(rg, Style::default().fg(theme.muted)),
-                    Span::raw("  "),
-                    Span::styled(created, Style::default().fg(theme.muted)),
                 ];
+
+                if show_sub {
+                    // Resolve to display name; fall back to the raw id until the
+                    // subscription list arrives.
+                    let sub = subscription_display_name(state, &r.subscription_id)
+                        .unwrap_or(&r.subscription_id);
+                    let sub = format!(
+                        "{:<width$}",
+                        truncate_right(sub, SUB_COL_WIDTH),
+                        width = SUB_COL_WIDTH
+                    );
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(sub, Style::default().fg(theme.muted)));
+                }
+
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(created, Style::default().fg(theme.muted)));
 
                 if selected {
                     Line::from(spans).style(theme.selection())
@@ -437,6 +444,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }
     }
 

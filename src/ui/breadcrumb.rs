@@ -54,6 +54,15 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        View::EnvVars => {
+            let mut s = vec![subscription_segment(state), "api resources".to_string()];
+            if let Some(r) = state.selected_resource() {
+                s.push(r.name.clone());
+            }
+            s.push("env vars".to_string());
+            s
+        }
+
         View::Logs => {
             let mut s = vec![subscription_segment(state), "api resources".to_string()];
             if let Some(r) = state.selected_resource() {
@@ -411,12 +420,14 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }
     }
 
     #[test]
     fn subscription_picker_breadcrumb() {
-        let state = fresh_state();
+        let mut state = fresh_state();
+        state.view = View::Subscriptions;
         assert_eq!(breadcrumb(&state), "subscriptions");
     }
 
@@ -514,6 +525,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::AppGatewayBackends;
@@ -538,6 +550,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.view = View::ApimApis;
@@ -562,6 +575,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.apim.selected_api_id = Some(
@@ -589,6 +603,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         state.list_cursor = 0;
         state.apim.selected_api_id = Some(
@@ -713,7 +728,8 @@ mod tests {
 
     #[test]
     fn segments_subscription_picker_is_root_only() {
-        let state = fresh_state();
+        let mut state = fresh_state();
+        state.view = View::Subscriptions;
         assert_eq!(segments(&state), vec!["subscriptions".to_string()]);
     }
 

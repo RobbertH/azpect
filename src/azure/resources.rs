@@ -48,6 +48,28 @@ pub struct Resource {
     /// `systemData.lastModifiedAt` from the ARM envelope. Same caveats as
     /// `created_at` — missing for legacy resources.
     pub modified_at: Option<DateTime<Utc>>,
+    /// Extended ARM-envelope bits (who created/modified the resource, tags)
+    /// surfaced in the Detail overview. Bundled so the (many) test fixtures can
+    /// opt out with `meta: Default::default()`. `#[serde(default)]` keeps older
+    /// cached payloads deserializable.
+    #[serde(default)]
+    pub meta: ResourceMeta,
+}
+
+/// `systemData` authorship + resource tags. All optional / empty for legacy
+/// resource providers (notably `microsoft.web/sites` and APIM) that don't
+/// populate `systemData`; the renderer collapses absent lines.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResourceMeta {
+    /// `systemData.createdBy` — a UPN/email for `User`, an object id for
+    /// `Application`/`ManagedIdentity`.
+    pub created_by: Option<String>,
+    /// `systemData.createdByType` — `User` / `Application` / `ManagedIdentity` / `Key`.
+    pub created_by_type: Option<String>,
+    pub modified_by: Option<String>,
+    pub modified_by_type: Option<String>,
+    /// Resource tags as `(key, value)` pairs, sorted by key.
+    pub tags: Vec<(String, String)>,
 }
 
 /// KQL query template. Lane 2 substitutes nothing — Resource Graph honors the
@@ -85,7 +107,15 @@ Resources
           modifiedAt = case(
               type == 'microsoft.web/sites', tostring(properties.lastModifiedTimeUtc),
               tostring(systemData.lastModifiedAt)
-          )
+          ),
+          // systemData authorship + tags for the Detail overview. Empty for RPs
+          // that don't populate systemData (web/sites, apimanagement); the
+          // renderer just omits those lines.
+          createdBy = tostring(systemData.createdBy),
+          createdByType = tostring(systemData.createdByType),
+          modifiedBy = tostring(systemData.lastModifiedBy),
+          modifiedByType = tostring(systemData.lastModifiedByType),
+          tags = tags
 | order by name asc
 "#;
 
@@ -171,6 +201,14 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
     let created_at = parse_optional_rfc3339(v.get("createdAt"));
     let modified_at = parse_optional_rfc3339(v.get("modifiedAt"));
 
+    let meta = ResourceMeta {
+        created_by: non_empty_string(v.get("createdBy")),
+        created_by_type: non_empty_string(v.get("createdByType")),
+        modified_by: non_empty_string(v.get("modifiedBy")),
+        modified_by_type: non_empty_string(v.get("modifiedByType")),
+        tags: parse_tags(v.get("tags")),
+    };
+
     Some(Resource {
         id,
         name,
@@ -181,7 +219,38 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
         state,
         created_at,
         modified_at,
+        meta,
     })
+}
+
+/// Read a JSON field as a non-empty string. Resource Graph surfaces absent
+/// `systemData` fields as empty strings (via `tostring(...)`), so collapse those
+/// to `None`.
+fn non_empty_string(v: Option<&serde_json::Value>) -> Option<String> {
+    v.and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Flatten a `tags` object into `(key, value)` pairs sorted by key. Non-string
+/// tag values are coerced via their JSON display; a missing/non-object `tags`
+/// field yields an empty vec.
+fn parse_tags(v: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let Some(map) = v.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .map(|(k, val)| {
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), s)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Pull an RFC3339 timestamp out of a JSON field, tolerant of `null`, missing
@@ -317,5 +386,76 @@ mod tests {
             .filter_map(parse_resource)
             .collect();
         assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn parses_systemdata_authorship_and_tags() {
+        let payload = json!({
+            "data": [{
+                "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.App/containerApps/myca",
+                "name": "myca",
+                "type": "microsoft.app/containerapps",
+                "kind": "",
+                "location": "westeurope",
+                "resourceGroup": "rg1",
+                "subscriptionId": "sub1",
+                "state": "Running",
+                "createdBy": "00000000-0000-0000-0000-000000000001",
+                "createdByType": "Application",
+                "modifiedBy": "someone@example.com",
+                "modifiedByType": "User",
+                "tags": { "Terraform": "true", "Domain": "tool" }
+            }]
+        });
+        let r = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .next()
+            .unwrap();
+        assert_eq!(
+            r.meta.created_by.as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(r.meta.created_by_type.as_deref(), Some("Application"));
+        assert_eq!(r.meta.modified_by.as_deref(), Some("someone@example.com"));
+        assert_eq!(r.meta.modified_by_type.as_deref(), Some("User"));
+        // Tags sorted by key.
+        assert_eq!(
+            r.meta.tags,
+            vec![
+                ("Domain".to_string(), "tool".to_string()),
+                ("Terraform".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_systemdata_strings_collapse_to_none() {
+        let payload = json!({
+            "data": [{
+                "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Web/sites/f",
+                "name": "f",
+                "type": "microsoft.web/sites",
+                "kind": "functionapp",
+                "location": "westeurope",
+                "resourceGroup": "rg1",
+                "subscriptionId": "sub1",
+                "state": "Running",
+                "createdBy": "",
+                "modifiedBy": ""
+            }]
+        });
+        let r = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .next()
+            .unwrap();
+        assert!(r.meta.created_by.is_none());
+        assert!(r.meta.modified_by.is_none());
+        assert!(r.meta.tags.is_empty());
     }
 }

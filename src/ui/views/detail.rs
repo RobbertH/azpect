@@ -138,18 +138,33 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // fetches. None of these are critical; missing data just collapses the
     // corresponding line.
     let revision_meta = state.revision_meta.by_resource.get(&resource.id);
-    let limits = state.limits.by_resource.get(&resource.id);
+    let limits = state.container_app_overview.by_resource.get(&resource.id);
     let meta_lines = container_app_meta_lines(revision_meta, limits, theme);
+    // Env vars (Container Apps + Function Apps), masked unless revealed, then
+    // the kind-agnostic tags + ownership lines.
+    let env_rows = env_var_rows(state, resource, theme);
+    let general_lines = general_meta_lines(resource, &state.principals);
 
     // Reserve enough rows for the header line + however many rows the second
     // line needs after wrapping at the available width. Without this, long
     // error messages get clipped and the user can't read the diagnostic.
     let mut context_height = 1 + wrapped_line_count(&second_line_text, inner.width).max(1);
     // Each meta line already wraps independently; reserve worst-case rows so
-    // none clip. `display_width` is the printable column count of the line.
+    // none clip.
     for (_, _, plain_text) in &meta_lines {
         context_height += wrapped_line_count(plain_text, inner.width).max(1);
     }
+    for (_, plain_text) in &env_rows {
+        context_height += wrapped_line_count(plain_text, inner.width).max(1);
+    }
+    for (_, _, plain_text) in &general_lines {
+        context_height += wrapped_line_count(plain_text, inner.width).max(1);
+    }
+    // Clamp so a long *revealed* env-var list can't starve the sparkline grid
+    // entirely — keep at least a few rows for the metrics area. The header /
+    // state lines always fit since the clamp floor (3) covers them.
+    let max_context = (inner.height.saturating_sub(6)).max(3) as usize;
+    let context_height = context_height.min(max_context);
     let body = Layout::vertical([
         Constraint::Length(context_height as u16),
         Constraint::Min(0),
@@ -175,7 +190,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.fg),
             ),
             Span::styled(
-                if state.metrics.loading {
+                // Stays up while *any* of the detail's data is reloading
+                // (metrics, health, or the Container App overview/revision), so
+                // a refresh keeps the old rows visible behind this hint rather
+                // than collapsing them.
+                if state.metrics.loading
+                    || state.health.pending.contains(&resource.id)
+                    || state.container_app_overview.pending.contains(&resource.id)
+                {
                     "  · refreshing…"
                 } else {
                     ""
@@ -186,16 +208,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         second_line,
     ];
     for (label, value, _) in meta_lines {
-        context_lines.push(Line::from(vec![
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(theme.muted)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(value, Style::default().fg(theme.accent)),
-        ]));
+        context_lines.push(styled_meta_line(label, value, theme));
+    }
+    for (line, _) in env_rows {
+        context_lines.push(line);
+    }
+    for (label, value, _) in general_lines {
+        context_lines.push(styled_meta_line(label, value, theme));
     }
     let context = Paragraph::new(context_lines).wrap(Wrap { trim: false });
     frame.render_widget(context, body[0]);
@@ -213,7 +232,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     .split(body[1]);
 
     let missing_for_resource = state.metrics.missing.get(&resource.id);
-    let limits = state.limits.by_resource.get(&resource.id);
+    let limits = state.container_app_overview.by_resource.get(&resource.id);
     for (i, (kind, label)) in ROW_KINDS.iter().enumerate() {
         let area = metric_rows[i];
         if area.height == 0 {
@@ -237,7 +256,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
     }
 
-    render_footer(frame, chunks[2], theme, &footer_hint_for(resource.kind));
+    let mut hint = footer_hint_for(resource.kind);
+    if matches!(
+        resource.kind,
+        ResourceKind::ContainerApp | ResourceKind::FunctionApp
+    ) {
+        hint = format!("e env vars  {hint}");
+    }
+    render_footer(frame, chunks[2], theme, &hint);
 }
 
 /// Render a 1-row time axis aligned under the sparkline grid. Five
@@ -352,7 +378,7 @@ fn render_metric_row(
     label: &str,
     metrics: Option<&Vec<MetricSeries>>,
     missing_reason: Option<&String>,
-    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
+    limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
     state: &AppState,
     theme: &Theme,
 ) {
@@ -443,7 +469,7 @@ fn short_missing_reason(reason: &str) -> String {
 /// image line; no ingress fqdn → no fqdn line.
 fn container_app_meta_lines(
     revision_meta: Option<&crate::azure::container_app_revisions::ActiveRevisionMeta>,
-    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
+    limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
     _theme: &Theme,
 ) -> Vec<(&'static str, String, String)> {
     let mut out: Vec<(&'static str, String, String)> = Vec::new();
@@ -463,11 +489,202 @@ fn container_app_meta_lines(
         out.push(("replicas:", replicas_value, plain));
     }
 
-    if let Some(fqdn) = limits.and_then(|l| l.fqdn.as_deref()) {
-        out.push(("fqdn:", fqdn.to_string(), format!("fqdn: {fqdn}")));
+    if let Some(l) = limits {
+        if let Some(eph) = l.ephemeral_storage.as_deref() {
+            out.push(("ephemeral:", eph.to_string(), format!("ephemeral: {eph}")));
+        }
+        if let Some(fqdn) = l.fqdn.as_deref() {
+            out.push(("fqdn:", fqdn.to_string(), format!("fqdn: {fqdn}")));
+        }
+        if let Some(env) = l.managed_environment.as_deref() {
+            out.push((
+                "environment:",
+                env.to_string(),
+                format!("environment: {env}"),
+            ));
+        }
+        if let Some(id) = l.managed_identity.as_deref() {
+            out.push(("identity:", id.to_string(), format!("identity: {id}")));
+        }
     }
 
     out
+}
+
+/// Build the meta lines that apply to every resource kind: tags and `systemData`
+/// ownership (created/modified by whom). Same `(label, value, plain)` tuple
+/// shape as [`container_app_meta_lines`]. Absent data collapses (no line).
+///
+/// For `Application` / `ManagedIdentity` authors the value is a GUID; we show
+/// the Graph-resolved display name when `principals` has it, falling back to the
+/// raw GUID otherwise. `User` entries are UPNs/emails and shown verbatim.
+fn general_meta_lines(
+    resource: &crate::azure::resources::Resource,
+    principals: &crate::ui::state::PrincipalCache,
+) -> Vec<(&'static str, String, String)> {
+    let mut out: Vec<(&'static str, String, String)> = Vec::new();
+    let m = &resource.meta;
+
+    if !m.tags.is_empty() {
+        let joined = m
+            .tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(("tags:", joined.clone(), format!("tags: {joined}")));
+    }
+
+    let resolved =
+        |id: Option<&str>| -> Option<String> { id.and_then(|i| principals.by_id.get(i)).cloned() };
+    if let Some(v) = ownership_value(
+        resource.created_at.as_ref(),
+        m.created_by.as_deref(),
+        m.created_by_type.as_deref(),
+        resolved(m.created_by.as_deref()).as_deref(),
+    ) {
+        out.push(("created:", v.clone(), format!("created: {v}")));
+    }
+    if let Some(v) = ownership_value(
+        resource.modified_at.as_ref(),
+        m.modified_by.as_deref(),
+        m.modified_by_type.as_deref(),
+        resolved(m.modified_by.as_deref()).as_deref(),
+    ) {
+        out.push(("modified:", v.clone(), format!("modified: {v}")));
+    }
+
+    out
+}
+
+/// Format a `YYYY-MM-DD HH:MM:SS UTC by <who> (<type>)` ownership string.
+/// `resolved` is the Graph-resolved display name for GUID principals, if known.
+/// Returns `None` when there's neither a timestamp nor an author to show.
+fn ownership_value(
+    date: Option<&chrono::DateTime<chrono::Utc>>,
+    by: Option<&str>,
+    by_type: Option<&str>,
+    resolved: Option<&str>,
+) -> Option<String> {
+    // Full UTC timestamp (not just the date) — created/modified are precise.
+    let date_s = date.map(|d| d.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+    let who = match (by, by_type) {
+        // UPN/email is readable — show it with the type.
+        (Some(b), Some("User")) => Some(format!("by {b} (User)")),
+        // GUID principals: prefer the resolved name, else the GUID itself.
+        (Some(b), Some(t @ ("Application" | "ManagedIdentity"))) => {
+            Some(format!("by {} ({t})", resolved.unwrap_or(b)))
+        }
+        // Any other type (e.g. Key): show the value with its type.
+        (Some(b), Some(t)) => Some(format!("by {b} ({t})")),
+        (Some(b), None) => Some(format!("by {b}")),
+        _ => None,
+    };
+    match (date_s, who) {
+        (Some(d), Some(w)) => Some(format!("{d} {w}")),
+        (Some(d), None) => Some(d),
+        (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
+}
+
+/// A bold-muted label + accent value line, matching the rest of the overview.
+fn styled_meta_line(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            label.into(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(value.into(), Style::default().fg(theme.accent)),
+    ])
+}
+
+/// Resolve the env vars to display for a resource, regardless of kind. Container
+/// Apps carry them on the overview cache (same GET); Function Apps on the
+/// dedicated settings cache. `None` means "not loaded / not applicable";
+/// `Some(&[])` means the resource genuinely has none. Shared with the dedicated
+/// env-vars page ([`crate::ui::views::env_vars`]).
+pub(crate) fn env_vars_for<'a>(
+    state: &'a AppState,
+    id: &str,
+    kind: ResourceKind,
+) -> Option<&'a [crate::azure::env_vars::EnvVar]> {
+    match kind {
+        ResourceKind::ContainerApp => state
+            .container_app_overview
+            .by_resource
+            .get(id)
+            .map(|l| l.env_vars.as_slice()),
+        ResourceKind::FunctionApp => state
+            .func_settings
+            .by_resource
+            .get(id)
+            .map(|v| v.as_slice()),
+        _ => None,
+    }
+}
+
+/// One-line env-vars *teaser* for the Detail overview: a count plus a hint to
+/// open the dedicated page with `e`. The values themselves live on that page —
+/// see [`crate::ui::views::env_vars`]. Returns `(styled line, plain)` pairs
+/// (0 or 1 entry) so it slots into the same height accounting as the meta lines.
+fn env_var_rows(
+    state: &AppState,
+    resource: &crate::azure::resources::Resource,
+    theme: &Theme,
+) -> Vec<(Line<'static>, String)> {
+    let id = resource.id.as_str();
+    let kind = resource.kind;
+
+    let Some(vars) = env_vars_for(state, id, kind) else {
+        // Not loaded yet. Container App env vars ride on the overview fetch
+        // (other lines already signal its progress), so only Function Apps get
+        // an explicit hint here.
+        if kind == ResourceKind::FunctionApp {
+            if state.func_settings.failures.contains_key(id) {
+                return vec![meta_hint_row(
+                    "env vars:",
+                    "unavailable (needs config/list permission)",
+                    theme,
+                )];
+            }
+            if state.func_settings.pending.contains(id) {
+                return vec![meta_hint_row("env vars:", "loading…", theme)];
+            }
+        }
+        return Vec::new();
+    };
+    if vars.is_empty() {
+        return Vec::new();
+    }
+
+    let value = format!("{}   [e to view]", vars.len());
+    vec![(
+        styled_meta_line("env vars:", value.clone(), theme),
+        format!("env vars: {value}"),
+    )]
+}
+
+/// A label + muted value row (for hints like "loading…" / permission denied).
+fn meta_hint_row(label: &str, value: &str, theme: &Theme) -> (Line<'static>, String) {
+    let line = Line::from(vec![
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(value.to_string(), Style::default().fg(theme.muted)),
+    ]);
+    (line, format!("{label} {value}"))
 }
 
 /// Resample `data` so its length matches `width` using nearest-neighbor
@@ -511,7 +728,7 @@ fn scaled_data(series: &MetricSeries) -> Vec<u64> {
 fn summary_for(
     kind: MetricKind,
     s: &MetricSeries,
-    limits: Option<&crate::azure::container_app_limits::ContainerAppLimits>,
+    limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
 ) -> String {
     match kind {
         MetricKind::Traffic | MetricKind::Errors => {
@@ -629,6 +846,19 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
+        Action::OpenEnvVars => {
+            let kind = state.selected_resource().map(|r| r.kind);
+            match kind {
+                Some(ResourceKind::ContainerApp | ResourceKind::FunctionApp) => {
+                    // Fresh page: cursor at top, values masked.
+                    state.env_vars_view = crate::ui::state::EnvVarsView::default();
+                    state.view_stack.push(state.view);
+                    state.view = View::EnvVars;
+                }
+                _ => state.set_status("no environment variables for this resource type"),
+            }
+            true
+        }
         Action::OpenLogs => {
             let supports = state
                 .selected_resource()
@@ -784,7 +1014,7 @@ mod tests {
 
     #[test]
     fn meta_lines_full_shape_emits_four_entries() {
-        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::container_app_overview::ContainerAppOverview;
         use crate::azure::container_app_revisions::ActiveRevisionMeta;
         use crate::ui::theme::Theme;
 
@@ -796,10 +1026,11 @@ mod tests {
             min_replicas: 1,
             max_replicas: 10,
         };
-        let limits = ContainerAppLimits {
+        let limits = ContainerAppOverview {
             cpu_millicores: 500,
             memory_bytes: 0,
             fqdn: Some("files-api.example.azurecontainerapps.io".into()),
+            ..Default::default()
         };
         let lines = container_app_meta_lines(Some(&meta), Some(&limits), &theme);
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
@@ -838,7 +1069,7 @@ mod tests {
 
     #[test]
     fn summary_for_cpu_appends_max_when_limits_present() {
-        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::container_app_overview::ContainerAppOverview;
         use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
         use chrono::Utc;
 
@@ -851,10 +1082,11 @@ mod tests {
                 value: 12.5,
             }],
         };
-        let limits = ContainerAppLimits {
+        let limits = ContainerAppOverview {
             cpu_millicores: 500,
             memory_bytes: 0,
             fqdn: None,
+            ..Default::default()
         };
         let out = summary_for(MetricKind::Cpu, &series, Some(&limits));
         assert!(out.contains("12.5"));
@@ -863,7 +1095,7 @@ mod tests {
 
     #[test]
     fn summary_for_cpu_omits_max_when_limits_zero() {
-        use crate::azure::container_app_limits::ContainerAppLimits;
+        use crate::azure::container_app_overview::ContainerAppOverview;
         use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
         use chrono::Utc;
 
@@ -876,10 +1108,11 @@ mod tests {
                 value: 4.7,
             }],
         };
-        let limits = ContainerAppLimits {
+        let limits = ContainerAppOverview {
             cpu_millicores: 0,
             memory_bytes: 0,
             fqdn: None,
+            ..Default::default()
         };
         let out = summary_for(MetricKind::Cpu, &series, Some(&limits));
         assert!(!out.contains("/ max"), "got {out:?}");
@@ -909,6 +1142,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }
     }
 
@@ -1030,5 +1264,172 @@ mod tests {
         assert_eq!(format_count(12_500.0), "12.5k");
         assert_eq!(format_count(2_400_000.0), "2.4M");
         assert!(format_bytes(2.0 * 1024.0 * 1024.0).contains("MB"));
+    }
+
+    #[test]
+    fn ownership_value_full_timestamp_and_principal_forms() {
+        use chrono::TimeZone;
+        let d = Utc.with_ymd_and_hms(2026, 5, 8, 14, 29, 55).unwrap();
+        // Application principal: GUID shown when unresolved, full timestamp.
+        assert_eq!(
+            ownership_value(
+                Some(&d),
+                Some("11111111-2222-3333-4444-555555555555"),
+                Some("Application"),
+                None,
+            ),
+            Some(
+                "2026-05-08 14:29:55 UTC by 11111111-2222-3333-4444-555555555555 (Application)"
+                    .to_string()
+            )
+        );
+        // …and the resolved display name when Graph has it.
+        assert_eq!(
+            ownership_value(
+                Some(&d),
+                Some("11111111-2222-3333-4444-555555555555"),
+                Some("Application"),
+                Some("di-sp-adp-devops-agent"),
+            ),
+            Some("2026-05-08 14:29:55 UTC by di-sp-adp-devops-agent (Application)".to_string())
+        );
+        // User principal is a readable UPN — show it verbatim.
+        assert_eq!(
+            ownership_value(Some(&d), Some("someone@example.com"), Some("User"), None),
+            Some("2026-05-08 14:29:55 UTC by someone@example.com (User)".to_string())
+        );
+        assert_eq!(ownership_value(None, None, None, None), None);
+    }
+
+    #[test]
+    fn general_meta_lines_emits_tags_and_ownership() {
+        use crate::azure::resources::ResourceMeta;
+        use crate::ui::state::PrincipalCache;
+        let mut res = r();
+        res.meta = ResourceMeta {
+            created_by: Some("someone@example.com".into()),
+            created_by_type: Some("User".into()),
+            modified_by: None,
+            modified_by_type: None,
+            tags: vec![
+                ("Domain".into(), "tool".into()),
+                ("Terraform".into(), "true".into()),
+            ],
+        };
+        let lines = general_meta_lines(&res, &PrincipalCache::default());
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(labels, vec!["tags:", "created:"]);
+        let tags = &lines.iter().find(|(l, _, _)| *l == "tags:").unwrap().1;
+        assert_eq!(tags, "Domain=tool, Terraform=true");
+    }
+
+    #[test]
+    fn general_meta_lines_uses_resolved_principal_name() {
+        use crate::azure::resources::ResourceMeta;
+        use crate::ui::state::PrincipalCache;
+        let guid = "11111111-2222-3333-4444-555555555555";
+        let mut res = r();
+        res.meta = ResourceMeta {
+            created_by: Some(guid.into()),
+            created_by_type: Some("Application".into()),
+            ..Default::default()
+        };
+        let mut principals = PrincipalCache::default();
+        principals
+            .by_id
+            .insert(guid.into(), "di-sp-adp-devops-agent".into());
+        let lines = general_meta_lines(&res, &principals);
+        let created = &lines.iter().find(|(l, _, _)| *l == "created:").unwrap().1;
+        assert!(
+            created.contains("di-sp-adp-devops-agent (Application)"),
+            "got {created:?}"
+        );
+        assert!(!created.contains(guid), "GUID should be replaced by name");
+    }
+
+    #[test]
+    fn general_meta_lines_empty_without_meta() {
+        // r() has Default::default() meta — no tags, no authorship, no dates.
+        assert!(general_meta_lines(&r(), &crate::ui::state::PrincipalCache::default()).is_empty());
+    }
+
+    fn ca_state_with_env(vars: Vec<crate::azure::env_vars::EnvVar>) -> (AppState, Resource) {
+        use crate::azure::container_app_overview::ContainerAppOverview;
+        let mut state = fixture_no_metrics();
+        state.resources[0].kind = ResourceKind::ContainerApp;
+        let id = state.resources[0].id.clone();
+        state.container_app_overview.by_resource.insert(
+            id,
+            ContainerAppOverview {
+                env_vars: vars,
+                ..Default::default()
+            },
+        );
+        let resource = state.resources[0].clone();
+        (state, resource)
+    }
+
+    fn ev(name: &str, value: &str, is_secret: bool) -> crate::azure::env_vars::EnvVar {
+        crate::azure::env_vars::EnvVar {
+            name: name.into(),
+            value: value.into(),
+            is_secret,
+        }
+    }
+
+    #[test]
+    fn env_var_rows_is_a_count_teaser_pointing_at_the_page() {
+        let theme = Theme::catppuccin_mocha();
+        let (state, resource) =
+            ca_state_with_env(vec![ev("A", "1", false), ev("B", "(secret: s)", true)]);
+        // The overview shows a one-line teaser; the values live on the page.
+        let rows = env_var_rows(&state, &resource, &theme);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("env vars: 2"));
+        assert!(rows[0].1.contains("[e to view]"));
+        // Crucially, no values leak into the overview teaser.
+        assert!(!rows[0].1.contains("A=1"));
+    }
+
+    #[test]
+    fn env_var_rows_empty_when_no_vars() {
+        let theme = Theme::catppuccin_mocha();
+        let (state, resource) = ca_state_with_env(vec![]);
+        assert!(env_var_rows(&state, &resource, &theme).is_empty());
+    }
+
+    #[test]
+    fn env_var_rows_function_app_permission_hint() {
+        let theme = Theme::catppuccin_mocha();
+        let mut state = fixture_no_metrics(); // r() is a Function App
+        let resource = state.resources[0].clone();
+        state
+            .func_settings
+            .failures
+            .insert(resource.id.clone(), "azure api error 403: Forbidden".into());
+        let rows = env_var_rows(&state, &resource, &theme);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].1.contains("config/list permission"));
+    }
+
+    #[test]
+    fn open_env_vars_transitions_to_page_for_function_app() {
+        let mut state = fixture_no_metrics(); // Function App
+        state.env_vars_view.cursor = 5; // stale state from a prior visit
+        state.env_vars_view.revealed = true;
+        assert!(handle(Action::OpenEnvVars, &mut state));
+        assert_eq!(state.view, View::EnvVars);
+        // Page opens fresh: masked, cursor at top.
+        assert_eq!(state.env_vars_view.cursor, 0);
+        assert!(!state.env_vars_view.revealed);
+    }
+
+    #[test]
+    fn open_env_vars_blocks_unsupported_kind() {
+        let mut state = fixture_no_metrics();
+        state.resources[0].kind = ResourceKind::Apim;
+        assert!(handle(Action::OpenEnvVars, &mut state));
+        assert_eq!(state.view, View::Detail);
+        assert!(state.status_message.is_some());
     }
 }

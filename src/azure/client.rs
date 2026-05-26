@@ -15,7 +15,7 @@ use anyhow::anyhow;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use reqwest::{Method, Response, StatusCode};
 
-use crate::azure::auth::{AzureAuth, SCOPE_ARM, SCOPE_LOGS, SCOPE_STORAGE};
+use crate::azure::auth::{AzureAuth, SCOPE_ARM, SCOPE_GRAPH, SCOPE_LOGS, SCOPE_STORAGE};
 
 /// `x-ms-version` header value for blob data-plane requests. Pinned to a stable
 /// release of the REST API; bump in lockstep across all storage calls so server
@@ -30,6 +30,9 @@ pub const ARM_BASE: &str = "https://management.azure.com";
 
 /// Base URL for Log Analytics resource-centric queries.
 pub const LOGS_BASE: &str = "https://api.loganalytics.io";
+
+/// Base URL for Microsoft Graph v1.0.
+pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
 /// Backoff schedule for retries on 429/5xx (in addition to any `Retry-After`).
 const BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000];
@@ -204,6 +207,34 @@ impl ArmClient {
             http.request(Method::POST, &url)
                 .header(CONTENT_TYPE, "application/json")
                 .json(body)
+        })
+        .await
+    }
+}
+
+/// Client for Microsoft Graph (`graph.microsoft.com`). Same retry/redaction
+/// discipline as [`ArmClient`], but uses `SCOPE_GRAPH`. Used best-effort to
+/// resolve directory object-ids to display names; callers tolerate 4xx.
+#[derive(Clone)]
+pub struct GraphClient {
+    pub(crate) auth: AzureAuth,
+    pub(crate) http: reqwest::Client,
+}
+
+impl GraphClient {
+    pub fn new(auth: AzureAuth) -> anyhow::Result<Self> {
+        Ok(Self {
+            auth,
+            http: build_http()?,
+        })
+    }
+
+    /// `GET https://graph.microsoft.com/v1.0{path}` with a Graph bearer. Caller
+    /// passes `path` starting with `/` (it may include a `?$select=` query).
+    pub async fn get(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{GRAPH_BASE}{path}");
+        send_with_retry(&self.http, &self.auth, SCOPE_GRAPH, |http| {
+            http.request(Method::GET, &url)
         })
         .await
     }

@@ -260,6 +260,7 @@ mod tests {
             state: Some("Running".into()),
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         }];
         s.list_cursor = 0;
         s.view = View::LogDetail;

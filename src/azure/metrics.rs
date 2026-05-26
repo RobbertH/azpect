@@ -36,10 +36,10 @@ pub enum MetricKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub enum TimeRange {
-    /// Last hour, aggregated per PT1M (60 bins). Useful for in-the-moment
-    /// investigation when 15-minute bars hide a recent spike.
-    Hour,
+    /// Last hour, aggregated per PT1M (60 bins). The default: fine-grained
+    /// enough to catch a recent spike that 15-minute bars would hide.
     #[default]
+    Hour,
     Day,
     Week,
 }

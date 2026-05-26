@@ -83,6 +83,7 @@ impl Category {
                     | View::Detail
                     | View::Logs
                     | View::LogDetail
+                    | View::EnvVars
                     | View::ApimApis
                     | View::ApimOperations
                     | View::ApimPolicy
@@ -125,7 +126,7 @@ impl Category {
     /// subscription. Called once per category on subscription switch.
     ///
     /// Note: per-resource-id caches that hang off the Apis category (metrics,
-    /// logs, health, container_app_limits, apim) are intentionally *not*
+    /// logs, health, container_app_overview, apim) are intentionally *not*
     /// cleared here. Their keys are resource ids (subscription-scoped on the
     /// Azure side); they go dormant once `resources` is cleared and are
     /// effectively dead memory until the user re-pins a sub that re-exposes
@@ -215,6 +216,11 @@ pub enum View {
     /// Full-screen detail panel for a single log line. Opened with Enter from
     /// the logs table; reads `LogsCache::scroll` to pick the line.
     LogDetail,
+    /// Full-screen, scrollable list of the selected API asset's OS environment
+    /// variables (Container App template env / Function App app-settings).
+    /// Opened with `e` from Detail. Values are masked by default; `x` reveals
+    /// them (k9s-style decode).
+    EnvVars,
     /// APIM-only: list of APIs hosted by the selected APIM service. Opened
     /// with Enter from Detail when the resource is `ResourceKind::Apim`.
     ApimApis,
@@ -348,12 +354,14 @@ pub struct MetricsCache {
     pub last_error: Option<String>,
 }
 
-/// Per-Container-App configured CPU/memory caps from the resource template,
-/// rendered alongside the CPU/Memory metrics as "latest: X / max Y". Cached
-/// per resource id; only populated for `ResourceKind::ContainerApp`.
+/// Per-Container-App overview metadata from a single Container App GET: the
+/// CPU/memory/ephemeral caps, ingress FQDN, managed environment, managed
+/// identity, and primary-container env vars. CPU/memory are rendered alongside
+/// the metrics as "latest: X / max Y"; the rest populate the Detail header.
+/// Cached per resource id; only populated for `ResourceKind::ContainerApp`.
 #[derive(Clone, Default)]
-pub struct LimitsCache {
-    pub by_resource: HashMap<String, crate::azure::container_app_limits::ContainerAppLimits>,
+pub struct ContainerAppOverviewCache {
+    pub by_resource: HashMap<String, crate::azure::container_app_overview::ContainerAppOverview>,
     pub pending: HashSet<String>,
 }
 
@@ -363,6 +371,48 @@ pub struct LimitsCache {
 #[derive(Clone, Default)]
 pub struct RevisionMetaCache {
     pub by_resource: HashMap<String, crate::azure::container_app_revisions::ActiveRevisionMeta>,
+}
+
+/// Per-Function-App application settings (OS env vars) from the
+/// `config/appsettings/list` action. Lazily fetched on entering the Detail
+/// view. The list action returns secret values, so it can 403 for read-only
+/// principals; the failure message is cached so the detail view can show a
+/// permission hint instead of silently empty env vars.
+///
+/// (Container App env vars don't need a cache here — they ride on
+/// [`ContainerAppOverviewCache`] since both come from the same Container App GET.)
+#[derive(Clone, Default)]
+pub struct FuncSettingsCache {
+    pub by_resource: HashMap<String, Vec<crate::azure::env_vars::EnvVar>>,
+    pub failures: HashMap<String, String>,
+    pub pending: HashSet<String>,
+}
+
+/// Directory principal object-id → display name, resolved best-effort via
+/// Microsoft Graph for the `created`/`modified` authorship lines in the Detail
+/// view. Only `Application` / `ManagedIdentity` authors (which are GUIDs) get
+/// resolved; `User` authors are already UPNs.
+#[derive(Clone, Default)]
+pub struct PrincipalCache {
+    /// object-id → resolved display name.
+    pub by_id: HashMap<String, String>,
+    /// object-ids we tried and couldn't resolve (no permission / not found);
+    /// kept so we don't retry them every render.
+    pub failed: HashSet<String>,
+    pub pending: HashSet<String>,
+}
+
+/// UI state for the dedicated env-vars page. The list itself is read from the
+/// per-resource caches ([`ContainerAppOverviewCache`] / [`FuncSettingsCache`])
+/// keyed by the selected resource, so this only tracks scroll + reveal.
+#[derive(Clone, Default)]
+pub struct EnvVarsView {
+    pub cursor: usize,
+    /// `x` toggles this — when `true`, values are shown instead of masked.
+    pub revealed: bool,
+    /// Horizontal scroll offset (in characters) for long revealed values.
+    /// Advanced with `l`, retreated with `h`; reset when reveal is toggled.
+    pub h_offset: usize,
 }
 
 /// Per-resource cached Azure Resource Health availability. Populated by a
@@ -1020,11 +1070,17 @@ pub struct AppState {
     pub favorites_only: bool,
     pub loading_resources: bool,
 
+    /// State of the dedicated env-vars page (cursor + whether values are
+    /// revealed). Reset on entering the page, so values always start masked.
+    pub env_vars_view: EnvVarsView,
+
     pub metrics: MetricsCache,
     pub health: HealthCache,
     pub logs: LogsCache,
-    pub limits: LimitsCache,
+    pub container_app_overview: ContainerAppOverviewCache,
     pub revision_meta: RevisionMetaCache,
+    pub func_settings: FuncSettingsCache,
+    pub principals: PrincipalCache,
     pub apim: ApimCache,
     pub appgw: AppGatewayBackendsCache,
     pub storage: StorageCache,
@@ -1086,7 +1142,10 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         let range = config.default_window;
         Self {
-            view: View::Subscriptions,
+            // Land straight on the API resources list (all subscriptions, or a
+            // previously-pinned one restored below). The Subscriptions view is
+            // now an optional filter reached with `s`, not a startup gate.
+            view: View::List,
             view_stack: Vec::new(),
             last_category: Category::Apis,
             subscriptions: Vec::new(),
@@ -1099,6 +1158,7 @@ impl AppState {
             list_filter_active: false,
             favorites_only: false,
             loading_resources: false,
+            env_vars_view: EnvVarsView::default(),
             metrics: MetricsCache {
                 range,
                 ..Default::default()
@@ -1108,8 +1168,10 @@ impl AppState {
                 range,
                 ..Default::default()
             },
-            limits: LimitsCache::default(),
+            container_app_overview: ContainerAppOverviewCache::default(),
             revision_meta: RevisionMetaCache::default(),
+            func_settings: FuncSettingsCache::default(),
+            principals: PrincipalCache::default(),
             apim: ApimCache::default(),
             appgw: AppGatewayBackendsCache::default(),
             storage: StorageCache::default(),
@@ -1342,6 +1404,7 @@ mod tests {
             state: None,
             created_at: None,
             modified_at: None,
+            meta: Default::default(),
         });
         state.storage.accounts = Some(Vec::new());
         state.registry.registries = Some(Vec::new());

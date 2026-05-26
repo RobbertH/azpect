@@ -58,9 +58,9 @@ pub enum AppEvent {
     },
     /// Background load completion: configured CPU/memory caps from a
     /// Container App's template. Only fired for `ResourceKind::ContainerApp`.
-    ContainerAppLimitsLoaded {
+    ContainerAppOverviewLoaded {
         resource_id: String,
-        result: Result<crate::azure::container_app_limits::ContainerAppLimits, String>,
+        result: Result<crate::azure::container_app_overview::ContainerAppOverview, String>,
     },
     /// Background load completion: active-revision metadata (name, image,
     /// replicas, scale) from a Container App. Fired alongside `HealthLoaded`
@@ -68,6 +68,21 @@ pub enum AppEvent {
     ContainerAppRevisionMetaLoaded {
         resource_id: String,
         result: Result<Option<crate::azure::container_app_revisions::ActiveRevisionMeta>, String>,
+    },
+    /// Background load completion: a Function App's application settings (OS env
+    /// vars) from the `config/appsettings/list` action. Only fired for
+    /// `ResourceKind::FunctionApp`. `Err` is commonly a 403 for read-only
+    /// principals (the action returns secrets).
+    FunctionAppSettingsLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::env_vars::EnvVar>, String>,
+    },
+    /// Background load completion: a directory principal's display name resolved
+    /// via Microsoft Graph (best-effort; `Err` / `Ok(None)` ⇒ fall back to the
+    /// object-id). Keyed by the object-id.
+    PrincipalResolved {
+        object_id: String,
+        result: Result<Option<String>, String>,
     },
     /// Background load completion: list of APIs for an APIM service.
     ApimApisLoaded {
@@ -237,6 +252,13 @@ pub enum Action {
     /// Toggle word-wrap in the logs view so long source/message cells render
     /// as multi-line rows instead of being truncated. Bound to `w`.
     ToggleWrap,
+    /// Open the dedicated env-vars page for the selected API asset. Bound to
+    /// `e` while in Detail (in the logs views `e` stays errors-only). No-op for
+    /// resource kinds without env vars.
+    OpenEnvVars,
+    /// Reveal / re-mask (k9s-style "decode") env-var values in the env-vars
+    /// page. Bound to `x`.
+    DecodeSecret,
     Help,
     /// Open the vim/k9s-style command palette (`:`).
     StartCommand,
@@ -331,11 +353,19 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // MoveRight so the key isn't a no-op there. Uppercase `L` is kept as
         // a universal alias for muscle memory.
         KeyCode::Char('l') if !ctrl => match view {
-            View::Logs | View::LogDetail => Action::MoveRight,
+            // Horizontal nav in views that use it; elsewhere `l` opens logs.
+            View::Logs | View::LogDetail | View::EnvVars => Action::MoveRight,
             _ => Action::OpenLogs,
         },
         KeyCode::Char('L') => Action::OpenLogs,
-        KeyCode::Char('e') => Action::ToggleErrorsOnly,
+        // `e` opens the env-vars page from Detail, but stays errors-only inside
+        // the logs views (mirrors how `l` is context-aware).
+        KeyCode::Char('e') => match view {
+            View::Logs | View::LogDetail => Action::ToggleErrorsOnly,
+            View::Detail => Action::OpenEnvVars,
+            _ => Action::ToggleErrorsOnly,
+        },
+        KeyCode::Char('x') => Action::DecodeSecret,
         KeyCode::Char('f') => Action::ToggleFavorite,
         KeyCode::Char('F') => Action::ToggleFavoritesOnly,
         KeyCode::Char('/') => Action::StartSearch,

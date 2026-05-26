@@ -12,7 +12,10 @@ use crate::ui::events::Action;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Enter open  y yank id  o portal  r refresh  ? help  q quit";
+const FOOTER_HINT: &str = "j/k move  Enter filter  y yank id  o portal  r refresh  ? help  q quit";
+
+/// Label for the synthetic top row that clears the subscription filter.
+const ALL_LABEL: &str = "All subscriptions";
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -61,53 +64,74 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         )));
         frame.render_widget(p, inner);
     } else {
-        let cursor = state
-            .subscription_cursor
-            .min(state.subscriptions.len().saturating_sub(1));
+        // Row 0 is the synthetic "All subscriptions" scope; the real
+        // subscriptions follow at cursor index +1.
+        let total = state.subscriptions.len() + 1;
+        let cursor = state.subscription_cursor.min(total - 1);
 
         let max_name = state
             .subscriptions
             .iter()
             .map(|s| s.display_name.chars().count())
+            .chain(std::iter::once(ALL_LABEL.len()))
             .max()
             .unwrap_or(0)
             .min(40);
 
-        let lines: Vec<Line> = state
-            .subscriptions
-            .iter()
-            .enumerate()
-            .map(|(i, sub)| {
-                let selected = i == cursor;
-                let name = truncate_right(&sub.display_name, max_name);
-                let pad_name = format!("{:<width$}", name, width = max_name);
-                let state_color = match sub.state.as_str() {
-                    "Enabled" => theme.healthy,
-                    "Disabled" | "Deleted" | "Warned" => theme.degraded,
-                    _ => theme.muted,
-                };
+        let mut lines: Vec<Line> = Vec::with_capacity(total);
 
-                let mut spans = vec![
-                    Span::raw(if selected { " ▍ " } else { "   " }),
-                    Span::styled(pad_name, Style::default().fg(theme.fg)),
-                    Span::raw("  "),
-                    Span::styled(format!("({})", sub.state), Style::default().fg(state_color)),
-                    Span::raw("  "),
-                    Span::styled(sub.id.as_str(), Style::default().fg(theme.muted)),
-                ];
+        // "All subscriptions" row.
+        {
+            let selected = cursor == 0;
+            let pad = format!("{:<width$}", ALL_LABEL, width = max_name);
+            let mut spans = vec![
+                Span::raw(if selected { " ▍ " } else { "   " }),
+                Span::styled(
+                    pad,
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if state.selected_subscription.is_none() {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("· active", Style::default().fg(theme.accent)));
+            }
+            lines.push(if selected {
+                Line::from(spans).style(theme.selection())
+            } else {
+                Line::from(spans)
+            });
+        }
 
-                if Some(&sub.id) == state.config.last_subscription_id.as_ref() {
-                    spans.push(Span::raw("  "));
-                    spans.push(Span::styled("· last", Style::default().fg(theme.accent)));
-                }
+        for (i, sub) in state.subscriptions.iter().enumerate() {
+            let selected = cursor == i + 1;
+            let name = truncate_right(&sub.display_name, max_name);
+            let pad_name = format!("{:<width$}", name, width = max_name);
+            let state_color = match sub.state.as_str() {
+                "Enabled" => theme.healthy,
+                "Disabled" | "Deleted" | "Warned" => theme.degraded,
+                _ => theme.muted,
+            };
 
-                if selected {
-                    Line::from(spans).style(theme.selection())
-                } else {
-                    Line::from(spans)
-                }
-            })
-            .collect();
+            let mut spans = vec![
+                Span::raw(if selected { " ▍ " } else { "   " }),
+                Span::styled(pad_name, Style::default().fg(theme.fg)),
+                Span::raw("  "),
+                Span::styled(format!("({})", sub.state), Style::default().fg(state_color)),
+                Span::raw("  "),
+                Span::styled(sub.id.as_str(), Style::default().fg(theme.muted)),
+            ];
+
+            if state.selected_subscription.as_ref() == Some(&sub.id) {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("· active", Style::default().fg(theme.accent)));
+            }
+
+            lines.push(if selected {
+                Line::from(spans).style(theme.selection())
+            } else {
+                Line::from(spans)
+            });
+        }
 
         let p = Paragraph::new(lines);
         frame.render_widget(p, inner);
@@ -122,12 +146,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 /// View-local input handler. Returns `true` if the action was consumed.
 pub fn handle(action: Action, state: &mut AppState) -> bool {
-    let len = state.subscriptions.len();
+    // +1 for the synthetic "All subscriptions" row at cursor 0.
+    let total = state.subscriptions.len() + 1;
     match action {
         Action::MoveDown => {
-            if len > 0 {
-                state.subscription_cursor = (state.subscription_cursor + 1).min(len - 1);
-            }
+            state.subscription_cursor = (state.subscription_cursor + 1).min(total - 1);
             true
         }
         Action::MoveUp => {
@@ -135,9 +158,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::HalfPageDown => {
-            if len > 0 {
-                state.subscription_cursor = (state.subscription_cursor + 10).min(len - 1);
-            }
+            state.subscription_cursor = (state.subscription_cursor + 10).min(total - 1);
             true
         }
         Action::HalfPageUp => {
@@ -149,31 +170,36 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::GotoBottom => {
-            if len > 0 {
-                state.subscription_cursor = len - 1;
-            }
+            state.subscription_cursor = total - 1;
             true
         }
         Action::OpenSelected => {
-            if let Some(sub) = state.subscriptions.get(state.subscription_cursor) {
-                state.selected_subscription = Some(sub.id.clone());
-                state.config.last_subscription_id = Some(sub.id.clone());
-                state.view_stack.push(state.view);
-                // Every subscription-scoped cache is stale for the new scope.
-                // Loop over `Category::ALL` so adding a new resource type
-                // (a new `Category` variant) automatically gets its cache
-                // flushed here — no risk of a future ACR-style "stale data
-                // sticks around" bug.
-                for category in crate::ui::state::Category::ALL {
-                    category.clear_cache(state);
-                }
-                // Land back on whichever category the user was most recently
-                // inside, so switching subscriptions feels like "re-scope what
-                // I'm looking at" rather than "throw me back to apis".
-                // Defaults to `Category::Apis` on first launch.
-                state.view = state.last_category.root_view();
-                state.list_cursor = 0;
+            // Cursor 0 = "All subscriptions" → clear the filter; any other row
+            // pins that subscription. Persist the choice so the next launch
+            // honors it (`None` for All).
+            let new_selection = if state.subscription_cursor == 0 {
+                None
+            } else {
+                state
+                    .subscriptions
+                    .get(state.subscription_cursor - 1)
+                    .map(|s| s.id.clone())
+            };
+            state.selected_subscription = new_selection.clone();
+            state.config.last_subscription_id = new_selection;
+            state.view_stack.push(state.view);
+            // Every subscription-scoped cache is stale for the new scope. Loop
+            // over `Category::ALL` so adding a new resource type automatically
+            // gets its cache flushed here — no risk of a future ACR-style
+            // "stale data sticks around" bug.
+            for category in crate::ui::state::Category::ALL {
+                category.clear_cache(state);
             }
+            // Land back on whichever category the user was most recently inside
+            // so re-scoping feels like "re-scope what I'm looking at" rather
+            // than "throw me back to apis". Defaults to `Category::Apis`.
+            state.view = state.last_category.root_view();
+            state.list_cursor = 0;
             true
         }
         _ => false,
@@ -236,21 +262,25 @@ mod tests {
 
     #[test]
     fn handles_navigation() {
+        // Rows: [All, alpha, beta] → cursor clamps to 2.
         let mut state = fixture();
         assert!(handle(Action::MoveDown, &mut state));
         assert_eq!(state.subscription_cursor, 1);
         assert!(handle(Action::MoveDown, &mut state));
-        assert_eq!(state.subscription_cursor, 1, "clamped to last");
+        assert_eq!(state.subscription_cursor, 2);
+        assert!(handle(Action::MoveDown, &mut state));
+        assert_eq!(state.subscription_cursor, 2, "clamped to last");
         assert!(handle(Action::MoveUp, &mut state));
-        assert_eq!(state.subscription_cursor, 0);
-        assert!(handle(Action::GotoBottom, &mut state));
         assert_eq!(state.subscription_cursor, 1);
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert_eq!(state.subscription_cursor, 2);
     }
 
     #[test]
-    fn open_selected_transitions_view() {
+    fn open_selected_pins_subscription() {
+        // Cursor 2 = beta (row 0 is "All", row 1 is alpha).
         let mut state = fixture();
-        state.subscription_cursor = 1;
+        state.subscription_cursor = 2;
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::List);
         assert_eq!(
@@ -263,6 +293,25 @@ mod tests {
             "picking a sub should update the persisted last_subscription_id",
         );
         assert!(state.resources.is_empty());
+    }
+
+    #[test]
+    fn open_selected_all_row_clears_the_filter() {
+        let mut state = fixture();
+        // Pretend a sub was pinned, then pick the "All subscriptions" row.
+        state.selected_subscription = Some("22222222-2222-2222-2222-222222222222".into());
+        state.config.last_subscription_id = Some("22222222-2222-2222-2222-222222222222".into());
+        state.subscription_cursor = 0;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::List);
+        assert!(
+            state.selected_subscription.is_none(),
+            "All clears the scope"
+        );
+        assert!(
+            state.config.last_subscription_id.is_none(),
+            "All persists as no-pin"
+        );
     }
 
     #[test]
