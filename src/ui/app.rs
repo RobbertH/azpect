@@ -504,6 +504,7 @@ async fn event_loop(
                         spawn_missing_container_app_overview(
                             state, auth, tx, /* force */ false,
                         );
+                        spawn_missing_function_app_image(state, auth, tx, /* force */ false);
                     }
                     Err(e) => state.set_status(format!("resources: {e}")),
                 }
@@ -598,6 +599,18 @@ async fn event_loop(
                     state.revision_meta.by_resource.insert(resource_id, meta);
                 }
                 // Same silent-on-error policy as limits: decorative.
+            }
+            AppEvent::FunctionAppImageLoaded {
+                resource_id,
+                result,
+            } => {
+                state.func_image.pending.remove(&resource_id);
+                if let Ok(image) = result {
+                    state.func_image.by_resource.insert(resource_id, image);
+                }
+                // Silent on error (typically a 403 / config read denial): the
+                // VERSION column just stays blank, same policy as the Container
+                // App overview decoration.
             }
             AppEvent::FunctionAppSettingsLoaded {
                 resource_id,
@@ -2081,6 +2094,7 @@ fn kick_off_loads_for_view(
                     spawn_missing_list_metrics(state, auth, tx, /* force */ true);
                     spawn_missing_list_health(state, auth, tx, /* force */ true);
                     spawn_missing_container_app_overview(state, auth, tx, /* force */ true);
+                    spawn_missing_function_app_image(state, auth, tx, /* force */ true);
                 }
             }
         }
@@ -3327,6 +3341,22 @@ fn spawn_load_container_app_overview(
     });
 }
 
+fn spawn_load_function_app_image(
+    auth: AzureAuth,
+    resource_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::function_app_config::fetch_image(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::FunctionAppImageLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
 fn spawn_load_function_app_settings(
     auth: AzureAuth,
     resource_id: String,
@@ -3398,6 +3428,33 @@ fn spawn_missing_container_app_overview(
             .pending
             .insert(resource_id.clone());
         spawn_load_container_app_overview(auth.clone(), resource_id, tx.clone());
+    }
+}
+
+/// Kick off a `config/web` fetch for every Function App that doesn't already
+/// have a cached deployed image. Feeds the list's VERSION column; same
+/// eager-on-load pattern as `spawn_missing_container_app_overview` (Container
+/// Apps get their image for free off the health fetch, so they're skipped here).
+fn spawn_missing_function_app_image(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    force: bool,
+) {
+    use crate::azure::resources::ResourceKind;
+    let to_fetch: Vec<String> = state
+        .resources
+        .iter()
+        .filter(|r| r.kind == ResourceKind::FunctionApp)
+        .filter(|r| {
+            (force || !state.func_image.by_resource.contains_key(&r.id))
+                && !state.func_image.pending.contains(&r.id)
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    for resource_id in to_fetch {
+        state.func_image.pending.insert(resource_id.clone());
+        spawn_load_function_app_image(auth.clone(), resource_id, tx.clone());
     }
 }
 

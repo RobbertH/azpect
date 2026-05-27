@@ -10,6 +10,7 @@ pub mod container_app_revisions;
 pub mod container_app_workspace;
 pub mod cosmos;
 pub mod env_vars;
+pub mod function_app_config;
 pub mod function_app_settings;
 pub mod health;
 pub mod key_vault;

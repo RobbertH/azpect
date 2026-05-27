@@ -26,6 +26,14 @@ const HALF_PAGE: usize = 10;
 /// Names longer than this get truncated with an ellipsis; shorter names are
 /// space-padded.
 const NAME_COL_WIDTH: usize = 36;
+/// Width of the `KIND` column. Sized for the longest tag (`FuncApp` / `ContApp`,
+/// 7 chars); shorter tags (`APIM`, `AppGW`) are space-padded.
+const KIND_COL_WIDTH: usize = 7;
+/// Width of the `VERSION` column: the deployed image *tag* (the version/hash),
+/// not the full image. Most tags (short git SHAs, semver, dates) fit; longer
+/// ones truncate with an ellipsis. Blank for APIM / App Gateway rows and for
+/// code-deployed Function Apps with no container image.
+const VERSION_COL_WIDTH: usize = 14;
 const RG_COL_WIDTH: usize = 20;
 /// Width of the SUBSCRIPTION column, shown only in all-subscriptions mode
 /// (mirrors the Storage / Registries / Cosmos / Key Vault / Service Bus lists).
@@ -138,9 +146,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Span::raw("    "), // selection prefix (2) + favorite glyph + space (2)
                 hdr("NAME", max_name),
                 Span::raw("  "),
-                hdr("KIND", 4),
+                hdr("KIND", KIND_COL_WIDTH),
                 Span::raw("    "), // badge glyph (●) + space + state column padding
                 hdr("STATUS", 8),
+                Span::raw("  "),
+                hdr("VERSION", VERSION_COL_WIDTH),
                 Span::raw("  "),
                 hdr("RESOURCE GROUP", max_rg),
             ];
@@ -176,9 +186,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     width = max_name
                 );
 
-                let kind_tag = format!("{:<4}", r.kind.short_tag());
+                let kind_tag = format!("{:<KIND_COL_WIDTH$}", r.kind.short_tag());
 
                 let (badge_color, badge_label) = badge_for_row(r, state, theme);
+
+                // Deployed image tag (the version/hash). Dots while the backing
+                // fetch is in flight; blank when there's no image to show.
+                let version_text = match deployed_image(r, state) {
+                    Some(image) => image_tag(&image).to_string(),
+                    None if image_pending(r, state) => "…".to_string(),
+                    None => String::new(),
+                };
+                let version = format!(
+                    "{:<width$}",
+                    truncate_right(&version_text, VERSION_COL_WIDTH),
+                    width = VERSION_COL_WIDTH
+                );
 
                 let rg = format!(
                     "{:<width$}",
@@ -206,6 +229,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                         format!("{:<8}", badge_label),
                         Style::default().fg(badge_color),
                     ),
+                    Span::raw("  "),
+                    Span::styled(version, Style::default().fg(theme.fg)),
                     Span::raw("  "),
                     Span::styled(rg, Style::default().fg(theme.muted)),
                 ];
@@ -280,6 +305,45 @@ fn format_date(dt: Option<&DateTime<Utc>>) -> String {
     match dt {
         Some(d) => d.format("%Y-%m-%d").to_string(),
         None => String::new(),
+    }
+}
+
+/// The deployed container image for a row, when known. Container Apps read the
+/// active-revision image (already fetched for every row alongside the health
+/// badge); Function Apps read the `config/web` image fetched in the background.
+/// APIM and App Gateways have no container image.
+fn deployed_image(r: &Resource, state: &AppState) -> Option<String> {
+    match r.kind {
+        ResourceKind::ContainerApp => state
+            .revision_meta
+            .by_resource
+            .get(&r.id)
+            .and_then(|m| m.image.clone()),
+        ResourceKind::FunctionApp => state.func_image.by_resource.get(&r.id).cloned().flatten(),
+        _ => None,
+    }
+}
+
+/// Whether the fetch backing a row's deployed image is still in flight, so the
+/// VERSION column can show `…` rather than a misleading blank.
+fn image_pending(r: &Resource, state: &AppState) -> bool {
+    match r.kind {
+        // Container App image rides on the revisions fetch that drives health.
+        ResourceKind::ContainerApp => state.health.pending.contains(&r.id),
+        ResourceKind::FunctionApp => state.func_image.pending.contains(&r.id),
+        _ => false,
+    }
+}
+
+/// Extract the tag — the version/hash — from a full image reference. Splits off
+/// the final path segment first so a registry port (`host:port/img:tag`) isn't
+/// mistaken for the tag; a digest reference (`img@sha256:hex`) yields the hex.
+/// Returns the empty string for an untagged image.
+fn image_tag(image: &str) -> &str {
+    let last_segment = image.rsplit('/').next().unwrap_or(image);
+    match last_segment.rsplit_once(':') {
+        Some((_, tag)) => tag,
+        None => "",
     }
 }
 
@@ -461,14 +525,18 @@ mod tests {
     #[test]
     fn renders_without_panic() {
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(120, 12);
+        // Wide enough for all columns (NAME…CREATED, incl. the SUBSCRIPTION and
+        // VERSION columns) so header assertions below see the trailing ones.
+        let backend = TestBackend::new(160, 12);
         let mut term = Terminal::new(backend).unwrap();
         let state = fixture();
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("alpha-func"));
-        assert!(s.contains("Func"));
+        assert!(s.contains("FuncApp"));
         assert!(s.contains("LOADING"));
+        // VERSION column shipped.
+        assert!(s.contains("VERSION"), "expected VERSION header in {s}");
         // The renamed block title now reads "api resources".
         assert!(
             s.contains("api resources"),
@@ -501,6 +569,63 @@ mod tests {
         assert_eq!(format_date(None), "");
         let d = Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
         assert_eq!(format_date(Some(&d)), "2026-05-21");
+    }
+
+    #[test]
+    fn image_tag_extracts_the_version() {
+        assert_eq!(image_tag("nginx:latest"), "latest");
+        assert_eq!(image_tag("myacr.azurecr.io/files-api:abc123"), "abc123");
+        // A registry port must not be mistaken for the tag.
+        assert_eq!(image_tag("host:5000/img:v1.2.3"), "v1.2.3");
+        // Digest-pinned image yields the digest hex.
+        assert_eq!(image_tag("acr/app@sha256:deadbeef"), "deadbeef");
+        // Untagged images have no version to show.
+        assert_eq!(image_tag("nginx"), "");
+        assert_eq!(image_tag("acr/nginx"), "");
+    }
+
+    #[test]
+    fn renders_container_app_version_tag() {
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // fixture()[2] (/r/three) is the Container App. Its image rides on the
+        // revision-meta cache, already populated by the health fetch.
+        state.revision_meta.by_resource.insert(
+            "/r/three".into(),
+            ActiveRevisionMeta {
+                image: Some("myacr.azurecr.io/files-api:abc123".into()),
+                ..Default::default()
+            },
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("abc123"),
+            "expected container app image tag in row, got {s}"
+        );
+    }
+
+    #[test]
+    fn renders_function_app_version_tag() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // fixture()[0] (/r/one) is the Function App. Its image comes from the
+        // background config/web fetch.
+        state
+            .func_image
+            .by_resource
+            .insert("/r/one".into(), Some("acr/f:fnver99".into()));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("fnver99"),
+            "expected function app image tag in row, got {s}"
+        );
     }
 
     #[test]

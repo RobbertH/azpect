@@ -373,6 +373,20 @@ pub struct RevisionMetaCache {
     pub by_resource: HashMap<String, crate::azure::container_app_revisions::ActiveRevisionMeta>,
 }
 
+/// Per-Function-App deployed container image, parsed from `config/web`'s
+/// `linuxFxVersion`. Populated by a background fetch kicked off after
+/// `ResourcesLoaded` (same eager pattern as [`ContainerAppOverviewCache`]) and
+/// consumed by the list's VERSION column. The `Option` value distinguishes
+/// "fetched, but the app is code-deployed (no image)" from "not fetched yet".
+///
+/// (Container Apps don't need a cache here — their deployed image rides on
+/// [`RevisionMetaCache`], populated by the same fetch that drives their health badge.)
+#[derive(Clone, Default)]
+pub struct FuncImageCache {
+    pub by_resource: HashMap<String, Option<String>>,
+    pub pending: HashSet<String>,
+}
+
 /// Per-Function-App application settings (OS env vars) from the
 /// `config/appsettings/list` action. Lazily fetched on entering the Detail
 /// view. The list action returns secret values, so it can 403 for read-only
@@ -1079,6 +1093,7 @@ pub struct AppState {
     pub logs: LogsCache,
     pub container_app_overview: ContainerAppOverviewCache,
     pub revision_meta: RevisionMetaCache,
+    pub func_image: FuncImageCache,
     pub func_settings: FuncSettingsCache,
     pub principals: PrincipalCache,
     pub apim: ApimCache,
@@ -1170,6 +1185,7 @@ impl AppState {
             },
             container_app_overview: ContainerAppOverviewCache::default(),
             revision_meta: RevisionMetaCache::default(),
+            func_image: FuncImageCache::default(),
             func_settings: FuncSettingsCache::default(),
             principals: PrincipalCache::default(),
             apim: ApimCache::default(),

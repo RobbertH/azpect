@@ -69,6 +69,14 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<Option<crate::azure::container_app_revisions::ActiveRevisionMeta>, String>,
     },
+    /// Background load completion: a Function App's deployed container image,
+    /// parsed from `config/web`'s `linuxFxVersion`. Only fired for
+    /// `ResourceKind::FunctionApp`. `Ok(None)` means the app is code-deployed
+    /// (no container image); `Err` leaves the VERSION column blank silently.
+    FunctionAppImageLoaded {
+        resource_id: String,
+        result: Result<Option<String>, String>,
+    },
     /// Background load completion: a Function App's application settings (OS env
     /// vars) from the `config/appsettings/list` action. Only fired for
     /// `ResourceKind::FunctionApp`. `Err` is commonly a 403 for read-only
