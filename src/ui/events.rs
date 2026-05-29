@@ -69,6 +69,14 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<Option<crate::azure::container_app_revisions::ActiveRevisionMeta>, String>,
     },
+    /// Background load completion: per-replica live status (containers, ready,
+    /// restart count) for a Container App's active revision. Fired downstream
+    /// of `ContainerAppRevisionMetaLoaded` since the replicas endpoint needs
+    /// the revision name in its path.
+    ContainerAppReplicasLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::container_app_replicas::ReplicaInstance>, String>,
+    },
     /// Background load completion: a Function App's deployed container image,
     /// parsed from `config/web`'s `linuxFxVersion`. Only fired for
     /// `ResourceKind::FunctionApp`. `Ok(None)` means the app is code-deployed

@@ -451,7 +451,14 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                         state.appgw.cursor = 0;
                         View::AppGatewayBackends
                     }
-                    _ => View::Detail,
+                    _ => {
+                        // Fresh Detail entry: reset the meta-row cursor + any
+                        // lingering modal from a previous visit. Esc-back-then-
+                        // re-Enter should land the cursor at the top, not
+                        // wherever the user left it on the previous resource.
+                        state.detail_view = crate::ui::state::DetailView::default();
+                        View::Detail
+                    }
                 };
             }
             true

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod az_login;
 pub mod client;
 pub mod container_app_overview;
+pub mod container_app_replicas;
 pub mod container_app_revisions;
 pub mod container_app_workspace;
 pub mod cosmos;

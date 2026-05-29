@@ -12,10 +12,32 @@ use ratatui::Frame;
 use crate::azure::health::{derive, find, HealthStatus};
 use crate::azure::logs::supports_logs;
 use crate::azure::metrics::{MetricKind, MetricSeries, TimeRange};
-use crate::azure::resources::ResourceKind;
+use crate::azure::resources::{Resource, ResourceKind};
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+use crate::ui::state::{AppState, DetailModal, View};
 use crate::ui::theme::Theme;
+
+/// One Detail row's worth of selection metadata: what `y` should yank, what
+/// the Enter modal should show, and (for env-vars-style rows) whether Enter
+/// should dispatch a different action instead of opening the modal.
+///
+/// Built by [`selectable_metas`] in the same order the rows appear on screen,
+/// so the cursor index in [`crate::ui::state::DetailView`] maps 1:1 to a slot
+/// in the returned Vec.
+#[derive(Clone)]
+struct SelectableMeta {
+    /// What `y` copies. The plain value, not the label.
+    yank: String,
+    /// Modal window title.
+    modal_title: String,
+    /// Modal body lines (one entry per visible line, wrapped at modal width).
+    modal_lines: Vec<String>,
+    /// When `Some`, Enter dispatches this action instead of opening the modal.
+    /// Currently only used by the env-vars teaser row, which routes Enter to
+    /// the dedicated EnvVars page (the modal is redundant when a real page
+    /// exists).
+    enter_action: Option<Action>,
+}
 
 /// Base footer hint without a resource-kind-specific Enter clue. The drill-in
 /// segment is appended per-render by [`footer_hint_for`] so Function Apps /
@@ -25,16 +47,14 @@ const FOOTER_HINT_BASE: &str = "0 1h  1 1d  7 7d  l logs  Esc back  r refresh  ?
 fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
     use crate::azure::resources::ResourceKind;
     let enter_clue = match kind {
-        ResourceKind::Apim => Some("Enter apis"),
-        ResourceKind::AppGateway => Some("Enter backends"),
-        ResourceKind::FunctionApp | ResourceKind::ContainerApp => None,
+        ResourceKind::Apim => "Enter apis",
+        ResourceKind::AppGateway => "Enter backends",
+        // Enter on a meta row pops the row-details modal (see `render_modal`).
+        // The j/k navigation is implicit in the highlighted row so worth
+        // surfacing here too.
+        ResourceKind::FunctionApp | ResourceKind::ContainerApp => "j/k row  Enter details",
     };
-    match enter_clue {
-        Some(clue) => {
-            format!("0 1h  1 1d  7 7d  l logs  {clue}  Esc back  r refresh  ? help  q quit")
-        }
-        None => FOOTER_HINT_BASE.to_string(),
-    }
+    format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
 }
 
 const ROW_KINDS: [(MetricKind, &str); 4] = [
@@ -139,10 +159,51 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // corresponding line.
     let revision_meta = state.revision_meta.by_resource.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
-    let meta_lines = container_app_meta_lines(revision_meta, limits, theme);
+    // For Container Apps the overview + revision metadata loads after the first
+    // frame. Render skeleton placeholders for the meta block while either is
+    // missing so the rest of the page (tags / created / modified) doesn't get
+    // pushed down once the data lands. Skeleton rows render in muted gray.
+    let is_ca = resource.kind == ResourceKind::ContainerApp;
+    let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
+    let (meta_lines, meta_is_skeleton) = if ca_meta_loading {
+        (container_app_skeleton_meta_rows(), true)
+    } else {
+        (container_app_meta_lines(revision_meta, limits), false)
+    };
+    // Live replica status (per-replica container readiness / restarts). Fed by
+    // the `…/revisions/{rev}/replicas` fetch that chains off the revision-meta
+    // load. Only Container Apps populate this cache, so non-CAs collapse to no
+    // rows regardless of the kind check.
+    let cached_replicas = state.replica_instances.by_resource.get(&resource.id);
+    let replicas_loading_skeleton = is_ca && cached_replicas.is_none();
+    let (replica_lines, replica_is_skeleton) = if replicas_loading_skeleton {
+        (
+            vec![(
+                "replica:".to_string(),
+                "loading\u{2026}".to_string(),
+                "replica: loading\u{2026}".to_string(),
+            )],
+            true,
+        )
+    } else {
+        (
+            replica_status_lines(
+                cached_replicas,
+                state.replica_instances.pending.contains(&resource.id),
+                state.replica_instances.failures.get(&resource.id),
+            ),
+            false,
+        )
+    };
     // Env vars (Container Apps + Function Apps), masked unless revealed, then
-    // the kind-agnostic tags + ownership lines.
-    let env_rows = env_var_rows(state, resource, theme);
+    // the kind-agnostic tags + ownership lines. Skip env_var_rows entirely for
+    // Container Apps while the overview is loading — the skeleton meta block
+    // above already reserved a row for it, so re-emitting would double the line.
+    let env_rows = if ca_meta_loading {
+        Vec::new()
+    } else {
+        env_var_rows(state, resource, theme)
+    };
     let general_lines = general_meta_lines(resource, &state.principals);
 
     // Reserve enough rows for the header line + however many rows the second
@@ -152,6 +213,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Each meta line already wraps independently; reserve worst-case rows so
     // none clip.
     for (_, _, plain_text) in &meta_lines {
+        context_height += wrapped_line_count(plain_text, inner.width).max(1);
+    }
+    for (_, _, plain_text) in &replica_lines {
         context_height += wrapped_line_count(plain_text, inner.width).max(1);
     }
     for (_, plain_text) in &env_rows {
@@ -191,12 +255,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             ),
             Span::styled(
                 // Stays up while *any* of the detail's data is reloading
-                // (metrics, health, or the Container App overview/revision), so
-                // a refresh keeps the old rows visible behind this hint rather
-                // than collapsing them.
+                // (metrics, health, the Container App overview/revision, or
+                // per-replica status), so a refresh keeps the old rows visible
+                // behind this hint rather than collapsing them.
                 if state.metrics.loading
                     || state.health.pending.contains(&resource.id)
                     || state.container_app_overview.pending.contains(&resource.id)
+                    || state.replica_instances.pending.contains(&resource.id)
                 {
                     "  · refreshing…"
                 } else {
@@ -207,15 +272,67 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ]),
         second_line,
     ];
+    // Track line indices that correspond to selectable rows so the cursor's
+    // row can be highlighted by patching its spans with `theme.selection()`
+    // after all rows have been pushed. The order here MUST match the order
+    // [`selectable_metas`] emits — same conditions, same data sources.
+    let mut selectable_line_idx: Vec<usize> = Vec::new();
+    // State row is selectable when there's no metrics-error overlay.
+    if failure.is_none() {
+        selectable_line_idx.push(1);
+    }
     for (label, value, _) in meta_lines {
-        context_lines.push(styled_meta_line(label, value, theme));
+        let line_idx = context_lines.len();
+        let line = if meta_is_skeleton {
+            styled_skeleton_line(label, value, theme)
+        } else {
+            styled_meta_line(label, value, theme)
+        };
+        context_lines.push(line);
+        if !meta_is_skeleton {
+            selectable_line_idx.push(line_idx);
+        }
+    }
+    for (label, value, _) in replica_lines {
+        let line_idx = context_lines.len();
+        let line = if replica_is_skeleton {
+            styled_skeleton_line(label, value, theme)
+        } else {
+            styled_meta_line(label, value, theme)
+        };
+        context_lines.push(line);
+        if !replica_is_skeleton {
+            selectable_line_idx.push(line_idx);
+        }
     }
     for (line, _) in env_rows {
+        let line_idx = context_lines.len();
         context_lines.push(line);
+        selectable_line_idx.push(line_idx);
     }
     for (label, value, _) in general_lines {
+        let line_idx = context_lines.len();
         context_lines.push(styled_meta_line(label, value, theme));
+        selectable_line_idx.push(line_idx);
     }
+
+    // Apply the cursor highlight. The cursor lives in `DetailView` and is an
+    // index into the *selectable* list, so we clamp here and patch spans on
+    // the corresponding rendered line. Clamping is read-only — the handler is
+    // responsible for keeping `state.detail_view.cursor` in range across data
+    // shape changes (new rows appearing, etc.).
+    if !selectable_line_idx.is_empty() {
+        let cursor = state.detail_view.cursor.min(selectable_line_idx.len() - 1);
+        if let Some(&idx) = selectable_line_idx.get(cursor) {
+            if let Some(line) = context_lines.get_mut(idx) {
+                let hl = theme.selection();
+                for span in line.spans.iter_mut() {
+                    span.style = span.style.patch(hl);
+                }
+            }
+        }
+    }
+
     let context = Paragraph::new(context_lines).wrap(Wrap { trim: false });
     frame.render_widget(context, body[0]);
 
@@ -464,51 +581,247 @@ fn short_missing_reason(reason: &str) -> String {
 /// Detail header. Each entry is `(label, value, plain_text)`: the first two
 /// drive styled rendering (bold muted label + accent value), the third is the
 /// concatenated plain string used only for wrap-aware height reservation.
+/// Labels are owned strings so multi-row sections (containers, replicas) can
+/// emit blank-padded continuation labels for column alignment without `'static`
+/// lifetime gymnastics.
 ///
 /// Missing pieces are skipped: no revision data → no lines; no image → no
 /// image line; no ingress fqdn → no fqdn line.
 fn container_app_meta_lines(
     revision_meta: Option<&crate::azure::container_app_revisions::ActiveRevisionMeta>,
     limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
-    _theme: &Theme,
-) -> Vec<(&'static str, String, String)> {
-    let mut out: Vec<(&'static str, String, String)> = Vec::new();
+) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
 
     if let Some(m) = revision_meta {
         if !m.name.is_empty() {
-            out.push(("rev:", m.name.clone(), format!("rev: {}", m.name)));
+            out.push(("rev:".into(), m.name.clone(), format!("rev: {}", m.name)));
         }
         if let Some(img) = &m.image {
-            out.push(("image:", img.clone(), format!("image: {img}")));
+            out.push(("image:".into(), img.clone(), format!("image: {img}")));
         }
         let replicas_value = match (m.min_replicas, m.max_replicas) {
             (0, 0) => format!("{}", m.replicas),
             (min, max) => format!("{} of {min}\u{2013}{max}", m.replicas),
         };
         let plain = format!("replicas: {replicas_value}");
-        out.push(("replicas:", replicas_value, plain));
+        out.push(("replicas:".into(), replicas_value, plain));
     }
 
     if let Some(l) = limits {
+        if !l.containers.is_empty() {
+            push_template_container_rows(&mut out, &l.containers);
+        }
         if let Some(eph) = l.ephemeral_storage.as_deref() {
-            out.push(("ephemeral:", eph.to_string(), format!("ephemeral: {eph}")));
+            out.push((
+                "ephemeral:".into(),
+                eph.to_string(),
+                format!("ephemeral: {eph}"),
+            ));
         }
         if let Some(fqdn) = l.fqdn.as_deref() {
-            out.push(("fqdn:", fqdn.to_string(), format!("fqdn: {fqdn}")));
+            out.push(("fqdn:".into(), fqdn.to_string(), format!("fqdn: {fqdn}")));
         }
         if let Some(env) = l.managed_environment.as_deref() {
             out.push((
-                "environment:",
+                "environment:".into(),
                 env.to_string(),
                 format!("environment: {env}"),
             ));
         }
         if let Some(id) = l.managed_identity.as_deref() {
-            out.push(("identity:", id.to_string(), format!("identity: {id}")));
+            out.push((
+                "identity:".into(),
+                id.to_string(),
+                format!("identity: {id}"),
+            ));
         }
     }
 
     out
+}
+
+/// Emit one row per template container, sharing the `containers:` label on
+/// the first row and using a space-padded blank label on continuation rows so
+/// values stack in a consistent column. `name` is left-padded to the longest
+/// name in the set so `image` / `resources` align across rows.
+fn push_template_container_rows(
+    out: &mut Vec<(String, String, String)>,
+    containers: &[crate::azure::container_app_overview::ContainerSpec],
+) {
+    const LABEL: &str = "containers:";
+    let max_name = containers
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let blank_label: String = " ".repeat(LABEL.chars().count());
+
+    for (idx, c) in containers.iter().enumerate() {
+        let name_col = format!("{:<width$}", c.name, width = max_name);
+        let image = c.image.as_deref().unwrap_or("\u{2014}"); // em dash for missing
+        let res = format!(
+            "{} mCores \u{00b7} {}",
+            c.cpu_millicores,
+            format_bytes(c.memory_bytes as f64)
+        );
+        // Tag init containers so a `something ✓` in the replica's container
+        // list that comes from `initContainers` doesn't look like a missing
+        // entry up here in the template.
+        let suffix = if c.is_init { "  (init)" } else { "" };
+        let value = format!("{name_col}  {image}  {res}{suffix}");
+        let label = if idx == 0 {
+            LABEL.to_string()
+        } else {
+            blank_label.clone()
+        };
+        let plain = format!("{label} {value}");
+        out.push((label, value, plain));
+    }
+}
+
+/// Emit one row per live replica with per-container readiness inlined. The
+/// replica name is trimmed to the random suffix (everything after the final
+/// `-`) since the long prefix repeats across every replica of the same
+/// revision and would dominate the row. Sorted newest-first by `created_at`;
+/// capped at 10 rows so a scaled-out app can't blow the Detail header height.
+///
+/// Returns an empty Vec when there are no replicas (e.g. revision with
+/// `replicas: 0`); a single hint row when the fetch is pending or has failed.
+fn replica_status_lines(
+    replicas: Option<&Vec<crate::azure::container_app_replicas::ReplicaInstance>>,
+    pending: bool,
+    failure: Option<&String>,
+) -> Vec<(String, String, String)> {
+    const LABEL_SINGLE: &str = "replica:";
+    const LABEL_MULTI: &str = "replicas:";
+    const CAP: usize = 10;
+
+    // Cached data wins over a transient error so a stale-but-useful row
+    // sticks around across blips; pure-error state shows the hint.
+    if let Some(list) = replicas {
+        if list.is_empty() {
+            return Vec::new();
+        }
+
+        let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
+            list.iter().collect();
+        // Newest first: `None` created_at sorts to the end.
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+
+        let total = sorted.len();
+        let shown = total.min(CAP);
+        let label = if total == 1 {
+            LABEL_SINGLE
+        } else {
+            LABEL_MULTI
+        };
+        let blank_label: String = " ".repeat(label.chars().count());
+
+        // Trim each replica name to its suffix so the rows fit; align in a
+        // column based on the longest suffix in the visible subset.
+        let suffixes: Vec<String> = sorted
+            .iter()
+            .take(shown)
+            .map(|r| short_replica_name(&r.name))
+            .collect();
+        let max_suffix = suffixes
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for (idx, r) in sorted.iter().take(shown).enumerate() {
+            let suffix = format!("{:<width$}", suffixes[idx], width = max_suffix);
+            let statuses = r
+                .containers
+                .iter()
+                .map(format_container_status)
+                .collect::<Vec<_>>()
+                .join("  ");
+            let restarts = r
+                .containers
+                .iter()
+                .map(|c| c.restart_count)
+                .max()
+                .unwrap_or(0);
+            let value = format!("{suffix}  {statuses}     restarts {restarts}");
+            let row_label = if idx == 0 {
+                label.to_string()
+            } else {
+                blank_label.clone()
+            };
+            let plain = format!("{row_label} {value}");
+            out.push((row_label, value, plain));
+        }
+        if total > shown {
+            let extra = total - shown;
+            let value = format!("\u{2026} +{extra} more");
+            out.push((
+                blank_label.clone(),
+                value.clone(),
+                format!("{blank_label} {value}"),
+            ));
+        }
+        return out;
+    }
+
+    if pending {
+        let plain = format!("{LABEL_MULTI} loading\u{2026}");
+        return vec![(LABEL_MULTI.into(), "loading\u{2026}".into(), plain)];
+    }
+    if let Some(msg) = failure {
+        let value = short_replica_failure(msg);
+        let plain = format!("{LABEL_MULTI} {value}");
+        return vec![(LABEL_MULTI.into(), value, plain)];
+    }
+    Vec::new()
+}
+
+/// Trim a full replica name (`<app>--<revsuffix>-<random>`) to its trailing
+/// random component. The full prefix is identical across every replica of the
+/// same revision, so showing only the suffix loses nothing and saves ~40 cols.
+/// Falls back to the full name if there's no `-` to split on.
+fn short_replica_name(full: &str) -> String {
+    match full.rsplit_once('-') {
+        Some((_, tail)) if !tail.is_empty() => format!("\u{2026}{tail}"),
+        _ => full.to_string(),
+    }
+}
+
+/// Format one container's status inline: `name ✓` for Ready, `name ✗` for
+/// not Ready, `name ?` when the probe state is unknown (container still
+/// initialising or no probe configured).
+fn format_container_status(c: &crate::azure::container_app_replicas::ReplicaContainer) -> String {
+    let glyph = match c.ready {
+        Some(true) => '\u{2713}',  // ✓
+        Some(false) => '\u{2717}', // ✗
+        None => '?',
+    };
+    let name = if c.name.is_empty() {
+        "?"
+    } else {
+        c.name.as_str()
+    };
+    format!("{name} {glyph}")
+}
+
+/// Translate a raw replicas-endpoint failure into a short, plain-language
+/// hint. Same one-line philosophy as `short_missing_reason` for metrics.
+fn short_replica_failure(reason: &str) -> String {
+    if reason.contains("403") || reason.contains("Forbidden") {
+        "unavailable (permission denied)".to_string()
+    } else if reason.contains("404") {
+        "unavailable (revision not found)".to_string()
+    } else {
+        let one_line: String = reason.chars().take(80).collect();
+        if reason.chars().count() > 80 {
+            format!("unavailable ({one_line}\u{2026})")
+        } else {
+            format!("unavailable ({one_line})")
+        }
+    }
 }
 
 /// Build the meta lines that apply to every resource kind: tags and `systemData`
@@ -521,8 +834,8 @@ fn container_app_meta_lines(
 fn general_meta_lines(
     resource: &crate::azure::resources::Resource,
     principals: &crate::ui::state::PrincipalCache,
-) -> Vec<(&'static str, String, String)> {
-    let mut out: Vec<(&'static str, String, String)> = Vec::new();
+) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
     let m = &resource.meta;
 
     if !m.tags.is_empty() {
@@ -532,7 +845,7 @@ fn general_meta_lines(
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push(("tags:", joined.clone(), format!("tags: {joined}")));
+        out.push(("tags:".into(), joined.clone(), format!("tags: {joined}")));
     }
 
     let resolved =
@@ -543,7 +856,7 @@ fn general_meta_lines(
         m.created_by_type.as_deref(),
         resolved(m.created_by.as_deref()).as_deref(),
     ) {
-        out.push(("created:", v.clone(), format!("created: {v}")));
+        out.push(("created:".into(), v.clone(), format!("created: {v}")));
     }
     if let Some(v) = ownership_value(
         resource.modified_at.as_ref(),
@@ -551,7 +864,7 @@ fn general_meta_lines(
         m.modified_by_type.as_deref(),
         resolved(m.modified_by.as_deref()).as_deref(),
     ) {
-        out.push(("modified:", v.clone(), format!("modified: {v}")));
+        out.push(("modified:".into(), v.clone(), format!("modified: {v}")));
     }
 
     out
@@ -604,6 +917,52 @@ fn styled_meta_line(
         Span::raw(" "),
         Span::styled(value.into(), Style::default().fg(theme.accent)),
     ])
+}
+
+/// Same shape as [`styled_meta_line`] but the value is rendered in `theme.muted`
+/// rather than `theme.accent`. Used for "loading…" placeholders so the layout
+/// reserves space ahead of the real data arriving without those rows screaming
+/// for attention in the meantime.
+fn styled_skeleton_line(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            label.into(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(value.into(), Style::default().fg(theme.muted)),
+    ])
+}
+
+/// Placeholder rows shown for the Container-App meta block while the
+/// `container_app_overview` and/or `revision_meta` caches are still being
+/// populated. Mirrors the structure the real renderer produces once data lands
+/// (rev / image / replicas / containers / env vars / fqdn), so the height the
+/// Detail view reserves stays roughly constant across the load → loaded
+/// transition and the rows below (tags / created / modified) don't jump.
+fn container_app_skeleton_meta_rows() -> Vec<(String, String, String)> {
+    const FIELDS: &[&str] = &[
+        "rev:",
+        "image:",
+        "replicas:",
+        "containers:",
+        "env vars:",
+        "fqdn:",
+    ];
+    FIELDS
+        .iter()
+        .map(|label| {
+            let value = "loading\u{2026}".to_string();
+            let plain = format!("{label} {value}");
+            ((*label).to_string(), value, plain)
+        })
+        .collect()
 }
 
 /// Resolve the env vars to display for a resource, regardless of kind. Container
@@ -841,11 +1200,321 @@ fn state_color(state: &str, theme: &Theme) -> Color {
     }
 }
 
+/// Build the Detail view's selection list — one [`SelectableMeta`] per row the
+/// cursor can land on, in display order. Render uses the order to compute line
+/// highlights; the input handler uses the contents to wire `y` and Enter to
+/// the right payload. Stay in sync with [`render`]'s push order or the cursor
+/// will point at the wrong row.
+fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta> {
+    let mut out: Vec<SelectableMeta> = Vec::new();
+
+    // State row. Skipped when a metrics fetch error is overlaying the slot —
+    // the row in that case is a pure error string with nothing to drill into.
+    let metrics_failure = state.metrics.failures.get(&resource.id);
+    if metrics_failure.is_none() {
+        let raw_state = resource.state.as_deref().unwrap_or("unknown");
+        out.push(SelectableMeta {
+            yank: raw_state.to_string(),
+            modal_title: "state".to_string(),
+            modal_lines: vec![raw_state.to_string()],
+            enter_action: None,
+        });
+    }
+
+    // Container-app meta block. Skip entirely when the cache is still being
+    // populated — render shows skeletons in that case and skeletons aren't
+    // selectable.
+    let revision_meta = state.revision_meta.by_resource.get(&resource.id);
+    let limits = state.container_app_overview.by_resource.get(&resource.id);
+    let is_ca = resource.kind == ResourceKind::ContainerApp;
+    let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
+    if !ca_meta_loading {
+        let meta_lines = container_app_meta_lines(revision_meta, limits);
+        for (label, value, _) in meta_lines {
+            out.push(SelectableMeta {
+                yank: value.clone(),
+                modal_title: label.trim_end_matches(':').trim().to_string(),
+                modal_lines: vec![value],
+                enter_action: None,
+            });
+        }
+    }
+
+    // Replica block. Same skeleton skip; otherwise one selectable per replica
+    // row. The modal body shows the full replica record (name, created, per-
+    // container status with restart counts) since the inline row trims hard.
+    let cached_replicas = state.replica_instances.by_resource.get(&resource.id);
+    let replicas_loading_skeleton = is_ca && cached_replicas.is_none();
+    if !replicas_loading_skeleton {
+        if let Some(replicas) = cached_replicas {
+            let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
+                replicas.iter().collect();
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+            let shown = sorted.len().min(10);
+            for r in sorted.iter().take(shown) {
+                out.push(SelectableMeta {
+                    yank: r.name.clone(),
+                    modal_title: format!("replica · {}", short_replica_name(&r.name)),
+                    modal_lines: replica_modal_lines(r),
+                    enter_action: None,
+                });
+            }
+            // The "+N more" overflow row isn't selectable — there's nothing to
+            // drill into. Match `replica_status_lines`'s cap of 10.
+        } else if state.replica_instances.failures.contains_key(&resource.id) {
+            // Failure hint row IS selectable so the user can `y` the error.
+            let msg = state
+                .replica_instances
+                .failures
+                .get(&resource.id)
+                .cloned()
+                .unwrap_or_default();
+            out.push(SelectableMeta {
+                yank: msg.clone(),
+                modal_title: "replicas error".to_string(),
+                modal_lines: vec![msg],
+                enter_action: None,
+            });
+        } else if state.replica_instances.pending.contains(&resource.id) {
+            // `replicas: loading…` placeholder row exists — make it selectable
+            // so the cursor still has somewhere to land in this slot.
+            out.push(SelectableMeta {
+                yank: String::new(),
+                modal_title: "replicas".to_string(),
+                modal_lines: vec!["loading\u{2026}".to_string()],
+                enter_action: None,
+            });
+        }
+        // (When there's just no replicas at all — empty array — no row is
+        // emitted at all, so no selectable here either.)
+    }
+
+    // Env-vars teaser. Enter on this row jumps to the dedicated EnvVars page
+    // instead of opening a modal; the page already gives a full view, so a
+    // modal would be redundant.
+    let env_rows_count = env_var_rows_count(state, resource, ca_meta_loading);
+    for _ in 0..env_rows_count {
+        out.push(SelectableMeta {
+            yank: format!("{} env vars", env_vars_count_for(state, resource)),
+            modal_title: "env vars".to_string(),
+            modal_lines: vec!["Press Enter or e to open the env vars page.".to_string()],
+            enter_action: Some(Action::OpenEnvVars),
+        });
+    }
+
+    // General lines (tags, created, modified). Modal body breaks them out so
+    // the user can read the full content without column truncation.
+    let general_lines = general_meta_lines(resource, &state.principals);
+    for (label, value, _) in general_lines {
+        let label_trim = label.trim_end_matches(':').trim().to_string();
+        let modal_lines = match label_trim.as_str() {
+            "tags" => tag_modal_lines(resource),
+            _ => vec![value.clone()],
+        };
+        out.push(SelectableMeta {
+            yank: value.clone(),
+            modal_title: label_trim,
+            modal_lines,
+            enter_action: None,
+        });
+    }
+
+    out
+}
+
+/// Count how many env-vars teaser rows the render would emit for this
+/// resource. Mirrors the carve-outs in [`env_var_rows`] (skipped for CA while
+/// the overview is loading, returns 0 if env vars aren't applicable, etc.) so
+/// the selection list stays aligned with what the user actually sees.
+fn env_var_rows_count(state: &AppState, resource: &Resource, ca_meta_loading: bool) -> usize {
+    if ca_meta_loading {
+        return 0;
+    }
+    let id = resource.id.as_str();
+    let kind = resource.kind;
+    match env_vars_for(state, id, kind) {
+        Some(vars) if !vars.is_empty() => 1,
+        Some(_) => 0,
+        None => {
+            // Function-App-only: emit a hint row when the settings fetch is
+            // in flight or has already failed.
+            if kind == ResourceKind::FunctionApp
+                && (state.func_settings.failures.contains_key(id)
+                    || state.func_settings.pending.contains(id))
+            {
+                return 1;
+            }
+            0
+        }
+    }
+}
+
+/// Count of env vars (best-effort, returns 0 when not loaded) — used to make
+/// the env-vars row's yank text reflect what the user sees.
+fn env_vars_count_for(state: &AppState, resource: &Resource) -> usize {
+    env_vars_for(state, &resource.id, resource.kind)
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+/// Build the modal body for a tag row: one `key=value` per line so long lists
+/// don't get truncated like they do inline.
+fn tag_modal_lines(resource: &Resource) -> Vec<String> {
+    if resource.meta.tags.is_empty() {
+        return vec!["(no tags)".to_string()];
+    }
+    resource
+        .meta
+        .tags
+        .iter()
+        .map(|(k, v)| format!("{k} = {v}"))
+        .collect()
+}
+
+/// Build the modal body for a replica row: name, timing, top-level state, and
+/// one line per container with its readiness probe + restart count + per-
+/// container running state.
+fn replica_modal_lines(
+    replica: &crate::azure::container_app_replicas::ReplicaInstance,
+) -> Vec<String> {
+    let mut lines = vec![format!("name: {}", replica.name)];
+    if let Some(ts) = replica.created_at {
+        lines.push(format!("created: {}", ts.format("%Y-%m-%d %H:%M:%S UTC")));
+    }
+    if let Some(rs) = replica.running_state.as_deref() {
+        lines.push(format!("running state: {rs}"));
+    }
+    if !replica.containers.is_empty() {
+        lines.push(String::new());
+        lines.push("containers:".to_string());
+        for c in &replica.containers {
+            let glyph = match c.ready {
+                Some(true) => "\u{2713}",
+                Some(false) => "\u{2717}",
+                None => "?",
+            };
+            let name = if c.name.is_empty() {
+                "?".to_string()
+            } else {
+                c.name.clone()
+            };
+            let running = c.running_state.as_deref().unwrap_or("?");
+            lines.push(format!(
+                "  {name} {glyph}  restarts {}  ({running})",
+                c.restart_count
+            ));
+        }
+    }
+    lines
+}
+
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // While the Enter modal is open, route navigation/dismissal there first.
+    // Any other action (refresh, window switch, …) falls through to the
+    // normal handler so the user can still drive the page underneath.
+    if state.detail_view.modal.is_some() {
+        match action {
+            Action::Back => {
+                state.detail_view.modal = None;
+                return true;
+            }
+            Action::MoveDown => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    m.scroll = m.scroll.saturating_add(1);
+                }
+                return true;
+            }
+            Action::MoveUp => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    m.scroll = m.scroll.saturating_sub(1);
+                }
+                return true;
+            }
+            Action::HalfPageDown => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    m.scroll = m.scroll.saturating_add(8);
+                }
+                return true;
+            }
+            Action::HalfPageUp => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    m.scroll = m.scroll.saturating_sub(8);
+                }
+                return true;
+            }
+            Action::GotoTop => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    m.scroll = 0;
+                }
+                return true;
+            }
+            Action::GotoBottom => {
+                if let Some(m) = state.detail_view.modal.as_mut() {
+                    // Saturating-add gets clamped by the renderer; the
+                    // modal's own clamp keeps us at the last line.
+                    m.scroll = u16::MAX;
+                }
+                return true;
+            }
+            // All other keys are swallowed so they don't steer the underlying
+            // view while the modal owns the foreground. Esc/Back closes; the
+            // explicit nav arms above scroll.
+            _ => return true,
+        }
+    }
+
     match action {
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
+        Action::MoveDown => {
+            if let Some(resource) = state.selected_resource().cloned() {
+                let count = selectable_metas(state, &resource).len();
+                if count > 0 {
+                    let next = state.detail_view.cursor.saturating_add(1);
+                    state.detail_view.cursor = next.min(count - 1);
+                }
+            }
+            true
+        }
+        Action::MoveUp => {
+            state.detail_view.cursor = state.detail_view.cursor.saturating_sub(1);
+            true
+        }
+        Action::GotoTop => {
+            state.detail_view.cursor = 0;
+            true
+        }
+        Action::GotoBottom => {
+            if let Some(resource) = state.selected_resource().cloned() {
+                let count = selectable_metas(state, &resource).len();
+                state.detail_view.cursor = count.saturating_sub(1);
+            }
+            true
+        }
+        Action::Yank => {
+            // Override the global yank target with the selected row's yank
+            // text — that's the whole point of j/k navigation in this view.
+            let resource = match state.selected_resource().cloned() {
+                Some(r) => r,
+                None => return false,
+            };
+            let metas = selectable_metas(state, &resource);
+            if metas.is_empty() {
+                return false;
+            }
+            let cursor = state.detail_view.cursor.min(metas.len() - 1);
+            let text = metas[cursor].yank.clone();
+            if text.is_empty() {
+                state.set_status("nothing to copy");
+                return true;
+            }
+            match crate::ui::clipboard::copy(&text) {
+                Ok(n) => state.set_status(format!("copied {n} bytes to clipboard")),
+                Err(e) => state.set_status(format!("clipboard write failed: {e}")),
+            }
+            true
+        }
         Action::OpenEnvVars => {
             let kind = state.selected_resource().map(|r| r.kind);
             match kind {
@@ -873,9 +1542,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::OpenSelected => {
-            // APIM drill-in: Enter on an APIM service opens the APIs panel.
-            // Other resource kinds have no further drill-in from Detail, so
-            // swallow the action to avoid accidental no-op transitions.
+            // APIM drill-in still wins: Enter on an APIM service detail opens
+            // the APIs panel regardless of which meta row the cursor is on.
             let is_apim = state
                 .selected_resource()
                 .map(|r| r.kind == ResourceKind::Apim)
@@ -885,11 +1553,118 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.apim.selected_api_id = None;
                 state.view_stack.push(state.view);
                 state.view = View::ApimApis;
+                return true;
             }
+            // Otherwise: open the selected meta row's modal (or dispatch the
+            // row's `enter_action` for the env-vars teaser).
+            let resource = match state.selected_resource().cloned() {
+                Some(r) => r,
+                None => return true,
+            };
+            let metas = selectable_metas(state, &resource);
+            if metas.is_empty() {
+                return true;
+            }
+            let cursor = state.detail_view.cursor.min(metas.len() - 1);
+            let meta = &metas[cursor];
+            if let Some(act) = meta.enter_action {
+                // Dispatch the carried action through `handle` again so the
+                // existing implementation runs (OpenEnvVars → push view, etc.).
+                return handle(act, state);
+            }
+            state.detail_view.modal = Some(DetailModal {
+                title: meta.modal_title.clone(),
+                lines: meta.modal_lines.clone(),
+                scroll: 0,
+            });
             true
         }
         _ => false,
     }
+}
+
+/// Render the Enter modal over the Detail view when one is open. Called from
+/// the top-level dispatcher (`app::dispatch_view`) so the modal stacks above
+/// the underlying view but below the global status / command bars.
+pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use ratatui::layout::Alignment;
+    use ratatui::widgets::{Clear, Wrap};
+
+    let Some(modal) = state.detail_view.modal.as_ref() else {
+        return;
+    };
+
+    // Size: fit roughly two thirds of the screen, capped so very tall
+    // terminals don't render an awkward strip. Min width keeps it readable
+    // on a small splitter pane.
+    let target_w = ((area.width as u32 * 2 / 3) as u16).max(40).min(area.width);
+    let target_h = ((area.height as u32 * 2 / 3) as u16)
+        .max(8)
+        .min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(target_w) / 2,
+        y: area.y + area.height.saturating_sub(target_h) / 2,
+        width: target_w,
+        height: target_h,
+    };
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            format!(" {} ", modal.title),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Reserve the bottom row for the help hint so it always stays in view as
+    // the user scrolls long content.
+    let body_height = inner.height.saturating_sub(1);
+    let body_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: body_height,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + body_height,
+        width: inner.width,
+        height: 1,
+    };
+
+    let lines: Vec<Line> = modal
+        .lines
+        .iter()
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
+        .collect();
+    // `scroll((y, x))` skips the first `y` rows of the wrapped output; clamped
+    // to `lines.len()` so the user can't scroll past the end into blankness.
+    let scroll_y = (modal.scroll as usize).min(lines.len()) as u16;
+    let body = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    frame.render_widget(body, body_area);
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "j/k scroll · g top · Esc close",
+        Style::default().fg(theme.muted),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(hint, hint_area);
 }
 
 fn set_window(state: &mut AppState, range: TimeRange) -> bool {
@@ -1032,8 +1807,8 @@ mod tests {
             fqdn: Some("files-api.example.azurecontainerapps.io".into()),
             ..Default::default()
         };
-        let lines = container_app_meta_lines(Some(&meta), Some(&limits), &theme);
-        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        let lines = container_app_meta_lines(Some(&meta), Some(&limits));
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["rev:", "image:", "replicas:", "fqdn:"]);
         assert_eq!(lines[0].1, "files-api--0000004");
         assert_eq!(lines[1].1, "myacr/files-api:abc123");
@@ -1054,8 +1829,8 @@ mod tests {
             min_replicas: 0,
             max_replicas: 0,
         };
-        let lines = container_app_meta_lines(Some(&meta), None, &theme);
-        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        let lines = container_app_meta_lines(Some(&meta), None);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["rev:", "replicas:"]);
         assert_eq!(lines[1].1, "1");
     }
@@ -1064,7 +1839,146 @@ mod tests {
     fn meta_lines_empty_when_no_data() {
         use crate::ui::theme::Theme;
         let theme = Theme::catppuccin_mocha();
-        assert!(container_app_meta_lines(None, None, &theme).is_empty());
+        assert!(container_app_meta_lines(None, None).is_empty());
+    }
+
+    #[test]
+    fn meta_lines_emits_one_row_per_template_container() {
+        use crate::azure::container_app_overview::{ContainerAppOverview, ContainerSpec};
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::ui::theme::Theme;
+        let theme = Theme::catppuccin_mocha();
+        let meta = ActiveRevisionMeta {
+            name: "rev".into(),
+            image: Some("primary:1.0".into()),
+            replicas: 1,
+            min_replicas: 1,
+            max_replicas: 1,
+        };
+        let limits = ContainerAppOverview {
+            containers: vec![
+                ContainerSpec {
+                    name: "files".into(),
+                    image: Some("myacr/files:abc".into()),
+                    cpu_millicores: 250,
+                    memory_bytes: 512 * 1024 * 1024,
+                    is_init: false,
+                },
+                ContainerSpec {
+                    name: "http-auth".into(),
+                    image: Some("myacr/http-auth:abc".into()),
+                    cpu_millicores: 500,
+                    memory_bytes: 1024 * 1024 * 1024,
+                    is_init: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let lines = container_app_meta_lines(Some(&meta), Some(&limits));
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
+        // First container row owns the `containers:` label; the second row's
+        // label is spaces (same width) so values stack in a single column.
+        assert_eq!(labels[0..3], ["rev:", "image:", "replicas:"]);
+        assert_eq!(labels[3], "containers:");
+        assert_eq!(labels[4], "           "); // 11 spaces == "containers:".len()
+        assert!(lines[3].1.contains("files"));
+        assert!(lines[3].1.contains("250 mCores"));
+        assert!(lines[3].1.contains("512.0 MB"));
+        assert!(lines[4].1.contains("http-auth"));
+        assert!(lines[4].1.contains("500 mCores"));
+    }
+
+    #[test]
+    fn replica_status_lines_renders_one_row_per_replica() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use chrono::TimeZone;
+        let replicas = vec![ReplicaInstance {
+            name: "ca--rev-suffix-r58pz".into(),
+            created_at: Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 5, 26, 16, 37, 49)
+                    .unwrap(),
+            ),
+            running_state: Some("Running".into()),
+            containers: vec![
+                ReplicaContainer {
+                    name: "files".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                },
+                ReplicaContainer {
+                    name: "files-api".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                },
+                ReplicaContainer {
+                    name: "http-auth".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                },
+            ],
+        }];
+        let lines = replica_status_lines(Some(&replicas), false, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "replica:");
+        // Suffix is rendered with the leading ellipsis and the three container
+        // statuses are inlined with the ✓ glyph for Ready=true.
+        assert!(lines[0].1.contains("\u{2026}r58pz"));
+        assert!(lines[0].1.contains("files \u{2713}"));
+        assert!(lines[0].1.contains("http-auth \u{2713}"));
+        assert!(lines[0].1.contains("restarts 0"));
+    }
+
+    #[test]
+    fn replica_status_lines_shows_loading_when_pending_with_no_cache() {
+        let lines = replica_status_lines(None, true, None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "replicas:");
+        assert!(lines[0].1.contains("loading"));
+    }
+
+    #[test]
+    fn replica_status_lines_shows_permission_hint_on_403_failure() {
+        let err = "403 Forbidden: not authorised".to_string();
+        let lines = replica_status_lines(None, false, Some(&err));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].1.contains("permission denied"));
+    }
+
+    #[test]
+    fn replica_status_lines_collapses_when_no_replicas_running() {
+        // An app with replicas=0 yields an empty vec from the fetch; the
+        // section should disappear entirely rather than emit a stub row.
+        let lines = replica_status_lines(Some(&vec![]), false, None);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn replica_status_lines_caps_at_ten_with_more_indicator() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        let make = |i: u32| ReplicaInstance {
+            name: format!("ca--rev-r{i:04}"),
+            created_at: None,
+            running_state: None,
+            containers: vec![ReplicaContainer {
+                name: "files".into(),
+                ready: Some(true),
+                started: Some(true),
+                restart_count: 0,
+                running_state: None,
+            }],
+        };
+        let replicas: Vec<_> = (0..15).map(make).collect();
+        let lines = replica_status_lines(Some(&replicas), false, None);
+        // 10 replica rows + 1 "+5 more" row.
+        assert_eq!(lines.len(), 11);
+        assert!(lines.last().unwrap().1.contains("+5 more"));
     }
 
     #[test]
@@ -1317,9 +2231,9 @@ mod tests {
             ],
         };
         let lines = general_meta_lines(&res, &PrincipalCache::default());
-        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| *l).collect();
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(labels, vec!["tags:", "created:"]);
-        let tags = &lines.iter().find(|(l, _, _)| *l == "tags:").unwrap().1;
+        let tags = &lines.iter().find(|(l, _, _)| l == "tags:").unwrap().1;
         assert_eq!(tags, "Domain=tool, Terraform=true");
     }
 
@@ -1339,7 +2253,7 @@ mod tests {
             .by_id
             .insert(guid.into(), "di-sp-adp-devops-agent".into());
         let lines = general_meta_lines(&res, &principals);
-        let created = &lines.iter().find(|(l, _, _)| *l == "created:").unwrap().1;
+        let created = &lines.iter().find(|(l, _, _)| l == "created:").unwrap().1;
         assert!(
             created.contains("di-sp-adp-devops-agent (Application)"),
             "got {created:?}"

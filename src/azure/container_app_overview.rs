@@ -40,6 +40,35 @@ pub struct ContainerAppOverview {
     /// Environment variables from the primary container's template. Masked in
     /// the UI by default; see [`crate::azure::env_vars`].
     pub env_vars: Vec<EnvVar>,
+    /// Per-container specs from the template, in declaration order. A revision
+    /// can define multiple containers (main app + sidecars); they all run in
+    /// every replica. Used by the Detail view to list each container by name
+    /// alongside its image and reservations.
+    pub containers: Vec<ContainerSpec>,
+}
+
+/// One container in a revision's template. Per-container reservations are
+/// what Azure schedules against, so we keep them split (the overview's
+/// `cpu_millicores` / `memory_bytes` are sums for the "what does this app
+/// cost" headline; this list is for "what's actually in there").
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContainerSpec {
+    /// The container's name (e.g. `files`, `files-api`, `http-auth`). Falls
+    /// back to an empty string if the field is missing — shouldn't happen on
+    /// Azure-emitted payloads but the renderer copes either way.
+    pub name: String,
+    /// Image string verbatim (`registry/repo:tag`). `None` when absent.
+    pub image: Option<String>,
+    /// CPU reservation in millicores. `0` when the field is missing.
+    pub cpu_millicores: u32,
+    /// Memory reservation in bytes. `0` when the field is missing or
+    /// unparseable.
+    pub memory_bytes: u64,
+    /// `true` when this entry came from `template.initContainers` rather than
+    /// `template.containers`. Init containers run before the main containers
+    /// start; the renderer prefixes them so users can tell them apart from
+    /// long-running sidecars.
+    pub is_init: bool,
 }
 
 const API_VERSION: &str = "2024-03-01";
@@ -59,6 +88,15 @@ pub async fn fetch(
 pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
     let containers = value
         .pointer("/properties/template/containers")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    // Init containers run before the main containers boot, but they're part of
+    // the spec the user pays for and they show up in the replicas endpoint
+    // alongside the long-running ones — so list them in the `containers:` block
+    // too, just marked.
+    let init_containers = value
+        .pointer("/properties/template/initContainers")
         .and_then(|v| v.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
@@ -102,26 +140,59 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
         ..ContainerAppOverview::default()
     };
     for c in containers {
-        let cpu_cores = c
-            .pointer("/resources/cpu")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        // Cores → millicores. Round to nearest int; ARM stores values like
-        // 0.25 / 0.5 / 0.75 / 1.0 so this is always exact in practice.
-        let cpu_mc = (cpu_cores * 1000.0).round();
-        if cpu_mc > 0.0 && cpu_mc < u32::MAX as f64 {
-            total.cpu_millicores = total.cpu_millicores.saturating_add(cpu_mc as u32);
-        }
-
-        let mem_str = c
-            .pointer("/resources/memory")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        total.memory_bytes = total
-            .memory_bytes
-            .saturating_add(parse_memory_bytes(mem_str));
+        let spec = extract_container_spec(c, false);
+        total.cpu_millicores = total.cpu_millicores.saturating_add(spec.cpu_millicores);
+        total.memory_bytes = total.memory_bytes.saturating_add(spec.memory_bytes);
+        total.containers.push(spec);
+    }
+    // Init containers are NOT summed into the CPU/memory headline — those caps
+    // represent the long-running cost of the app. But we surface them in the
+    // containers list with `is_init = true` so the renderer can tag them and
+    // users can see why a replica reports an extra `something ✓` container
+    // that isn't in the main template list.
+    for c in init_containers {
+        total.containers.push(extract_container_spec(c, true));
     }
     total
+}
+
+/// Pull one container spec out of a `template.containers` / `initContainers`
+/// entry. Shared by both code paths so the field handling stays consistent.
+fn extract_container_spec(c: &serde_json::Value, is_init: bool) -> ContainerSpec {
+    let cpu_cores = c
+        .pointer("/resources/cpu")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    // Cores → millicores. Round to nearest int; ARM stores values like
+    // 0.25 / 0.5 / 0.75 / 1.0 so this is always exact in practice.
+    let cpu_mc_f = (cpu_cores * 1000.0).round();
+    let cpu_mc: u32 = if cpu_mc_f > 0.0 && cpu_mc_f < u32::MAX as f64 {
+        cpu_mc_f as u32
+    } else {
+        0
+    };
+    let mem_str = c
+        .pointer("/resources/memory")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mem_bytes = parse_memory_bytes(mem_str);
+    let name = c
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let image = c
+        .get("image")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    ContainerSpec {
+        name,
+        image,
+        cpu_millicores: cpu_mc,
+        memory_bytes: mem_bytes,
+        is_init,
+    }
 }
 
 /// Summarize an ARM `identity` object into one display line. Returns `None`
@@ -430,6 +501,99 @@ mod tests {
             summarize_identity(Some(&id)).as_deref(),
             Some("SystemAssigned + UserAssigned: uami")
         );
+    }
+
+    #[test]
+    fn captures_per_container_specs_with_name_and_image() {
+        let v = json!({
+            "properties": {
+                "template": {
+                    "containers": [
+                        {
+                            "name": "files",
+                            "image": "myacr.azurecr.io/files:abc",
+                            "resources": { "cpu": 0.25, "memory": "512Mi" }
+                        },
+                        {
+                            "name": "http-auth",
+                            "image": "myacr.azurecr.io/http-auth:abc",
+                            "resources": { "cpu": 0.5, "memory": "1Gi" }
+                        }
+                    ]
+                }
+            }
+        });
+        let l = extract(&v);
+        assert_eq!(l.containers.len(), 2);
+        assert_eq!(l.containers[0].name, "files");
+        assert_eq!(
+            l.containers[0].image.as_deref(),
+            Some("myacr.azurecr.io/files:abc")
+        );
+        assert_eq!(l.containers[0].cpu_millicores, 250);
+        assert_eq!(l.containers[0].memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(l.containers[1].name, "http-auth");
+        assert_eq!(l.containers[1].cpu_millicores, 500);
+        // Sum still works alongside the per-container split.
+        assert_eq!(l.cpu_millicores, 750);
+        assert_eq!(l.memory_bytes, 512 * 1024 * 1024 + 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn init_containers_appear_in_containers_list_marked_as_init() {
+        // Init containers should be surfaced alongside long-running ones so the
+        // Detail view's `containers:` block matches what a replica shows under
+        // `properties.containers`. The CPU/memory headline must NOT include the
+        // init container's reservations though.
+        let v = json!({
+            "properties": {
+                "template": {
+                    "containers": [
+                        {
+                            "name": "files",
+                            "image": "myacr.azurecr.io/files-api:abc",
+                            "resources": { "cpu": 0.25, "memory": "512Mi" }
+                        }
+                    ],
+                    "initContainers": [
+                        {
+                            "name": "http-auth",
+                            "image": "myacr.azurecr.io/http-auth:abc",
+                            "resources": { "cpu": 0.5, "memory": "1Gi" }
+                        }
+                    ]
+                }
+            }
+        });
+        let l = extract(&v);
+        assert_eq!(l.containers.len(), 2);
+        assert_eq!(l.containers[0].name, "files");
+        assert!(!l.containers[0].is_init);
+        assert_eq!(l.containers[1].name, "http-auth");
+        assert!(l.containers[1].is_init);
+        // Headline cost only reflects long-running containers.
+        assert_eq!(l.cpu_millicores, 250);
+        assert_eq!(l.memory_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn per_container_specs_tolerate_missing_name_and_image() {
+        // A pathologically minimal container: no name, no image, just resources.
+        // We still record it so the count stays accurate, but with empty/None.
+        let v = json!({
+            "properties": {
+                "template": {
+                    "containers": [
+                        { "resources": { "cpu": 0.25, "memory": "256Mi" } }
+                    ]
+                }
+            }
+        });
+        let l = extract(&v);
+        assert_eq!(l.containers.len(), 1);
+        assert_eq!(l.containers[0].name, "");
+        assert!(l.containers[0].image.is_none());
+        assert_eq!(l.containers[0].cpu_millicores, 250);
     }
 
     #[test]

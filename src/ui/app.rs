@@ -596,9 +596,50 @@ async fn event_loop(
                 result,
             } => {
                 if let Ok(Some(meta)) = result {
-                    state.revision_meta.by_resource.insert(resource_id, meta);
+                    // Kick off the per-replica live-status fetch as soon as we
+                    // know the active revision name — that's the only place
+                    // it's available, and the replicas endpoint needs it in
+                    // the path. Skip if already in-flight so refresh paths
+                    // (which re-fire this event) don't stack duplicates.
+                    let revision_name = meta.name.clone();
+                    let needs_spawn = !revision_name.is_empty()
+                        && !state.replica_instances.pending.contains(&resource_id);
+                    state
+                        .revision_meta
+                        .by_resource
+                        .insert(resource_id.clone(), meta);
+                    if needs_spawn {
+                        state.replica_instances.pending.insert(resource_id.clone());
+                        spawn_load_container_app_replicas(
+                            auth.clone(),
+                            resource_id,
+                            revision_name,
+                            tx.clone(),
+                        );
+                    }
                 }
                 // Same silent-on-error policy as limits: decorative.
+            }
+            AppEvent::ContainerAppReplicasLoaded {
+                resource_id,
+                result,
+            } => {
+                state.replica_instances.pending.remove(&resource_id);
+                match result {
+                    Ok(replicas) => {
+                        state.replica_instances.failures.remove(&resource_id);
+                        state
+                            .replica_instances
+                            .by_resource
+                            .insert(resource_id, replicas);
+                    }
+                    Err(msg) => {
+                        // Leave any previously-cached replicas in place so a
+                        // transient error doesn't blank the section; the
+                        // failure entry lets the renderer add a hint line.
+                        state.replica_instances.failures.insert(resource_id, msg);
+                    }
+                }
             }
             AppEvent::FunctionAppImageLoaded {
                 resource_id,
@@ -2197,12 +2238,10 @@ fn kick_off_loads_for_view(
                     }
                     // Container App env vars ride on the overview fetch, so a
                     // refresh re-pulls that (otherwise `r` keeps stale values).
-                    crate::azure::resources::ResourceKind::ContainerApp => {
-                        if force {
-                            state.container_app_overview.by_resource.remove(&id);
-                            state.container_app_overview.pending.insert(id.clone());
-                            spawn_load_container_app_overview(auth.clone(), id, tx.clone());
-                        }
+                    crate::azure::resources::ResourceKind::ContainerApp if force => {
+                        state.container_app_overview.by_resource.remove(&id);
+                        state.container_app_overview.pending.insert(id.clone());
+                        spawn_load_container_app_overview(auth.clone(), id, tx.clone());
                     }
                     _ => {}
                 }
@@ -2749,6 +2788,11 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
+    // Detail's row-Enter modal stacks above the page itself but below the
+    // global overlays (quit / auth) so the latter always win foreground.
+    if state.view == View::Detail && state.detail_view.modal.is_some() {
+        crate::ui::views::detail::render_modal(f, view_area, state, theme);
+    }
     // Quit-confirmation modal overlays the underlying view AND must beat the
     // command bar to the screen — render it before the command bar. (In
     // practice both flags can't be true at once given input gating.)
@@ -3335,6 +3379,24 @@ fn spawn_load_container_app_overview(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::ContainerAppOverviewLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_container_app_replicas(
+    auth: AzureAuth,
+    resource_id: String,
+    revision_name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result =
+            crate::azure::container_app_replicas::fetch(&auth, &resource_id, &revision_name)
+                .await
+                .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::ContainerAppReplicasLoaded {
             resource_id,
             result,
         });

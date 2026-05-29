@@ -373,6 +373,21 @@ pub struct RevisionMetaCache {
     pub by_resource: HashMap<String, crate::azure::container_app_revisions::ActiveRevisionMeta>,
 }
 
+/// Per-Container-App live replica instances (one per running replica) with
+/// per-container readiness, restart counts, and start status. Populated by a
+/// background fetch fired once the active revision name is known, since the
+/// `…/revisions/{rev}/replicas` endpoint needs the revision name in its path.
+///
+/// `failures` carries the error message for failed fetches (commonly 403 for
+/// principals without access to the replicas sub-resource) so the Detail view
+/// can show a hint instead of silently dropping the live status section.
+#[derive(Clone, Default)]
+pub struct ReplicaInstancesCache {
+    pub by_resource: HashMap<String, Vec<crate::azure::container_app_replicas::ReplicaInstance>>,
+    pub pending: HashSet<String>,
+    pub failures: HashMap<String, String>,
+}
+
 /// Per-Function-App deployed container image, parsed from `config/web`'s
 /// `linuxFxVersion`. Populated by a background fetch kicked off after
 /// `ResourcesLoaded` (same eager pattern as [`ContainerAppOverviewCache`]) and
@@ -427,6 +442,36 @@ pub struct EnvVarsView {
     /// Horizontal scroll offset (in characters) for long revealed values.
     /// Advanced with `l`, retreated with `h`; reset when reveal is toggled.
     pub h_offset: usize,
+}
+
+/// UI state for the Detail view's meta-row navigation and Enter modal. The
+/// rows themselves are computed from the various per-resource caches on every
+/// render, so this struct only tracks the cursor position into the selectable
+/// row list and the modal payload when one is open.
+#[derive(Clone, Default)]
+pub struct DetailView {
+    /// Index into the *selectable* row list (skeleton placeholders skip past).
+    /// Clamped at render time when the row count shrinks. Resets to 0 each time
+    /// the user enters Detail from a different view so a fresh resource starts
+    /// at the top.
+    pub cursor: usize,
+    /// `Some(_)` when a row's Enter modal is open. Cleared on Esc / Back.
+    pub modal: Option<DetailModal>,
+}
+
+/// One Enter-opened detail modal payload. Snapshot of the row's full content
+/// at the time the modal was opened — not a live view on the cache — so
+/// background refreshes during the modal's lifetime won't shuffle the text
+/// out from under the reader.
+#[derive(Clone, Default)]
+pub struct DetailModal {
+    /// Window title (e.g. `replica · …r58pz` or `image`).
+    pub title: String,
+    /// Body rendered one line per element. Each line is wrapped on the
+    /// modal's width, so callers don't need to pre-wrap.
+    pub lines: Vec<String>,
+    /// Vertical scroll offset (in rendered rows) inside the modal body.
+    pub scroll: u16,
 }
 
 /// Per-resource cached Azure Resource Health availability. Populated by a
@@ -1088,11 +1133,16 @@ pub struct AppState {
     /// revealed). Reset on entering the page, so values always start masked.
     pub env_vars_view: EnvVarsView,
 
+    /// Detail-view cursor (over the meta rows) plus the optional Enter modal
+    /// payload. Reset on entering Detail from a different view.
+    pub detail_view: DetailView,
+
     pub metrics: MetricsCache,
     pub health: HealthCache,
     pub logs: LogsCache,
     pub container_app_overview: ContainerAppOverviewCache,
     pub revision_meta: RevisionMetaCache,
+    pub replica_instances: ReplicaInstancesCache,
     pub func_image: FuncImageCache,
     pub func_settings: FuncSettingsCache,
     pub principals: PrincipalCache,
@@ -1174,6 +1224,7 @@ impl AppState {
             favorites_only: false,
             loading_resources: false,
             env_vars_view: EnvVarsView::default(),
+            detail_view: DetailView::default(),
             metrics: MetricsCache {
                 range,
                 ..Default::default()
@@ -1185,6 +1236,7 @@ impl AppState {
             },
             container_app_overview: ContainerAppOverviewCache::default(),
             revision_meta: RevisionMetaCache::default(),
+            replica_instances: ReplicaInstancesCache::default(),
             func_image: FuncImageCache::default(),
             func_settings: FuncSettingsCache::default(),
             principals: PrincipalCache::default(),
