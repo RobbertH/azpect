@@ -227,8 +227,44 @@ fn aggregation_field(aggregation: &str) -> &'static str {
     }
 }
 
+/// Fixed window the health verdict is computed over, independent of whatever
+/// chart range the user has selected. `TimeRange::Day` is exactly 24h at PT15M
+/// (96 bins) — fine-grained enough for per-bin spike detection. See
+/// `azure::health::derive`.
+pub const HEALTH_RANGE: TimeRange = TimeRange::Day;
+
 /// Fetch all relevant metrics for a resource over the given range, one Monitor
-/// call per metric in parallel.
+/// call per metric in parallel. See `fetch_core` for the per-metric rationale.
+pub async fn fetch(
+    auth: &AzureAuth,
+    resource: &Resource,
+    range: TimeRange,
+) -> anyhow::Result<MetricsResult> {
+    fetch_core(auth, &resource.id, resource.kind, range, None).await
+}
+
+/// Fetch just the Errors + Traffic series over the fixed [`HEALTH_RANGE`], for
+/// the health badge. Kept separate from the chart fetch so the verdict always
+/// covers a stable 24h window regardless of which chart range is selected.
+/// Returns only the series (the per-metric error map isn't needed for the
+/// badge — a missing series degrades to `Unknown` via `derive`).
+pub async fn fetch_health(
+    auth: &AzureAuth,
+    resource_id: &str,
+    kind: ResourceKind,
+) -> anyhow::Result<Vec<MetricSeries>> {
+    let result = fetch_core(
+        auth,
+        resource_id,
+        kind,
+        HEALTH_RANGE,
+        Some(&[MetricKind::Errors, MetricKind::Traffic]),
+    )
+    .await?;
+    Ok(result.series)
+}
+
+/// One Monitor call per (selected) metric, in parallel.
 ///
 /// Per-metric calls are deliberate: Monitor's batch endpoint 400s the *whole*
 /// batch when a single name is invalid for the resource's plan (e.g. `CpuTime`
@@ -237,36 +273,45 @@ fn aggregation_field(aggregation: &str) -> &'static str {
 /// works from Errors+Traffic, and the user sees partial data rather than an
 /// all-or-nothing failure.
 ///
+/// `only` restricts which logical metrics are fetched (e.g. just Errors+Traffic
+/// for the health badge); `None` fetches everything the resource type exposes.
+///
 /// Returns `Err` only if *every* metric call failed; otherwise returns whatever
 /// subset succeeded plus a per-metric error map describing which ones didn't.
-pub async fn fetch(
+async fn fetch_core(
     auth: &AzureAuth,
-    resource: &Resource,
+    resource_id: &str,
+    resource_kind: ResourceKind,
     range: TimeRange,
+    only: Option<&[MetricKind]>,
 ) -> anyhow::Result<MetricsResult> {
     let client = ArmClient::new(auth.clone())?;
-    let mappings = metric_names(resource.kind);
+    let mappings: Vec<(MetricKind, &str, &str)> = metric_names(resource_kind)
+        .iter()
+        .filter(|(k, _, _)| only.is_none_or(|allow| allow.contains(k)))
+        .map(|(k, n, a)| (*k, *n, *a))
+        .collect();
     let timespan = range.timespan();
     let interval = range.interval().to_string();
     let path = format!(
         "{}/providers/Microsoft.Insights/metrics",
-        resource.id.trim_end_matches('/')
+        resource_id.trim_end_matches('/')
     );
 
     let needs_error_filter = matches!(
-        resource.kind,
+        resource_kind,
         ResourceKind::Apim | ResourceKind::ContainerApp | ResourceKind::AppGateway
     );
 
     type Handle = tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>;
     let mut handles: Vec<Handle> = Vec::new();
 
-    for (kind, name, agg) in mappings {
+    for (kind, name, agg) in &mappings {
         let kind = *kind;
         let name = (*name).to_string();
         let agg = (*agg).to_string();
         let filter = if needs_error_filter && kind == MetricKind::Errors {
-            match resource.kind {
+            match resource_kind {
                 ResourceKind::Apim => Some("GatewayResponseCodeCategory eq '5xx'".to_string()),
                 // Monitor's $filter only supports `eq`, `ne`, and `sw`
                 // (NOT `startswith`), so an earlier `statusCode startswith '5'`
@@ -286,7 +331,8 @@ pub async fn fetch(
         let path = path.clone();
         let timespan = timespan.clone();
         let interval = interval.clone();
-        let resource_kind = resource.kind;
+        // `resource_kind` is `Copy`, so each `async move` block captures its own
+        // copy and the outer binding stays usable across loop iterations.
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
@@ -328,7 +374,7 @@ pub async fn fetch(
                 any_ok = true;
             }
             Ok((kind, Err(e))) => {
-                tracing::debug!("metric {kind:?} fetch failed for {}: {e}", resource.id);
+                tracing::debug!("metric {kind:?} fetch failed for {resource_id}: {e}");
                 missing.insert(kind, e.clone());
                 errors.push(e);
             }

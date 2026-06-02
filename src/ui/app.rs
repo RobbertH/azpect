@@ -446,6 +446,12 @@ async fn event_loop(
                     state.service_bus.subscriptions_cursor = 0;
                     continue;
                 }
+                // Subscription picker `/`-search box.
+                if should_forward_to_subscriptions_filter(state, key) {
+                    state.subscription_filter.handle_event(&CtEvent::Key(key));
+                    state.subscription_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -499,7 +505,9 @@ async fn event_loop(
                         if state.list_cursor >= state.resources.len() {
                             state.list_cursor = state.resources.len().saturating_sub(1);
                         }
-                        spawn_missing_list_metrics(state, auth, tx, /* force */ false);
+                        // Per-row badges derive from the health fetch (availability
+                        // + a fixed-24h Errors+Traffic window). Chart metrics are
+                        // fetched lazily on detail entry, not eagerly per row.
                         spawn_missing_list_health(state, auth, tx, /* force */ false);
                         spawn_missing_container_app_overview(
                             state, auth, tx, /* force */ false,
@@ -551,6 +559,12 @@ async fn event_loop(
                             .logs
                             .more_available
                             .insert(resource_id.clone(), page.has_more);
+                        // Workspace ARM id (Container Apps, first page only) — the
+                        // scope `o` uses for the portal Logs deep-link. Cache it;
+                        // its absence on later pages must not evict a known value.
+                        if let Some(ws) = page.workspace_arm_id {
+                            state.logs.workspace_ids.insert(resource_id.clone(), ws);
+                        }
                         if append {
                             let entry = state.logs.by_resource.entry(resource_id).or_default();
                             entry.extend(page.lines);
@@ -576,6 +590,18 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::HealthMetricsLoaded {
+                resource_id,
+                result,
+            } => match result {
+                Ok(series) => {
+                    state.health.metrics_failures.remove(&resource_id);
+                    state.health.metrics.insert(resource_id, series);
+                }
+                Err(e) => {
+                    state.health.metrics_failures.insert(resource_id, e);
+                }
+            },
             AppEvent::ContainerAppOverviewLoaded {
                 resource_id,
                 result,
@@ -646,12 +672,16 @@ async fn event_loop(
                 result,
             } => {
                 state.func_image.pending.remove(&resource_id);
-                if let Ok(image) = result {
-                    state.func_image.by_resource.insert(resource_id, image);
+                if let Ok(web) = result {
+                    state
+                        .func_image
+                        .access_restricted
+                        .insert(resource_id.clone(), web.access_restricted);
+                    state.func_image.by_resource.insert(resource_id, web.image);
                 }
                 // Silent on error (typically a 403 / config read denial): the
-                // VERSION column just stays blank, same policy as the Container
-                // App overview decoration.
+                // VERSION column / network detail just stay blank, same policy as
+                // the Container App overview decoration.
             }
             AppEvent::FunctionAppSettingsLoaded {
                 resource_id,
@@ -668,6 +698,29 @@ async fn event_loop(
                     Err(e) => {
                         state.func_settings.by_resource.remove(&resource_id);
                         state.func_settings.failures.insert(resource_id, e);
+                    }
+                }
+            }
+            AppEvent::FunctionAppTriggersLoaded {
+                resource_id,
+                result,
+            } => {
+                state.func_triggers.pending.remove(&resource_id);
+                match result {
+                    // Empty is a valid result (no functions synced); cache it so
+                    // the block collapses cleanly rather than spinning forever.
+                    Ok(triggers) => {
+                        state.func_triggers.failures.remove(&resource_id);
+                        state
+                            .func_triggers
+                            .by_resource
+                            .insert(resource_id, triggers);
+                    }
+                    // Keep the error so the detail view can show a hint; drop any
+                    // stale cache so a failed refresh doesn't read as success.
+                    Err(e) => {
+                        state.func_triggers.by_resource.remove(&resource_id);
+                        state.func_triggers.failures.insert(resource_id, e);
                     }
                 }
             }
@@ -1104,6 +1157,26 @@ fn should_forward_to_filter(state: &AppState, key: crossterm::event::KeyEvent) -
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the subscription picker's `/`-search
+/// box. Only forwards while the picker has its filter focused; same Esc / Enter /
+/// arrow carve-outs so cancel / commit / nav still reach the dispatcher.
+fn should_forward_to_subscriptions_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::Subscriptions
+        && state.subscription_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Mirror of `should_forward_to_filter` for the logs view's less-style search
 /// box. Same carve-outs: arrows / page nav drive the underlying table so the
 /// user can scroll context around the live highlights while still typing.
@@ -1442,6 +1515,8 @@ fn run_command(state: &mut AppState, cmd: &str) {
             if state.view != View::Subscriptions {
                 state.view_stack.push(state.view);
                 state.view = View::Subscriptions;
+                state.subscription_filter.reset();
+                state.subscription_filter_active = false;
             }
         }
         "help" | "h" | "?" => {
@@ -1548,6 +1623,7 @@ fn decide_action(
     // or open a chord — they belong to the input field.
     let input_focused = state.list_filter_active
         || state.logs.search_active
+        || (state.view == View::Subscriptions && state.subscription_filter_active)
         || (state.view == View::StorageBlobs && state.storage.blobs_filter_active)
         || (state.view == View::StorageContainers && state.storage.containers_filter_active)
         || (state.view == View::StorageAccounts && state.storage.accounts_filter_active)
@@ -1708,12 +1784,68 @@ fn service_id_from_api_id(api_id: &str) -> Option<&str> {
 fn portal_url_for(state: &AppState) -> Option<String> {
     const PORTAL_BASE: &str = "https://portal.azure.com/#@/resource";
     match state.view {
-        View::List | View::Detail | View::EnvVars => state
+        View::List => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
-        View::Logs | View::LogDetail => state
-            .selected_resource()
-            .map(|r| format!("{PORTAL_BASE}{}/logs", r.id)),
+        // Most Detail meta rows open the resource overview, but some deep-link to
+        // a specific blade based on which row the cursor is on — e.g. the
+        // Function App `network:` row → the resource's Networking blade.
+        View::Detail => state.selected_resource().map(|r| {
+            let suffix =
+                crate::ui::views::detail::selected_meta_portal_suffix(state, r).unwrap_or("");
+            format!("{PORTAL_BASE}{}{suffix}", r.id)
+        }),
+        // From the env-vars page, `o` jumps straight to the resource's
+        // environment-variables blade rather than its overview. Function Apps
+        // have a dedicated "Environment variables" blade; Container Apps surface
+        // env vars inside the "Containers" blade (there's no standalone one).
+        // The empty-tenant `#@/resource` base lets the portal resolve to the
+        // signed-in user's tenant, so no tenant id is baked in here.
+        View::EnvVars => state.selected_resource().map(|r| {
+            use crate::azure::resources::ResourceKind;
+            let blade = match r.kind {
+                ResourceKind::FunctionApp => "/environmentVariablesAppSettings",
+                ResourceKind::ContainerApp => "/containers",
+                _ => "",
+            };
+            format!("{PORTAL_BASE}{}{blade}", r.id)
+        }),
+        // Logs views open the Azure Monitor **Logs blade** with the same KQL
+        // azpect ran pre-filled, scoped to the resource. When a specific line is
+        // highlighted, the time window is narrowed to bracket it so the user
+        // lands on (or right next to) that row. (The old `{id}/logs` anchor
+        // isn't a real blade ref, so the portal silently fell back to the
+        // resource overview — this replaces it.)
+        View::Logs | View::LogDetail => state.selected_resource().and_then(|r| {
+            use crate::azure::resources::ResourceKind;
+            let lines = state
+                .logs
+                .by_resource
+                .get(&r.id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let query = crate::azure::logs::portal_query(r, lines)?;
+            let selected_ts = crate::ui::views::logs_detail::selected_line(state).map(|l| l.ts);
+            let timespan = match selected_ts {
+                Some(ts) => logs_timespan_around(ts),
+                None => logs_timespan_for_range(state.logs.range),
+            };
+            // Container App logs live in the env's Log Analytics workspace, so
+            // the blade must be scoped there (the app resource scope has none of
+            // the console-log tables). Fall back to the resource id if the
+            // workspace hasn't been resolved yet — Function Apps are always
+            // resource-scoped.
+            let scope_id = match r.kind {
+                ResourceKind::ContainerApp => state
+                    .logs
+                    .workspace_ids
+                    .get(&r.id)
+                    .map(String::as_str)
+                    .unwrap_or(r.id.as_str()),
+                _ => r.id.as_str(),
+            };
+            Some(logs_blade_url(scope_id, &query, &timespan))
+        }),
         // Per-API/per-operation resource URLs land on Azure's generic resource
         // view, not the APIM editor — so from any APIM view we open the
         // service's APIs blade where the real management UX lives.
@@ -1729,9 +1861,12 @@ fn portal_url_for(state: &AppState) -> Option<String> {
         View::AppGatewayBackends => state
             .selected_resource()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        // Cursor 0 is the synthetic "All subscriptions" row (no single sub to
+        // open); rows below index the *filtered* list at `cursor - 1`.
         View::Subscriptions => state
-            .subscriptions
-            .get(state.subscription_cursor)
+            .subscription_cursor
+            .checked_sub(1)
+            .and_then(|i| state.filtered_subscription_list().into_iter().nth(i))
             .map(|s| format!("{PORTAL_BASE}/subscriptions/{}/overview", s.id)),
         // Storage views land on the account's overview blade; the portal
         // exposes the container/blob drill-down off of there. The cursor
@@ -1807,6 +1942,67 @@ fn portal_url_for(state: &AppState) -> Option<String> {
     }
 }
 
+/// Assemble the Azure Monitor Logs blade deep link scoped to `scope_id` (an ARM
+/// resource id — the resource itself for Function Apps, the Log Analytics
+/// workspace for Container Apps), pre-filled with `query` over `timespan`.
+///
+/// Uses the uncompressed `query` path segment (plain percent-encoded KQL), which
+/// the portal accepts for queries under ~1.6k chars — ours are far shorter, so
+/// we avoid pulling in gzip+base64 just for the compressed `q` form. The
+/// empty-tenant `#@/` base (matching [`portal_url_for`]'s `PORTAL_BASE`) lets the
+/// portal resolve the signed-in user's tenant.
+fn logs_blade_url(scope_id: &str, query: &str, timespan: &str) -> String {
+    const BLADE_BASE: &str =
+        "https://portal.azure.com/#@/blade/Microsoft_Azure_Monitoring_Logs/LogsBlade";
+    format!(
+        "{BLADE_BASE}/resourceId/{rid}/source/LogsBlade.AnalyticsShareLinkToQuery/query/{q}/timespan/{ts}",
+        rid = percent_encode(scope_id),
+        q = percent_encode(query),
+        ts = percent_encode(timespan),
+    )
+}
+
+/// ISO-8601 timespan for the Logs blade when no specific line is selected: the
+/// same relative window the logs view is showing (`PT1H` / `P1D` / `P7D`).
+fn logs_timespan_for_range(range: crate::azure::metrics::TimeRange) -> String {
+    use crate::azure::metrics::TimeRange;
+    // Uniform `PT<hours>H` durations — the portal time picker parses these more
+    // reliably than the day/week `P1D`/`P7D` forms.
+    match range {
+        TimeRange::Hour => "PT1H",
+        TimeRange::Day => "PT24H",
+        TimeRange::Week => "PT168H",
+    }
+    .to_string()
+}
+
+/// Absolute Logs-blade timespan bracketing a highlighted line: a one-minute
+/// window centred on its timestamp. Narrow enough that the row is right there,
+/// wide enough to absorb sub-second precision / clock-skew so the line is always
+/// inside the window. Format is `start/end` in the ISO-8601 form the portal's
+/// time picker accepts.
+fn logs_timespan_around(ts: chrono::DateTime<chrono::Utc>) -> String {
+    let half = chrono::Duration::seconds(30);
+    let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    format!("{}/{}", fmt(ts - half), fmt(ts + half))
+}
+
+/// Percent-encode a string for use as a single Azure-portal deep-link path
+/// segment: everything outside the RFC 3986 *unreserved* set (`A-Za-z0-9-_.~`)
+/// is escaped, including `/` → `%2F`, so a multi-segment resource id or a KQL
+/// body with slashes/pipes can't break the blade's `/`-delimited path parsing.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Resolve what `y` should copy from the currently-visible view. The logs
 /// view prefers the displayed error (when the table is empty / the error
 /// banner is showing) and otherwise the highlighted log line.
@@ -1837,9 +2033,12 @@ fn yank_target(state: &AppState) -> Option<String> {
             .or_else(|| state.apim.selected_operation_id.clone()),
         View::AppGatewayBackends => crate::ui::views::appgw_backends::yank_text(state)
             .or_else(|| state.selected_resource().map(|r| r.id.clone())),
+        // Cursor 0 = synthetic "All" row (nothing to yank); below indexes the
+        // *filtered* list at `cursor - 1`.
         View::Subscriptions => state
-            .subscriptions
-            .get(state.subscription_cursor)
+            .subscription_cursor
+            .checked_sub(1)
+            .and_then(|i| state.filtered_subscription_list().into_iter().nth(i))
             .map(|s| s.id.clone()),
         View::StorageAccounts => state
             .storage
@@ -2015,6 +2214,9 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
             if state.view != View::Subscriptions {
                 state.view_stack.push(state.view);
                 state.view = View::Subscriptions;
+                // Open the picker on the full list (drop any stale `/`-search).
+                state.subscription_filter.reset();
+                state.subscription_filter_active = false;
             }
             true
         }
@@ -2132,7 +2334,6 @@ fn kick_off_loads_for_view(
                     // resource list itself reloads above; new rows get filled by
                     // the non-force `spawn_missing_*` in the ResourcesLoaded
                     // handler.)
-                    spawn_missing_list_metrics(state, auth, tx, /* force */ true);
                     spawn_missing_list_health(state, auth, tx, /* force */ true);
                     spawn_missing_container_app_overview(state, auth, tx, /* force */ true);
                     spawn_missing_function_app_image(state, auth, tx, /* force */ true);
@@ -2187,9 +2388,11 @@ fn kick_off_loads_for_view(
                         spawn_load_container_app_overview(auth.clone(), id.clone(), tx.clone());
                     }
                 }
-                // Function App OS env vars are lazy-loaded on Detail entry.
-                // (Container App env vars ride on the eagerly-fetched limits.)
-                // Guard against re-spawning while one is cached / in flight.
+                // Function App OS env vars + per-function triggers are lazy-loaded
+                // on Detail entry — neither is shown in the list, so fetching them
+                // eagerly for every app would be wasteful. (Container App env vars
+                // ride on the eagerly-fetched limits.) Guard against re-spawning
+                // while one is cached / in flight.
                 if kind == crate::azure::resources::ResourceKind::FunctionApp {
                     let cached = state.func_settings.by_resource.contains_key(&id)
                         || state.func_settings.failures.contains_key(&id);
@@ -2200,7 +2403,18 @@ fn kick_off_loads_for_view(
                             state.func_settings.failures.remove(&id);
                         }
                         state.func_settings.pending.insert(id.clone());
-                        spawn_load_function_app_settings(auth.clone(), id, tx.clone());
+                        spawn_load_function_app_settings(auth.clone(), id.clone(), tx.clone());
+                    }
+                    let t_cached = state.func_triggers.by_resource.contains_key(&id)
+                        || state.func_triggers.failures.contains_key(&id);
+                    let t_in_flight = state.func_triggers.pending.contains(&id);
+                    if force || (!t_cached && !t_in_flight) {
+                        if force {
+                            state.func_triggers.by_resource.remove(&id);
+                            state.func_triggers.failures.remove(&id);
+                        }
+                        state.func_triggers.pending.insert(id.clone());
+                        spawn_load_function_app_triggers(auth.clone(), id, tx.clone());
                     }
                 }
                 // Resolve Application / ManagedIdentity authors to display names
@@ -3292,34 +3506,6 @@ fn spawn_load_metrics(
     });
 }
 
-/// Kick off a metrics fetch for every resource whose health badge is unknown
-/// and not already in flight. Used after `ResourcesLoaded` to populate the
-/// list view's per-row badges without waiting for the user to enter Detail.
-fn spawn_missing_list_metrics(
-    state: &mut AppState,
-    auth: &AzureAuth,
-    tx: &UnboundedSender<AppEvent>,
-    force: bool,
-) {
-    let range = state.metrics.range;
-    // `force` (explicit refresh) re-fetches even already-cached rows so badges
-    // update in place; the `pending` guard still prevents duplicate in-flight
-    // fetches. Non-force only fills gaps (eager first-load).
-    let to_fetch: Vec<Resource> = state
-        .resources
-        .iter()
-        .filter(|r| {
-            (force || !state.metrics.by_resource.contains_key(&r.id))
-                && !state.metrics.pending.contains(&r.id)
-        })
-        .cloned()
-        .collect();
-    for resource in to_fetch {
-        state.metrics.pending.insert(resource.id.clone());
-        spawn_load_metrics(auth.clone(), resource, range, tx.clone());
-    }
-}
-
 fn spawn_load_health(
     auth: AzureAuth,
     resource_id: String,
@@ -3328,44 +3514,67 @@ fn spawn_load_health(
 ) {
     use crate::azure::resources::ResourceKind;
     tokio::spawn(async move {
-        // Container Apps don't expose meaningful state via the generic
-        // Microsoft.ResourceHealth endpoint — it returns `Unknown` even when
-        // active revisions are ActivationFailed/Unhealthy. The revisions
-        // endpoint gives us both the authoritative availability signal and
-        // the display metadata (active revision name, image, replicas), so
-        // one fetch feeds two events.
-        match kind {
-            ResourceKind::ContainerApp => {
-                match crate::azure::container_app_revisions::fetch(&auth, &resource_id).await {
-                    Ok(info) => {
-                        let _ = tx.send(AppEvent::HealthLoaded {
-                            resource_id: resource_id.clone(),
-                            result: Ok(info.availability),
-                        });
-                        let _ = tx.send(AppEvent::ContainerAppRevisionMetaLoaded {
-                            resource_id,
-                            result: Ok(info.active_revision),
-                        });
+        // Two independent signals feed the health badge, fetched concurrently:
+        //   1. availability — the platform's up/degraded/down state
+        //   2. health metrics — a fixed-24h Errors+Traffic window (range-agnostic)
+        // `derive` combines them pessimistically (worst-of).
+        let availability = {
+            let auth = auth.clone();
+            let resource_id = resource_id.clone();
+            let tx = tx.clone();
+            async move {
+                // Container Apps don't expose meaningful state via the generic
+                // Microsoft.ResourceHealth endpoint — it returns `Unknown` even
+                // when active revisions are ActivationFailed/Unhealthy. The
+                // revisions endpoint gives us both the authoritative availability
+                // signal and the display metadata (active revision name, image,
+                // replicas), so one fetch feeds two events.
+                match kind {
+                    ResourceKind::ContainerApp => {
+                        match crate::azure::container_app_revisions::fetch(&auth, &resource_id)
+                            .await
+                        {
+                            Ok(info) => {
+                                let _ = tx.send(AppEvent::HealthLoaded {
+                                    resource_id: resource_id.clone(),
+                                    result: Ok(info.availability),
+                                });
+                                let _ = tx.send(AppEvent::ContainerAppRevisionMetaLoaded {
+                                    resource_id,
+                                    result: Ok(info.active_revision),
+                                });
+                            }
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                let _ = tx.send(AppEvent::HealthLoaded {
+                                    resource_id,
+                                    result: Err(msg),
+                                });
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let msg = format!("{e:#}");
+                    _ => {
+                        let result = crate::azure::resource_health::fetch(&auth, &resource_id)
+                            .await
+                            .map_err(|e| format!("{e:#}"));
                         let _ = tx.send(AppEvent::HealthLoaded {
                             resource_id,
-                            result: Err(msg),
+                            result,
                         });
                     }
                 }
             }
-            _ => {
-                let result = crate::azure::resource_health::fetch(&auth, &resource_id)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(AppEvent::HealthLoaded {
-                    resource_id,
-                    result,
-                });
-            }
-        }
+        };
+        let metrics = async move {
+            let result = crate::azure::metrics::fetch_health(&auth, &resource_id, kind)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::HealthMetricsLoaded {
+                resource_id,
+                result,
+            });
+        };
+        tokio::join!(availability, metrics);
     });
 }
 
@@ -3409,7 +3618,7 @@ fn spawn_load_function_app_image(
     tx: UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        let result = crate::azure::function_app_config::fetch_image(&auth, &resource_id)
+        let result = crate::azure::function_app_config::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::FunctionAppImageLoaded {
@@ -3429,6 +3638,22 @@ fn spawn_load_function_app_settings(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::FunctionAppSettingsLoaded {
+            resource_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_function_app_triggers(
+    auth: AzureAuth,
+    resource_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::function_app_triggers::fetch(&auth, &resource_id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::FunctionAppTriggersLoaded {
             resource_id,
             result,
         });
@@ -4434,7 +4659,7 @@ mod tests {
                 })
                 .collect(),
         };
-        state.metrics.by_resource.insert(
+        state.health.metrics.insert(
             resource.id.clone(),
             vec![
                 zero_series(MetricKind::Errors),
@@ -4465,7 +4690,7 @@ mod tests {
                 })
                 .collect(),
         };
-        state.metrics.by_resource.insert(
+        state.health.metrics.insert(
             resource.id.clone(),
             vec![zero_series(MetricKind::Errors), traffic_series],
         );
@@ -4607,11 +4832,234 @@ mod tests {
         state.list_cursor = 0;
         state.view = View::LogDetail;
         let url = portal_url_for(&state).expect("log detail should yield a portal URL");
+        // Opens the Azure Monitor Logs blade (not the resource overview) with the
+        // resource as the query scope and a pre-filled KQL query.
         assert!(url.contains("portal.azure.com"));
-        assert!(url.contains("/sites/alpha"));
+        assert!(url.contains("Microsoft_Azure_Monitoring_Logs/LogsBlade"));
+        assert!(url.contains("LogsBlade.AnalyticsShareLinkToQuery"));
+        // Resource id is percent-encoded into the resourceId path segment.
+        assert!(url.contains(
+            "resourceId/%2Fsubscriptions%2FX%2FresourceGroups%2Frg%2Fproviders%2FMicrosoft.Web%2Fsites%2Falpha"
+        ));
+        // The Function App table union is carried in the query segment.
+        assert!(url.contains("FunctionAppLogs"));
+        // No selected line here (logs cache empty) → relative range timespan.
+        assert!(url.contains("/timespan/PT1H"));
+    }
+
+    #[test]
+    fn portal_url_in_logs_brackets_the_selected_line_timespan() {
+        use crate::azure::logs::{LogLevel, LogLine};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{TimeZone, Utc};
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/subscriptions/X/resourceGroups/rg/providers/Microsoft.App/containerApps/beta"
+                .into(),
+            name: "beta".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "X".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        let ts = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .unwrap();
+        state.logs.by_resource.insert(
+            state.resources[0].id.clone(),
+            vec![LogLine {
+                ts,
+                level: LogLevel::Info,
+                source: "ContainerAppConsoleLogs".into(),
+                message: "hello".into(),
+                fields: vec![],
+            }],
+        );
+        state.logs.scroll = 0;
+        let url = portal_url_for(&state).expect("logs should yield a portal URL");
+        // Container App query scopes by name inside the blade query.
+        assert!(url.contains("ContainerAppConsoleLogs"));
+        assert!(url.contains("beta"));
+        // Timespan is a one-minute absolute window centred on the line
+        // (11:59:30 → 12:00:30), encoded as start%2Fend.
         assert!(
-            url.ends_with("/logs"),
-            "log views should open the Logs blade, got {url}"
+            url.contains("/timespan/2026-05-10T11%3A59%3A30.000Z%2F2026-05-10T12%3A00%3A30.000Z"),
+            "expected a bracketed absolute timespan, got {url}"
+        );
+    }
+
+    #[test]
+    fn portal_url_container_app_logs_scope_to_workspace_when_resolved() {
+        use crate::azure::logs::{LogLevel, LogLine};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{TimeZone, Utc};
+        let mut state = fresh_state();
+        let app_id =
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.App/containerApps/beta";
+        let workspace_id =
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law";
+        state.resources = vec![Resource {
+            id: app_id.into(),
+            name: "beta".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "X".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        let ts = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .unwrap();
+        state.logs.by_resource.insert(
+            app_id.into(),
+            vec![LogLine {
+                ts,
+                level: LogLevel::Info,
+                source: "ContainerAppConsoleLogs".into(),
+                message: "hi".into(),
+                fields: vec![],
+            }],
+        );
+        // Workspace resolved (as it would be after the first log page).
+        state
+            .logs
+            .workspace_ids
+            .insert(app_id.into(), workspace_id.into());
+        let url = portal_url_for(&state).expect("logs should yield a portal URL");
+        // The blade scope (resourceId path segment) is the WORKSPACE, not the
+        // container app — that's what makes the console-log tables resolvable.
+        assert!(
+            url.contains(
+                "resourceId/%2Fsubscriptions%2FX%2FresourceGroups%2Frg%2Fproviders%2FMicrosoft.OperationalInsights%2Fworkspaces%2Flaw"
+            ),
+            "expected workspace-scoped blade, got {url}"
+        );
+        assert!(!url.contains("containerApps%2Fbeta"));
+    }
+
+    #[test]
+    fn subscriptions_yank_and_portal_index_the_filtered_list() {
+        use crate::azure::subscriptions::Subscription;
+        let sub = |id: &str, name: &str| Subscription {
+            id: id.into(),
+            display_name: name.into(),
+            state: "Enabled".into(),
+            tenant_id: "t".into(),
+        };
+        let mut state = fresh_state();
+        state.view = View::Subscriptions;
+        state.subscriptions = vec![sub("sub-alpha", "alpha"), sub("sub-beta", "beta")];
+
+        // Cursor 0 = synthetic "All" row → nothing to yank / open.
+        state.subscription_cursor = 0;
+        assert!(yank_target(&state).is_none());
+        assert!(portal_url_for(&state).is_none());
+
+        // Cursor 1 = first row → alpha (guards the old off-by-one that returned
+        // the *next* subscription).
+        state.subscription_cursor = 1;
+        assert_eq!(yank_target(&state).as_deref(), Some("sub-alpha"));
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .contains("/subscriptions/sub-alpha/overview"));
+
+        // With a `/`-filter matching only beta, row 1 now maps to beta.
+        state.subscription_filter = tui_input::Input::default().with_value("beta".into());
+        state.subscription_cursor = 1;
+        assert_eq!(yank_target(&state).as_deref(), Some("sub-beta"));
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .contains("/subscriptions/sub-beta/overview"));
+    }
+
+    #[test]
+    fn portal_url_in_detail_network_row_targets_networking_blade() {
+        use crate::azure::resources::{Resource, ResourceKind};
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Web/sites/alpha".into(),
+            name: "alpha".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "X".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Detail;
+        // Minimal Function App → meta rows are [state, network]; cursor 1 is the
+        // network row. (Guarded by the detail.rs unit test that finds it by name.)
+        state.detail_view.cursor = 1;
+        let url = portal_url_for(&state).expect("detail should yield a portal URL");
+        assert!(
+            url.ends_with("/sites/alpha/networkingHub"),
+            "network row should open the Networking blade, got {url}"
+        );
+
+        // A different row (state, cursor 0) opens the plain resource overview.
+        state.detail_view.cursor = 0;
+        let url = portal_url_for(&state).unwrap();
+        assert!(url.ends_with("/sites/alpha"), "got {url}");
+    }
+
+    #[test]
+    fn portal_url_in_env_vars_targets_the_environment_variables_blade() {
+        use crate::azure::resources::{Resource, ResourceKind};
+        let mk = |id: &str, kind: ResourceKind| Resource {
+            id: id.into(),
+            name: "x".into(),
+            kind,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "X".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        };
+
+        // Function App: dedicated Environment variables blade.
+        let mut state = fresh_state();
+        state.resources = vec![mk(
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Web/sites/alpha",
+            ResourceKind::FunctionApp,
+        )];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        let url = portal_url_for(&state).expect("env vars should yield a portal URL");
+        assert!(
+            url.ends_with("/sites/alpha/environmentVariablesAppSettings"),
+            "function app env vars should open the env-vars blade, got {url}"
+        );
+
+        // Container App: env vars live in the Containers blade.
+        let mut state = fresh_state();
+        state.resources = vec![mk(
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.App/containerApps/beta",
+            ResourceKind::ContainerApp,
+        )];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        let url = portal_url_for(&state).expect("env vars should yield a portal URL");
+        assert!(
+            url.ends_with("/containerApps/beta/containers"),
+            "container app env vars should open the Containers blade, got {url}"
         );
     }
 }

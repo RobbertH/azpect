@@ -38,37 +38,58 @@ impl HealthStatus {
     }
 }
 
-/// How many trailing points constitute "the last hour" for v1.
-/// PT15M -> 4 points = 1h. PT1H -> 1 point = 1h, but we still take up to 4 to
-/// stay in line with the spec.
-const LAST_HOUR_POINTS: usize = 4;
+// Thresholds for the error-to-traffic ratio. These are deliberately
+// pessimistic: any single signal crossing a line drags the whole verdict down.
 
-/// Outcome of running just the metric-ratio heuristic. Lets `derive` combine
-/// the platform-reported availability with traffic-based fine tuning.
+/// Sustained ratio over the *whole* 24h window: an app that's quietly erroring
+/// 1–5% of the time is degraded; >5% is critical.
+const SUSTAINED_DEGRADED: f64 = 0.01;
+const SUSTAINED_CRITICAL: f64 = 0.05;
+
+/// Per-bin spike ratio. A single 15-minute bin that's >10% errors is a spike
+/// worth surfacing even if the daily average looks fine; >30% is critical. The
+/// daily average can hide a sharp outage — the spike check catches it.
+const SPIKE_DEGRADED: f64 = 0.10;
+const SPIKE_CRITICAL: f64 = 0.30;
+
+/// Ignore bins with fewer requests than this when looking for spikes, so a
+/// "2 errors out of 3 requests" blip in a near-idle bin doesn't read as a 66%
+/// spike. Tuned for the 15-minute bins of the fixed 24h health window.
+const SPIKE_MIN_REQUESTS: f64 = 20.0;
+
+/// Outcome of the errors-vs-traffic heuristic over the whole window. Lets
+/// `derive` combine the platform-reported availability with traffic-based
+/// signals (worst-of).
 enum MetricVerdict {
-    /// Errors+Traffic both present and traffic_sum > 0. Holds the resolved badge
-    /// from the ratio (Healthy/Degraded/Critical).
+    /// Traffic present; holds the worst badge across the sustained ratio and the
+    /// per-bin spike check (Healthy/Degraded/Critical).
     Traffic(HealthStatus),
-    /// Errors+Traffic both present but traffic_sum == 0 in the trailing window.
+    /// Errors+Traffic both present but no traffic in the 24h window.
     NoTraffic,
     /// Series missing or both empty — we genuinely don't know.
     NoData,
 }
 
-/// Compute health from loaded metrics, optional resource state, and the optional
-/// Azure Resource Health signal.
+/// Compute a health badge from the fixed-24h metrics window, optional resource
+/// state, and the optional Azure Resource Health signal.
 ///
-/// Decision table (first match wins):
+/// `metrics` are the Errors + Traffic series over a fixed 24h window (see
+/// `metrics::fetch_health`) — *not* the chart's selected range, so the verdict
+/// is stable regardless of what the user is looking at.
 ///
-/// | state == Stopped             | → CRITICAL                            |
-/// | availability == Unavailable  | → CRITICAL                            |
-/// | availability == Degraded     | → DEGRADED                            |
-/// | availability == Available    | metric ratio > 0% → ratio verdict     |
-/// |                              | else state == Running → IDLE          |
-/// |                              | else → HEALTHY                        |
-/// | availability == Unknown/None | metric ratio > 0% → ratio verdict     |
-/// |                              | else state == Running → IDLE          |
-/// |                              | else → UNKNOWN                        |
+/// The combine rule is **worst-of**: state, platform availability, the
+/// sustained error ratio, and per-bin spikes each contribute a severity, and
+/// the most severe one wins. A clean platform signal never upgrades a metric
+/// problem away.
+///
+/// | state == Stopped            | → CRITICAL                                |
+/// | availability == Unavailable | → CRITICAL                                |
+/// | any signal CRITICAL         | → CRITICAL                                |
+/// | availability == Degraded    | → DEGRADED (unless a signal is CRITICAL)  |
+/// | any signal DEGRADED         | → DEGRADED                                |
+/// | otherwise, traffic present  | → HEALTHY                                 |
+/// | otherwise, no traffic       | running/available → IDLE, else UNKNOWN    |
+/// | otherwise, no data          | available → HEALTHY, else UNKNOWN         |
 pub fn derive(
     metrics: &[MetricSeries],
     state: Option<&str>,
@@ -77,39 +98,46 @@ pub fn derive(
     if matches!(state, Some(s) if s.eq_ignore_ascii_case("Stopped")) {
         return HealthStatus::Critical;
     }
-
-    match availability {
-        Some(AvailabilityState::Unavailable) => return HealthStatus::Critical,
-        Some(AvailabilityState::Degraded) => return HealthStatus::Degraded,
-        _ => {}
+    if availability == Some(AvailabilityState::Unavailable) {
+        return HealthStatus::Critical;
     }
 
     let verdict = metric_verdict(metrics);
-    let running = matches!(state, Some(s) if s.eq_ignore_ascii_case("Running"));
 
-    match availability {
-        Some(AvailabilityState::Available) => match verdict {
-            MetricVerdict::Traffic(status) => status,
-            MetricVerdict::NoTraffic if running => HealthStatus::Idle,
-            // Resource Health says we're up — trust it even with no metric data.
-            _ => HealthStatus::Healthy,
-        },
-        // Unknown / None: fall back to the heuristic.
-        _ => match verdict {
-            MetricVerdict::Traffic(status) => status,
-            MetricVerdict::NoTraffic if running => HealthStatus::Idle,
-            _ => HealthStatus::Unknown,
-        },
+    // Worst-of: a critical metric signal beats a merely-degraded platform, and
+    // a degraded platform beats clean metrics.
+    if matches!(verdict, MetricVerdict::Traffic(HealthStatus::Critical)) {
+        return HealthStatus::Critical;
+    }
+    if availability == Some(AvailabilityState::Degraded)
+        || matches!(verdict, MetricVerdict::Traffic(HealthStatus::Degraded))
+    {
+        return HealthStatus::Degraded;
+    }
+
+    let running = matches!(state, Some(s) if s.eq_ignore_ascii_case("Running"));
+    let available = availability == Some(AvailabilityState::Available);
+
+    match verdict {
+        // Already handled the Degraded/Critical cases above.
+        MetricVerdict::Traffic(_) => HealthStatus::Healthy,
+        // Up but quiet: distinguish a fine-but-idle app from one we can't read.
+        MetricVerdict::NoTraffic if running || available => HealthStatus::Idle,
+        MetricVerdict::NoTraffic => HealthStatus::Unknown,
+        // No metric series at all: trust the platform if it says we're up,
+        // otherwise we genuinely don't know (don't claim IDLE without data).
+        MetricVerdict::NoData if available => HealthStatus::Healthy,
+        MetricVerdict::NoData => HealthStatus::Unknown,
     }
 }
 
-/// Run the existing errors-vs-traffic ratio against the trailing window and
-/// classify the result without consulting any other signals.
+/// Classify the Errors-vs-Traffic series over the whole window: the worst of the
+/// sustained (windowed) ratio and any single-bin spike.
 fn metric_verdict(metrics: &[MetricSeries]) -> MetricVerdict {
-    let errors = find(metrics, MetricKind::Errors);
-    let traffic = find(metrics, MetricKind::Traffic);
-
-    let (errors, traffic) = match (errors, traffic) {
+    let (errors, traffic) = match (
+        find(metrics, MetricKind::Errors),
+        find(metrics, MetricKind::Traffic),
+    ) {
         (Some(e), Some(t)) => (e, t),
         _ => return MetricVerdict::NoData,
     };
@@ -118,33 +146,86 @@ fn metric_verdict(metrics: &[MetricSeries]) -> MetricVerdict {
         return MetricVerdict::NoData;
     }
 
-    let traffic_sum = trailing_sum(traffic, LAST_HOUR_POINTS);
+    let traffic_sum: f64 = traffic.points.iter().map(|p| p.value).sum();
     if traffic_sum <= 0.0 {
         return MetricVerdict::NoTraffic;
     }
+    let errors_sum: f64 = errors.points.iter().map(|p| p.value).sum();
 
-    let errors_sum = trailing_sum(errors, LAST_HOUR_POINTS);
-    let ratio = errors_sum / traffic_sum;
+    let sustained = ratio_status(
+        errors_sum / traffic_sum,
+        SUSTAINED_DEGRADED,
+        SUSTAINED_CRITICAL,
+    );
+    let spike = worst_bin_status(errors, traffic);
+    MetricVerdict::Traffic(worse(sustained, spike))
+}
 
-    let status = if ratio > 0.05 {
+/// Worst per-bin error ratio across the window, ignoring near-idle bins so a
+/// tiny-denominator blip doesn't masquerade as a spike. Bins are paired by
+/// timestamp (the two series share the same query window/grain, but pairing by
+/// `ts` is robust to any misalignment).
+fn worst_bin_status(errors: &MetricSeries, traffic: &MetricSeries) -> HealthStatus {
+    let errors_at: std::collections::HashMap<_, f64> =
+        errors.points.iter().map(|p| (p.ts, p.value)).collect();
+    let mut worst = HealthStatus::Healthy;
+    for t in &traffic.points {
+        if t.value < SPIKE_MIN_REQUESTS {
+            continue;
+        }
+        let e = errors_at.get(&t.ts).copied().unwrap_or(0.0);
+        worst = worse(
+            worst,
+            ratio_status(e / t.value, SPIKE_DEGRADED, SPIKE_CRITICAL),
+        );
+    }
+    worst
+}
+
+/// Map an error ratio to a badge given the degraded/critical thresholds.
+fn ratio_status(ratio: f64, degraded: f64, critical: f64) -> HealthStatus {
+    if ratio > critical {
         HealthStatus::Critical
-    } else if ratio > 0.01 {
+    } else if ratio > degraded {
         HealthStatus::Degraded
     } else {
         HealthStatus::Healthy
-    };
-    MetricVerdict::Traffic(status)
+    }
 }
 
-fn trailing_sum(series: &MetricSeries, n: usize) -> f64 {
-    let len = series.points.len();
-    let start = len.saturating_sub(n);
-    series.points[start..].iter().map(|p| p.value).sum()
+/// Return the more severe of two badges. Only meaningful for the metric-derived
+/// trio (Healthy < Degraded < Critical); other variants rank as 0.
+fn worse(a: HealthStatus, b: HealthStatus) -> HealthStatus {
+    fn rank(s: HealthStatus) -> u8 {
+        match s {
+            HealthStatus::Critical => 3,
+            HealthStatus::Degraded => 2,
+            HealthStatus::Healthy => 1,
+            _ => 0,
+        }
+    }
+    if rank(a) >= rank(b) {
+        a
+    } else {
+        b
+    }
 }
 
 /// Find a series by kind. Convenience for callers.
 pub fn find(metrics: &[MetricSeries], kind: MetricKind) -> Option<&MetricSeries> {
     metrics.iter().find(|m| m.kind == kind)
+}
+
+/// Total 5xx errors across the health window (0.0 if there's no Errors series).
+///
+/// This is a *presence* signal, deliberately separate from the [`derive`]
+/// verdict: an app can sit comfortably under the error-ratio thresholds (so the
+/// badge is HEALTHY) while still throwing 500s worth eyeballing. Callers surface
+/// it as a flag next to the badge rather than folding it into the severity.
+pub fn errors_total(metrics: &[MetricSeries]) -> f64 {
+    find(metrics, MetricKind::Errors)
+        .map(|s| s.points.iter().map(|p| p.value).sum())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -154,7 +235,10 @@ mod tests {
     use chrono::{Duration, Utc};
 
     fn series(kind: MetricKind, values: &[f64]) -> MetricSeries {
-        let now = Utc::now();
+        series_at(kind, values, Utc::now())
+    }
+
+    fn series_at(kind: MetricKind, values: &[f64], now: chrono::DateTime<Utc>) -> MetricSeries {
         let points = values
             .iter()
             .enumerate()
@@ -169,6 +253,17 @@ mod tests {
             unit: String::new(),
             points,
         }
+    }
+
+    /// Errors + Traffic series stamped with the *same* bin timestamps, so the
+    /// per-bin spike check (which pairs by `ts`) lines them up — mirrors how
+    /// Azure returns aligned bins for the two metrics of one query.
+    fn aligned(errors: &[f64], traffic: &[f64]) -> Vec<MetricSeries> {
+        let now = Utc::now();
+        vec![
+            series_at(MetricKind::Errors, errors, now),
+            series_at(MetricKind::Traffic, traffic, now),
+        ]
     }
 
     #[test]
@@ -346,6 +441,70 @@ mod tests {
         assert_eq!(
             derive(&metrics, Some("Running"), Some(AvailabilityState::Unknown)),
             HealthStatus::Idle
+        );
+    }
+
+    #[test]
+    fn single_bin_spike_degrades_despite_healthy_average() {
+        // 15 errors in the last bin against 100 requests = 15% for that bin,
+        // but the daily average is 15 / 15_100 ≈ 0.1% — well under the sustained
+        // threshold. The spike check must still surface it. This is the
+        // rnd3-context-api-tst case: spiky 5xx the windowed ratio would hide.
+        let metrics = aligned(&[0.0, 0.0, 0.0, 15.0], &[5000.0, 5000.0, 5000.0, 100.0]);
+        assert_eq!(
+            derive(
+                &metrics,
+                Some("Running"),
+                Some(AvailabilityState::Available)
+            ),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn severe_single_bin_spike_is_critical() {
+        // 50 / 100 = 50% in one bin → critical, even though Resource Health is
+        // happy and the daily average is negligible.
+        let metrics = aligned(&[0.0, 0.0, 0.0, 50.0], &[5000.0, 5000.0, 5000.0, 100.0]);
+        assert_eq!(
+            derive(
+                &metrics,
+                Some("Running"),
+                Some(AvailabilityState::Available)
+            ),
+            HealthStatus::Critical
+        );
+    }
+
+    #[test]
+    fn tiny_bin_blip_is_not_a_spike() {
+        // 2 errors out of 3 requests is 66%, but 3 requests is below the
+        // min-requests guard, so it must not register as a spike.
+        let metrics = aligned(&[0.0, 0.0, 0.0, 2.0], &[5000.0, 5000.0, 5000.0, 3.0]);
+        assert_eq!(
+            derive(&metrics, Some("Running"), None),
+            HealthStatus::Healthy
+        );
+    }
+
+    #[test]
+    fn errors_total_sums_the_5xx_series() {
+        let metrics = aligned(&[1.0, 0.0, 4.0, 8.0], &[100.0, 100.0, 100.0, 100.0]);
+        assert_eq!(errors_total(&metrics), 13.0);
+        // No Errors series → 0, not a panic.
+        assert_eq!(errors_total(&[series(MetricKind::Cpu, &[5.0])]), 0.0);
+    }
+
+    #[test]
+    fn platform_degraded_loses_to_critical_metrics() {
+        // Worst-of: a critical error ratio outranks a merely-degraded platform.
+        let metrics = vec![
+            series(MetricKind::Errors, &[25.0, 25.0, 25.0, 25.0]),
+            series(MetricKind::Traffic, &[250.0, 250.0, 250.0, 250.0]),
+        ];
+        assert_eq!(
+            derive(&metrics, Some("Running"), Some(AvailabilityState::Degraded)),
+            HealthStatus::Critical
         );
     }
 }

@@ -31,6 +31,14 @@ pub struct ContainerAppOverview {
     /// `my-app.westeurope.azurecontainerapps.io`). `None` when the app has
     /// no ingress configured or ingress is internal-only.
     pub fqdn: Option<String>,
+    /// Ingress exposure — the network posture: `None` ⇒ no ingress (no inbound
+    /// HTTP endpoint), `Some(true)` ⇒ external (internet-facing), `Some(false)`
+    /// ⇒ internal (reachable only within the environment / VNet).
+    pub ingress_external: Option<bool>,
+    /// `true` when ingress is gated by IP access restrictions
+    /// (`ingress.ipSecurityRestrictions`) — the Container App analogue of a
+    /// Function App's IP/VNet restrictions.
+    pub access_restricted: bool,
     /// Name of the Container Apps managed environment this app runs in — the
     /// last path segment of `properties.managedEnvironmentId`. `None` if absent.
     pub managed_environment: Option<String>,
@@ -107,6 +115,25 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
+    // Ingress posture — the Container App equivalent of a Function App's public
+    // network access. No `ingress` block ⇒ no inbound HTTP endpoint at all;
+    // `external: true` ⇒ internet-facing; `false` ⇒ internal (environment/VNet
+    // only). `ipSecurityRestrictions` on the ingress is the IP-restriction
+    // equivalent — Container Apps list explicit rules (no implicit allow-all),
+    // so any rule means restricted.
+    let ingress = value
+        .pointer("/properties/configuration/ingress")
+        .filter(|v| !v.is_null());
+    let ingress_external = ingress.map(|ing| {
+        ing.get("external")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    });
+    let access_restricted = ingress
+        .and_then(|ing| ing.get("ipSecurityRestrictions"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|rules| !rules.is_empty());
+
     let managed_environment = value
         .pointer("/properties/managedEnvironmentId")
         .and_then(|v| v.as_str())
@@ -133,6 +160,8 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
 
     let mut total = ContainerAppOverview {
         fqdn,
+        ingress_external,
+        access_restricted,
         managed_environment,
         managed_identity,
         ephemeral_storage,
@@ -400,6 +429,58 @@ mod tests {
             }
         });
         assert!(extract(&v).fqdn.is_none());
+    }
+
+    #[test]
+    fn ingress_posture_external_internal_and_none() {
+        // No ingress block → no inbound endpoint.
+        let none = json!({ "properties": { "template": { "containers": [] } } });
+        let l = extract(&none);
+        assert_eq!(l.ingress_external, None);
+        assert!(!l.access_restricted);
+
+        // External ingress, no restrictions.
+        let external = json!({
+            "properties": { "configuration": { "ingress": {
+                "external": true, "fqdn": "app.example.azurecontainerapps.io"
+            }}}
+        });
+        let l = extract(&external);
+        assert_eq!(l.ingress_external, Some(true));
+        assert!(!l.access_restricted);
+
+        // Internal ingress (external omitted defaults to false).
+        let internal = json!({
+            "properties": { "configuration": { "ingress": { "external": false } } }
+        });
+        assert_eq!(extract(&internal).ingress_external, Some(false));
+        let implied = json!({
+            "properties": { "configuration": { "ingress": { "targetPort": 80 } } }
+        });
+        assert_eq!(extract(&implied).ingress_external, Some(false));
+    }
+
+    #[test]
+    fn access_restricted_when_ingress_has_ip_rules() {
+        let v = json!({
+            "properties": { "configuration": { "ingress": {
+                "external": true,
+                "ipSecurityRestrictions": [
+                    { "name": "office", "ipAddressRange": "203.0.113.0/24", "action": "Allow" }
+                ]
+            }}}
+        });
+        let l = extract(&v);
+        assert_eq!(l.ingress_external, Some(true));
+        assert!(l.access_restricted);
+
+        // Empty rule list is not a restriction.
+        let empty = json!({
+            "properties": { "configuration": { "ingress": {
+                "external": true, "ipSecurityRestrictions": []
+            }}}
+        });
+        assert!(!extract(&empty).access_restricted);
     }
 
     #[test]

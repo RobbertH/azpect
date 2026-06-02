@@ -48,17 +48,19 @@ pub struct Resource {
     /// `systemData.lastModifiedAt` from the ARM envelope. Same caveats as
     /// `created_at` — missing for legacy resources.
     pub modified_at: Option<DateTime<Utc>>,
-    /// Extended ARM-envelope bits (who created/modified the resource, tags)
-    /// surfaced in the Detail overview. Bundled so the (many) test fixtures can
-    /// opt out with `meta: Default::default()`. `#[serde(default)]` keeps older
-    /// cached payloads deserializable.
+    /// Extended ARM-envelope bits (authorship, tags) plus kind-specific
+    /// networking (APIM gateway/VIPs, Function App public-access posture)
+    /// surfaced in the list + Detail overview. Bundled so the (many) test
+    /// fixtures can opt out with `meta: Default::default()`. `#[serde(default)]`
+    /// keeps older cached payloads deserializable.
     #[serde(default)]
     pub meta: ResourceMeta,
 }
 
-/// `systemData` authorship + resource tags. All optional / empty for legacy
-/// resource providers (notably `microsoft.web/sites` and APIM) that don't
-/// populate `systemData`; the renderer collapses absent lines.
+/// `systemData` authorship + resource tags + kind-specific networking. All
+/// optional / empty for legacy resource providers (notably `microsoft.web/sites`
+/// and APIM) that don't populate `systemData`; the renderer collapses absent
+/// lines.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ResourceMeta {
     /// `systemData.createdBy` — a UPN/email for `User`, an object id for
@@ -70,6 +72,36 @@ pub struct ResourceMeta {
     pub modified_by_type: Option<String>,
     /// Resource tags as `(key, value)` pairs, sorted by key.
     pub tags: Vec<(String, String)>,
+    /// APIM only: `properties.gatewayUrl` — the service's gateway endpoint
+    /// (e.g. `https://myapim.azure-api.net`). `None` for other kinds.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+    /// APIM only: `properties.publicIPAddresses` — the public virtual IP(s) the
+    /// gateway answers on. Empty for non-APIM resources.
+    #[serde(default)]
+    pub public_ips: Vec<String>,
+    /// APIM only: `properties.privateIPAddresses` — the private VIP(s), present
+    /// only for internal-VNet-mode services. Empty otherwise.
+    #[serde(default)]
+    pub private_ips: Vec<String>,
+    /// `properties.publicNetworkAccess` (`Enabled` / `Disabled`). Populated for
+    /// Function Apps (and APIM); `None` when the provider doesn't expose it or
+    /// the value is unset. See [`ResourceMeta::public_network_enabled`].
+    #[serde(default)]
+    pub public_network_access: Option<String>,
+}
+
+impl ResourceMeta {
+    /// Whether the resource is reachable over the public network. The ARM field
+    /// `properties.publicNetworkAccess` is `Disabled` to lock a resource down;
+    /// any other value — including unset and `Enabled` — leaves it publicly
+    /// reachable, which is Azure's default for `microsoft.web/sites`.
+    pub fn public_network_enabled(&self) -> bool {
+        !matches!(
+            self.public_network_access.as_deref(),
+            Some(a) if a.eq_ignore_ascii_case("Disabled")
+        )
+    }
 }
 
 /// KQL query template. Lane 2 substitutes nothing — Resource Graph honors the
@@ -115,7 +147,21 @@ Resources
           createdByType = tostring(systemData.createdByType),
           modifiedBy = tostring(systemData.lastModifiedBy),
           modifiedByType = tostring(systemData.lastModifiedByType),
-          tags = tags
+          tags = tags,
+          // Kind-specific networking surfaced in the list's NETWORK column and
+          // the Detail overview. gatewayUrl / hostnameConfigurations / public+
+          // private IPs only exist on APIM (`microsoft.apimanagement/service`);
+          // publicNetworkAccess is the Function App (and APIM) public-access
+          // toggle. Absent fields project as null/empty and the renderer just
+          // omits them. The effective gateway URL prefers the custom `Proxy`
+          // hostname (what the portal Overview shows, e.g. `https://api.acme.io`)
+          // over the default `gatewayUrl` (`https://<name>.azure-api.net`); both
+          // are carried so the parser can pick — see `effective_gateway_url`.
+          gatewayUrl = tostring(properties.gatewayUrl),
+          hostnameConfigurations = properties.hostnameConfigurations,
+          publicIPs = properties.publicIPAddresses,
+          privateIPs = properties.privateIPAddresses,
+          publicNetworkAccess = tostring(properties.publicNetworkAccess)
 | order by name asc
 "#;
 
@@ -207,6 +253,10 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
         modified_by: non_empty_string(v.get("modifiedBy")),
         modified_by_type: non_empty_string(v.get("modifiedByType")),
         tags: parse_tags(v.get("tags")),
+        gateway_url: effective_gateway_url(v),
+        public_ips: parse_string_array(v.get("publicIPs")),
+        private_ips: parse_string_array(v.get("privateIPs")),
+        public_network_access: non_empty_string(v.get("publicNetworkAccess")),
     };
 
     Some(Resource {
@@ -230,6 +280,62 @@ fn non_empty_string(v: Option<&serde_json::Value>) -> Option<String> {
     v.and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+/// The APIM gateway URL as the portal Overview shows it: the custom gateway
+/// (`Proxy`) hostname when one is configured (e.g. `https://api.acme.io`),
+/// otherwise the default `properties.gatewayUrl` (`https://<name>.azure-api.net`).
+/// `None` for non-APIM resources (both projected fields are null there).
+fn effective_gateway_url(v: &serde_json::Value) -> Option<String> {
+    if let Some(host) = proxy_hostname(v.get("hostnameConfigurations")) {
+        return Some(format!("https://{host}"));
+    }
+    non_empty_string(v.get("gatewayUrl"))
+}
+
+/// Pick the gateway (`Proxy`) custom hostname out of APIM's
+/// `hostnameConfigurations` array, preferring the entry marked as the default
+/// SSL binding when several `Proxy` hostnames exist. Returns `None` when there's
+/// no custom gateway domain (only the default `*.azure-api.net` applies) — note
+/// `DeveloperPortal` / `Management` / `Scm` / `Portal` entries are deliberately
+/// ignored so a custom developer-portal domain never masquerades as the gateway.
+fn proxy_hostname(v: Option<&serde_json::Value>) -> Option<String> {
+    let arr = v?.as_array()?;
+    let is_proxy = |h: &&serde_json::Value| {
+        h.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.eq_ignore_ascii_case("Proxy"))
+    };
+    let host_of = |h: &serde_json::Value| {
+        h.get("hostName")
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // Prefer the default-SSL-binding Proxy host; else the first Proxy host.
+    arr.iter()
+        .filter(is_proxy)
+        .find(|h| {
+            h.get("defaultSslBinding")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false)
+        })
+        .and_then(host_of)
+        .or_else(|| arr.iter().filter(is_proxy).find_map(host_of))
+}
+
+/// Read a JSON field as a vec of strings, tolerant of `null` / missing / a
+/// non-array value. Resource Graph projects an absent dynamic column (e.g.
+/// `properties.publicIPAddresses` on a non-APIM resource) as `null`; non-string
+/// array entries are skipped. Yields an empty vec in all the absent cases.
+fn parse_string_array(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Flatten a `tags` object into `(key, value)` pairs sorted by key. Non-string
@@ -429,6 +535,156 @@ mod tests {
                 ("Terraform".to_string(), "true".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_apim_gateway_and_virtual_ips() {
+        let payload = json!({
+            "data": [{
+                "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.ApiManagement/service/myapim",
+                "name": "myapim",
+                "type": "microsoft.apimanagement/service",
+                "kind": "",
+                "location": "westeurope",
+                "resourceGroup": "rg1",
+                "subscriptionId": "sub1",
+                "state": "",
+                "gatewayUrl": "https://myapim.azure-api.net",
+                "publicIPs": ["20.1.2.3"],
+                "privateIPs": ["10.0.0.4", "10.0.0.5"],
+                "publicNetworkAccess": "Enabled"
+            }]
+        });
+        let r = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .next()
+            .unwrap();
+        assert_eq!(r.kind, ResourceKind::Apim);
+        assert_eq!(
+            r.meta.gateway_url.as_deref(),
+            Some("https://myapim.azure-api.net")
+        );
+        assert_eq!(r.meta.public_ips, vec!["20.1.2.3".to_string()]);
+        assert_eq!(
+            r.meta.private_ips,
+            vec!["10.0.0.4".to_string(), "10.0.0.5".to_string()]
+        );
+        assert!(r.meta.public_network_enabled());
+    }
+
+    #[test]
+    fn apim_gateway_prefers_custom_proxy_hostname() {
+        // Portal "Gateway URL" reflects the custom Proxy domain when set, not the
+        // default *.azure-api.net. A DeveloperPortal custom domain must NOT be
+        // mistaken for the gateway.
+        let payload = json!({
+            "data": [{
+                "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.ApiManagement/service/apim",
+                "name": "apim",
+                "type": "microsoft.apimanagement/service",
+                "kind": "",
+                "location": "westeurope",
+                "resourceGroup": "rg1",
+                "subscriptionId": "sub1",
+                "state": "",
+                "gatewayUrl": "https://apim.azure-api.net",
+                "hostnameConfigurations": [
+                    { "type": "DeveloperPortal", "hostName": "portal.acme.io" },
+                    { "type": "Proxy", "hostName": "api.acme.io", "defaultSslBinding": true }
+                ]
+            }]
+        });
+        let r = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .next()
+            .unwrap();
+        assert_eq!(r.meta.gateway_url.as_deref(), Some("https://api.acme.io"));
+    }
+
+    #[test]
+    fn apim_gateway_picks_default_ssl_binding_among_multiple_proxies() {
+        let v = json!({
+            "hostnameConfigurations": [
+                { "type": "Proxy", "hostName": "legacy.acme.io", "defaultSslBinding": false },
+                { "type": "Proxy", "hostName": "api.acme.io", "defaultSslBinding": true }
+            ],
+            "gatewayUrl": "https://apim.azure-api.net"
+        });
+        assert_eq!(
+            effective_gateway_url(&v).as_deref(),
+            Some("https://api.acme.io")
+        );
+    }
+
+    #[test]
+    fn apim_gateway_falls_back_to_default_when_no_custom_proxy() {
+        // Only a custom developer-portal domain → the gateway stays the default.
+        let v = json!({
+            "hostnameConfigurations": [
+                { "type": "DeveloperPortal", "hostName": "portal.acme.io" }
+            ],
+            "gatewayUrl": "https://apim.azure-api.net"
+        });
+        assert_eq!(
+            effective_gateway_url(&v).as_deref(),
+            Some("https://apim.azure-api.net")
+        );
+        // No hostname configs at all → default gateway.
+        let v = json!({ "gatewayUrl": "https://apim.azure-api.net" });
+        assert_eq!(
+            effective_gateway_url(&v).as_deref(),
+            Some("https://apim.azure-api.net")
+        );
+    }
+
+    #[test]
+    fn function_app_public_network_access_disabled_reads_as_private() {
+        let payload = json!({
+            "data": [{
+                "id": "/subscriptions/sub1/resourceGroups/rg1/providers/Microsoft.Web/sites/locked",
+                "name": "locked",
+                "type": "microsoft.web/sites",
+                "kind": "functionapp,linux",
+                "location": "westeurope",
+                "resourceGroup": "rg1",
+                "subscriptionId": "sub1",
+                "state": "Running",
+                "publicNetworkAccess": "Disabled"
+            }]
+        });
+        let r = payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_resource)
+            .next()
+            .unwrap();
+        assert_eq!(r.kind, ResourceKind::FunctionApp);
+        assert_eq!(r.meta.public_network_access.as_deref(), Some("Disabled"));
+        assert!(!r.meta.public_network_enabled());
+        // Non-APIM rows carry no gateway / VIPs.
+        assert!(r.meta.gateway_url.is_none());
+        assert!(r.meta.public_ips.is_empty());
+        assert!(r.meta.private_ips.is_empty());
+    }
+
+    #[test]
+    fn public_network_unset_defaults_to_enabled() {
+        // Azure leaves publicNetworkAccess unset on apps that have never toggled
+        // it; the default posture is "Enabled" (publicly reachable).
+        let meta = ResourceMeta::default();
+        assert!(meta.public_network_enabled());
+        let meta = ResourceMeta {
+            public_network_access: Some("Enabled".into()),
+            ..Default::default()
+        };
+        assert!(meta.public_network_enabled());
     }
 
     #[test]

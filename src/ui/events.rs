@@ -56,6 +56,13 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<crate::azure::resource_health::ResourceAvailability, String>,
     },
+    /// Background load completion: the fixed-24h Errors+Traffic series used to
+    /// compute the health badge, independent of the chart's selected range.
+    /// Fired alongside `HealthLoaded` from `spawn_load_health`.
+    HealthMetricsLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::metrics::MetricSeries>, String>,
+    },
     /// Background load completion: configured CPU/memory caps from a
     /// Container App's template. Only fired for `ResourceKind::ContainerApp`.
     ContainerAppOverviewLoaded {
@@ -77,13 +84,13 @@ pub enum AppEvent {
         resource_id: String,
         result: Result<Vec<crate::azure::container_app_replicas::ReplicaInstance>, String>,
     },
-    /// Background load completion: a Function App's deployed container image,
-    /// parsed from `config/web`'s `linuxFxVersion`. Only fired for
-    /// `ResourceKind::FunctionApp`. `Ok(None)` means the app is code-deployed
-    /// (no container image); `Err` leaves the VERSION column blank silently.
+    /// Background load completion: a Function App's `config/web` — its deployed
+    /// container image (for the VERSION column) plus its public-access posture
+    /// (for the Detail `network:` row). Only fired for `ResourceKind::FunctionApp`.
+    /// `Err` leaves both blank silently.
     FunctionAppImageLoaded {
         resource_id: String,
-        result: Result<Option<String>, String>,
+        result: Result<crate::azure::function_app_config::WebConfig, String>,
     },
     /// Background load completion: a Function App's application settings (OS env
     /// vars) from the `config/appsettings/list` action. Only fired for
@@ -92,6 +99,14 @@ pub enum AppEvent {
     FunctionAppSettingsLoaded {
         resource_id: String,
         result: Result<Vec<crate::azure::env_vars::EnvVar>, String>,
+    },
+    /// Background load completion: a Function App's per-function trigger summary
+    /// from the `functions` list. Only fired for `ResourceKind::FunctionApp`.
+    /// `Ok(vec![])` means no functions are synced to ARM (e.g. run-from-package
+    /// apps); `Err` is surfaced as a hint in the Detail overview.
+    FunctionAppTriggersLoaded {
+        resource_id: String,
+        result: Result<Vec<crate::azure::function_app_triggers::FunctionTrigger>, String>,
     },
     /// Background load completion: a directory principal's display name resolved
     /// via Microsoft Graph (best-effort; `Err` / `Ok(None)` ⇒ fall back to the

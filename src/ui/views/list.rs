@@ -42,6 +42,13 @@ const SUB_COL_WIDTH: usize = 22;
 /// reserve exactly that — older resources with `None` for the timestamp render
 /// as an empty column, which keeps the next column aligned.
 const DATE_COL_WIDTH: usize = 10;
+/// Width of the `NETWORK` column: a single column that means different things by
+/// kind — the APIM gateway host (scheme stripped, e.g. `myapim.azure-api.net`)
+/// or a Function App / Container App's exposure posture (`public`,
+/// `public (restricted)`, `private`). Sized to fit the longest posture label;
+/// longer gateway hosts truncate with an ellipsis. Network exposure is worth a
+/// glance, so it sits ahead of the (less critical) `CREATED` column.
+const NETWORK_COL_WIDTH: usize = 20;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
@@ -149,7 +156,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 hdr("KIND", KIND_COL_WIDTH),
                 Span::raw("    "), // badge glyph (●) + space + state column padding
                 hdr("STATUS", 8),
-                Span::raw("  "),
+                // Extra padding spans the 5xx-flag slot (" " + 3 + "  ") that
+                // each row renders after the badge, keeping VERSION aligned.
+                Span::raw("      "),
                 hdr("VERSION", VERSION_COL_WIDTH),
                 Span::raw("  "),
                 hdr("RESOURCE GROUP", max_rg),
@@ -159,7 +168,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 header_spans.push(hdr("SUBSCRIPTION", SUB_COL_WIDTH));
             }
             header_spans.push(Span::raw("  "));
+            header_spans.push(hdr("NETWORK", NETWORK_COL_WIDTH));
+            header_spans.push(Span::raw("  "));
             header_spans.push(hdr("CREATED", DATE_COL_WIDTH));
+            let header_spans = clip_spans_to_width(header_spans, ha.width as usize, theme);
             frame.render_widget(Paragraph::new(Line::from(header_spans)), ha);
         }
 
@@ -189,6 +201,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 let kind_tag = format!("{:<KIND_COL_WIDTH$}", r.kind.short_tag());
 
                 let (badge_color, badge_label) = badge_for_row(r, state, theme);
+                // 5xx presence flag (see `errors_5xx_for_row`): a marker next to
+                // the badge, independent of the verdict.
+                let five_xx = match errors_5xx_for_row(r, state) {
+                    Some(n) if n > 0.0 => "5xx",
+                    _ => "",
+                };
 
                 // Deployed image tag (the version/hash). Dots while the backing
                 // fetch is in flight; blank when there's no image to show.
@@ -229,6 +247,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                         format!("{:<8}", badge_label),
                         Style::default().fg(badge_color),
                     ),
+                    Span::raw(" "),
+                    Span::styled(format!("{five_xx:<3}"), Style::default().fg(theme.degraded)),
                     Span::raw("  "),
                     Span::styled(version, Style::default().fg(theme.fg)),
                     Span::raw("  "),
@@ -249,9 +269,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     spans.push(Span::styled(sub, Style::default().fg(theme.muted)));
                 }
 
+                // NETWORK before CREATED: exposure posture is worth a glance, so
+                // when the row overflows the terminal it's CREATED that gets
+                // clipped, not the network state.
+                let (net_text, net_color) = network_cell(r, state, theme);
+                let network = format!(
+                    "{:<width$}",
+                    truncate_right(&net_text, NETWORK_COL_WIDTH),
+                    width = NETWORK_COL_WIDTH
+                );
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(network, Style::default().fg(net_color)));
+
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(created, Style::default().fg(theme.muted)));
 
+                // Clip the assembled row to the visible width with a trailing `…`
+                // so a chopped-off column reads as truncated, not silently cut.
+                let spans = clip_spans_to_width(spans, body_area.width as usize, theme);
                 if selected {
                     Line::from(spans).style(theme.selection())
                 } else {
@@ -270,19 +305,39 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     frame.render_widget(footer, chunks[1]);
 }
 
-pub(crate) fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
-    if state.metrics.failures.contains_key(&r.id) {
-        return (theme.critical, "ERROR".to_string());
-    }
-    let metrics = state.metrics.by_resource.get(&r.id);
-    let availability = state.health.by_resource.get(&r.id).map(|a| a.state);
+/// 5xx count over the fixed-24h health window for a row, once the health
+/// metrics have loaded (`None` while loading / on failure). Surfaced as a `5xx`
+/// flag next to the badge — a *presence* signal, independent of the verdict, so
+/// an app that's HEALTHY by error-ratio but still throwing 500s is visible.
+pub(crate) fn errors_5xx_for_row(r: &Resource, state: &AppState) -> Option<f64> {
+    state
+        .health
+        .metrics
+        .get(&r.id)
+        .map(|m| crate::azure::health::errors_total(m))
+}
 
-    // Both signals still loading: show LOADING. Otherwise feed `derive`
-    // whatever's there and let the decision table take over.
-    if metrics.is_none() && availability.is_none() {
+pub(crate) fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
+    // The badge derives from two independent fetches that resolve at different
+    // times: the fixed-24h health metrics (Errors+Traffic) and Resource Health
+    // availability. Deriving from whichever lands first flashes a wrong verdict
+    // before things settle (metrics-only → IDLE, health-only → HEALTHY), so hold
+    // at LOADING until *both* have resolved. A failure on either counts as
+    // resolved: all-metrics-failed → ERROR; a 403 on Resource Health just drops
+    // the availability signal rather than pinning the row at LOADING forever.
+    let metrics_resolved = state.health.metrics.contains_key(&r.id)
+        || state.health.metrics_failures.contains_key(&r.id);
+    let availability_resolved =
+        state.health.by_resource.contains_key(&r.id) || state.health.failures.contains_key(&r.id);
+    if !(metrics_resolved && availability_resolved) {
         return (theme.muted, "LOADING…".to_string());
     }
+    if state.health.metrics_failures.contains_key(&r.id) {
+        return (theme.critical, "ERROR".to_string());
+    }
 
+    let metrics = state.health.metrics.get(&r.id);
+    let availability = state.health.by_resource.get(&r.id).map(|a| a.state);
     let m: &[crate::azure::metrics::MetricSeries] = metrics.map(|v| v.as_slice()).unwrap_or(&[]);
     let status = derive(m, r.state.as_deref(), availability);
     (color_for_health(status, theme), status.label().to_string())
@@ -306,6 +361,69 @@ fn format_date(dt: Option<&DateTime<Utc>>) -> String {
         Some(d) => d.format("%Y-%m-%d").to_string(),
         None => String::new(),
     }
+}
+
+/// Content + colour for the kind-aware NETWORK column. APIM rows show the
+/// gateway host (scheme stripped, in `accent` like a link); Function App rows
+/// show their public/private posture in three states, mirroring the portal:
+/// `private` (`healthy`) when public access is disabled, `public (restricted)`
+/// (`idle`) when reachable but gated by IP/VNet rules, and a bare `public`
+/// (`degraded` — worth a glance for an internal API tool) when wide open. The
+/// restriction detail rides on the same eager `config/web` fetch as the image;
+/// until it lands, an Enabled app reads as plain `public`. Every other kind
+/// (and an APIM service with no gateway yet) renders blank.
+fn network_cell(r: &Resource, state: &AppState, theme: &Theme) -> (String, Color) {
+    match r.kind {
+        ResourceKind::Apim => match r.meta.gateway_url.as_deref() {
+            Some(url) if !url.is_empty() => (strip_scheme(url).to_string(), theme.accent),
+            _ => (String::new(), theme.muted),
+        },
+        ResourceKind::FunctionApp => {
+            if !r.meta.public_network_enabled() {
+                ("private".to_string(), theme.healthy)
+            } else {
+                match state.func_image.access_restricted.get(&r.id).copied() {
+                    Some(true) => ("public (restricted)".to_string(), theme.idle),
+                    Some(false) => ("public".to_string(), theme.degraded),
+                    // Restriction state not known yet. While the config/web fetch
+                    // is in flight show a loading dash rather than committing to
+                    // the wide-open "public" label — a restricted app must not
+                    // flash as fully public. A finished-but-dataless fetch (e.g.
+                    // a 403) falls back to the bare posture.
+                    None if image_pending(r, state) => ("…".to_string(), theme.muted),
+                    None => ("public".to_string(), theme.degraded),
+                }
+            }
+        }
+        // Container Apps express exposure through ingress, not publicNetworkAccess:
+        // external ingress is internet-facing, internal/none is not. Same vocab as
+        // Function Apps so the column reads consistently; the Detail row carries
+        // the finer internal-vs-no-ingress distinction.
+        ResourceKind::ContainerApp => match state.container_app_overview.by_resource.get(&r.id) {
+            Some(ov) => match ov.ingress_external {
+                Some(true) if ov.access_restricted => {
+                    ("public (restricted)".to_string(), theme.idle)
+                }
+                Some(true) => ("public".to_string(), theme.degraded),
+                Some(false) | None => ("private".to_string(), theme.healthy),
+            },
+            // Overview fetch (eager, like the FA image) still in flight.
+            None if state.container_app_overview.pending.contains(&r.id) => {
+                ("…".to_string(), theme.muted)
+            }
+            None => (String::new(), theme.muted),
+        },
+        _ => (String::new(), theme.muted),
+    }
+}
+
+/// Strip a leading `https://` / `http://` so the gateway host fits the column.
+/// The scheme is always `https` for an APIM gateway, so dropping it loses no
+/// signal; the Detail view still shows the full URL for copy.
+fn strip_scheme(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
 }
 
 /// The deployed container image for a row, when known. Container Apps read the
@@ -360,6 +478,47 @@ fn truncate_right(s: &str, max: usize) -> String {
     out
 }
 
+/// Clip a row's spans to `width` display columns, appending a muted `…` when
+/// content is dropped. Columns are left-aligned and fixed-width, so the cut only
+/// ever lands in the rightmost (least important) columns; the ellipsis makes a
+/// chopped-off column read as truncated rather than silently missing. Counted in
+/// chars, matching [`truncate_right`]. A no-op when everything already fits.
+fn clip_spans_to_width(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= width {
+        return spans;
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let budget = width - 1; // leave a column for the ellipsis
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for s in spans {
+        let len = s.content.chars().count();
+        if used + len <= budget {
+            used += len;
+            out.push(s);
+        } else {
+            let take = budget - used;
+            if take > 0 {
+                let truncated: String = s.content.chars().take(take).collect();
+                out.push(Span::styled(truncated, s.style));
+            }
+            break;
+        }
+    }
+    out.push(Span::styled(
+        "\u{2026}".to_string(),
+        Style::default().fg(theme.muted),
+    ));
+    out
+}
+
 fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
     if visible == 0 || len <= visible {
         return 0;
@@ -373,15 +532,23 @@ fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let filtered_len = state.filtered_resources().len();
 
+    // Esc clears the search filter — whether the box is still focused or the
+    // filter was applied then defocused (via Enter/Down) — and returns to the
+    // full list. Only an already-clear list lets Esc fall through to navigation.
+    if matches!(action, Action::Back)
+        && (state.list_filter_active || !state.list_filter.value().is_empty())
+    {
+        state.list_filter_active = false;
+        state.list_filter.reset();
+        state.list_cursor = 0;
+        return true;
+    }
+
     // While the search box is active, swallow nav/special actions and let Lane 3
     // forward raw key events into `list_filter` for editing. The set we still
     // handle here is limited to ones that should affect the underlying list.
     if state.list_filter_active {
         match action {
-            Action::Back => {
-                state.list_filter_active = false;
-                return true;
-            }
             Action::OpenSelected => {
                 // Vim-style: first Enter just defocuses the search box and hands
                 // control to the filtered list. A second Enter (handled below)
@@ -534,7 +701,7 @@ mod tests {
         let theme = Theme::catppuccin_mocha();
         // Wide enough for all columns (NAME…CREATED, incl. the SUBSCRIPTION and
         // VERSION columns) so header assertions below see the trailing ones.
-        let backend = TestBackend::new(160, 12);
+        let backend = TestBackend::new(180, 12);
         let mut term = Terminal::new(backend).unwrap();
         let state = fixture();
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -553,12 +720,159 @@ mod tests {
         assert!(s.contains("CREATED"), "expected CREATED header in {s}");
     }
 
+    /// Build a metrics vec with `traffic` requests and zero errors across the
+    /// trailing window, so `derive` resolves to HEALTHY once both signals land.
+    fn healthy_metrics() -> Vec<crate::azure::metrics::MetricSeries> {
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        let now = Utc::now();
+        let pts = |v: f64| {
+            (0..4)
+                .map(|i| MetricPoint {
+                    ts: now - chrono::Duration::minutes(15 * (4 - i)),
+                    value: v,
+                })
+                .collect::<Vec<_>>()
+        };
+        vec![
+            MetricSeries {
+                kind: MetricKind::Errors,
+                label: "Http 5xx".into(),
+                unit: "count".into(),
+                points: pts(0.0),
+            },
+            MetricSeries {
+                kind: MetricKind::Traffic,
+                label: "Requests".into(),
+                unit: "count".into(),
+                points: pts(100.0),
+            },
+        ]
+    }
+
+    fn avail_available() -> crate::azure::resource_health::ResourceAvailability {
+        use crate::azure::resource_health::{AvailabilityState, ResourceAvailability};
+        ResourceAvailability {
+            state: AvailabilityState::Available,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn badge_holds_loading_until_both_signals_resolve() {
+        let theme = Theme::catppuccin_mocha();
+        let mut state = fixture();
+        let res = state.resources[0].clone();
+
+        // Nothing loaded yet.
+        assert_eq!(badge_for_row(&res, &state, &theme).1, "LOADING…");
+
+        // Health metrics arrived but Resource Health still pending → still
+        // LOADING (this is the case that used to flash IDLE).
+        state
+            .health
+            .metrics
+            .insert(res.id.clone(), healthy_metrics());
+        assert_eq!(
+            badge_for_row(&res, &state, &theme).1,
+            "LOADING…",
+            "metrics-only must not derive a badge"
+        );
+
+        // Resource Health lands → both resolved → real verdict.
+        state
+            .health
+            .by_resource
+            .insert(res.id.clone(), avail_available());
+        assert_eq!(badge_for_row(&res, &state, &theme).1, "HEALTHY");
+    }
+
+    #[test]
+    fn badge_holds_loading_when_only_health_resolved() {
+        // Mirror case: health-first must not flash HEALTHY before metrics load.
+        let theme = Theme::catppuccin_mocha();
+        let mut state = fixture();
+        let res = state.resources[0].clone();
+        state
+            .health
+            .by_resource
+            .insert(res.id.clone(), avail_available());
+        assert_eq!(badge_for_row(&res, &state, &theme).1, "LOADING…");
+    }
+
+    #[test]
+    fn badge_treats_health_failure_as_resolved() {
+        // A 403 on Resource Health must not pin the row at LOADING forever — we
+        // fall back to the metric-only verdict.
+        let theme = Theme::catppuccin_mocha();
+        let mut state = fixture();
+        let res = state.resources[0].clone();
+        state
+            .health
+            .metrics
+            .insert(res.id.clone(), healthy_metrics());
+        state
+            .health
+            .failures
+            .insert(res.id.clone(), "403 Forbidden".into());
+        assert_eq!(badge_for_row(&res, &state, &theme).1, "HEALTHY");
+    }
+
+    #[test]
+    fn renders_5xx_flag_when_health_window_has_errors() {
+        // A HEALTHY row that nonetheless had 5xx in the 24h window must show the
+        // `5xx` flag next to the badge.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let id = state.resources[0].id.clone();
+        // Healthy ratio (1 error / 1000 req) but errors_total > 0.
+        let mut metrics = healthy_metrics();
+        if let Some(errors) = metrics
+            .iter_mut()
+            .find(|m| m.kind == crate::azure::metrics::MetricKind::Errors)
+        {
+            errors.points.last_mut().unwrap().value = 1.0;
+        }
+        state.health.metrics.insert(id.clone(), metrics);
+        state.health.by_resource.insert(id, avail_available());
+
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("HEALTHY"), "expected HEALTHY badge, got {s}");
+        assert!(
+            s.contains("5xx"),
+            "expected 5xx flag next to badge, got {s}"
+        );
+    }
+
+    #[test]
+    fn no_5xx_flag_when_window_is_clean() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let id = state.resources[0].id.clone();
+        // healthy_metrics() has zero errors.
+        state.health.metrics.insert(id.clone(), healthy_metrics());
+        state.health.by_resource.insert(id, avail_available());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("HEALTHY"));
+        assert!(
+            !s.contains("5xx"),
+            "clean window must not show the 5xx flag"
+        );
+    }
+
     #[test]
     fn renders_created_column_value_when_present() {
         use chrono::TimeZone;
 
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(140, 12);
+        // Wide enough to reach the CREATED column, which now trails NETWORK and
+        // the all-subscriptions SUBSCRIPTION column.
+        let backend = TestBackend::new(180, 12);
         let mut term = Terminal::new(backend).unwrap();
         let mut state = fixture();
         state.resources[0].created_at = Some(Utc.with_ymd_and_hms(2024, 3, 15, 8, 30, 0).unwrap());
@@ -632,6 +946,174 @@ mod tests {
         assert!(
             s.contains("fnver99"),
             "expected function app image tag in row, got {s}"
+        );
+    }
+
+    #[test]
+    fn strip_scheme_drops_https() {
+        assert_eq!(
+            strip_scheme("https://myapim.azure-api.net"),
+            "myapim.azure-api.net"
+        );
+        assert_eq!(strip_scheme("http://x.example"), "x.example");
+        // No scheme to strip — returned unchanged.
+        assert_eq!(strip_scheme("myapim.azure-api.net"), "myapim.azure-api.net");
+    }
+
+    #[test]
+    fn network_cell_apim_shows_gateway_host() {
+        let theme = Theme::catppuccin_mocha();
+        let state = AppState::new(Config::default());
+        let mut res = r("/r/apim", "an-apim", ResourceKind::Apim);
+        res.meta.gateway_url = Some("https://an-apim.azure-api.net".into());
+        let (text, color) = network_cell(&res, &state, &theme);
+        assert_eq!(text, "an-apim.azure-api.net");
+        assert_eq!(color, theme.accent);
+
+        // No gateway resolved yet → blank, not a stray scheme.
+        let bare = r("/r/apim2", "bare-apim", ResourceKind::Apim);
+        assert_eq!(network_cell(&bare, &state, &theme).0, "");
+    }
+
+    #[test]
+    fn network_cell_function_app_shows_access_posture() {
+        let theme = Theme::catppuccin_mocha();
+        let mut state = AppState::new(Config::default());
+
+        // Unset → Azure default is public. While the config/web fetch is still
+        // in flight the restriction state is unknown → loading dash, not a
+        // premature "public" that could mislabel a restricted app.
+        let public = r("/r/f1", "open-func", ResourceKind::FunctionApp);
+        state.func_image.pending.insert(public.id.clone());
+        let (text, color) = network_cell(&public, &state, &theme);
+        assert_eq!(text, "…");
+        assert_eq!(color, theme.muted);
+
+        // Fetch finished without restriction data (e.g. 403) → bare public.
+        state.func_image.pending.remove(&public.id);
+        let (text, color) = network_cell(&public, &state, &theme);
+        assert_eq!(text, "public");
+        assert_eq!(color, theme.degraded);
+
+        // Same app once config/web reports IP/VNet restrictions → distinct label.
+        state
+            .func_image
+            .access_restricted
+            .insert(public.id.clone(), true);
+        let (text, color) = network_cell(&public, &state, &theme);
+        assert_eq!(text, "public (restricted)");
+        assert_eq!(color, theme.idle);
+
+        // A known-unrestricted app stays bare public.
+        state
+            .func_image
+            .access_restricted
+            .insert(public.id.clone(), false);
+        assert_eq!(network_cell(&public, &state, &theme).0, "public");
+
+        let mut private = r("/r/f2", "locked-func", ResourceKind::FunctionApp);
+        private.meta.public_network_access = Some("Disabled".into());
+        let (text, color) = network_cell(&private, &state, &theme);
+        assert_eq!(text, "private");
+        assert_eq!(color, theme.healthy);
+    }
+
+    #[test]
+    fn network_cell_container_app_reflects_ingress() {
+        use crate::azure::container_app_overview::ContainerAppOverview;
+        let theme = Theme::catppuccin_mocha();
+        let mut state = AppState::new(Config::default());
+        let ca = r("/r/ca", "some-ca", ResourceKind::ContainerApp);
+
+        // Overview fetch in flight → loading dash.
+        state.container_app_overview.pending.insert(ca.id.clone());
+        assert_eq!(network_cell(&ca, &state, &theme), ("…".into(), theme.muted));
+        state.container_app_overview.pending.remove(&ca.id);
+
+        let put = |state: &mut AppState, ext: Option<bool>, restricted: bool| {
+            state.container_app_overview.by_resource.insert(
+                ca.id.clone(),
+                ContainerAppOverview {
+                    ingress_external: ext,
+                    access_restricted: restricted,
+                    ..Default::default()
+                },
+            );
+        };
+        put(&mut state, Some(true), false);
+        assert_eq!(
+            network_cell(&ca, &state, &theme),
+            ("public".into(), theme.degraded)
+        );
+        put(&mut state, Some(true), true);
+        assert_eq!(
+            network_cell(&ca, &state, &theme),
+            ("public (restricted)".into(), theme.idle)
+        );
+        put(&mut state, Some(false), false); // internal ingress → not public
+        assert_eq!(
+            network_cell(&ca, &state, &theme),
+            ("private".into(), theme.healthy)
+        );
+        put(&mut state, None, false); // no ingress → not public
+        assert_eq!(
+            network_cell(&ca, &state, &theme),
+            ("private".into(), theme.healthy)
+        );
+    }
+
+    #[test]
+    fn network_cell_blank_for_other_kinds() {
+        let theme = Theme::catppuccin_mocha();
+        let state = AppState::new(Config::default());
+        let agw = r("/r/agw", "some-gw", ResourceKind::AppGateway);
+        assert_eq!(network_cell(&agw, &state, &theme).0, "");
+    }
+
+    #[test]
+    fn clip_spans_appends_ellipsis_only_on_overflow() {
+        let theme = Theme::catppuccin_mocha();
+        let spans = vec![
+            Span::raw("hello "),
+            Span::styled("world!!".to_string(), Style::default().fg(theme.fg)),
+        ]; // 13 chars total
+        let text = |out: &[Span]| -> String { out.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Fits exactly → untouched, no ellipsis.
+        let out = clip_spans_to_width(spans.clone(), 13, &theme);
+        assert_eq!(text(&out), "hello world!!");
+
+        // Overflows → truncated to width-1 chars plus a trailing ellipsis, and
+        // span styles are preserved up to the cut.
+        let out = clip_spans_to_width(spans, 10, &theme);
+        let t = text(&out);
+        assert_eq!(t, "hello wor\u{2026}");
+        assert_eq!(t.chars().count(), 10);
+    }
+
+    #[test]
+    fn renders_network_column() {
+        let theme = Theme::catppuccin_mocha();
+        // Wide enough that the appended NETWORK column is fully visible even with
+        // the SUBSCRIPTION column shown (all-subscriptions mode).
+        let backend = TestBackend::new(200, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // fixture()[1] (/r/two) is the APIM; give it a gateway URL.
+        state.resources[1].meta.gateway_url = Some("https://beta-apim.azure-api.net".into());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("NETWORK"), "expected NETWORK header in {s}");
+        // The gateway host is longer than the column, so it shows truncated
+        // (`…`); assert on the visible prefix rather than the full host.
+        assert!(
+            s.contains("beta-apim.azure-api"),
+            "expected gateway host in {s}"
+        );
+        // fixture()[0] (/r/one) is a Function App with no access set → public.
+        assert!(
+            s.contains("public"),
+            "expected funcapp access posture in {s}"
         );
     }
 
@@ -716,6 +1198,37 @@ mod tests {
         let mut state = fixture();
         assert!(handle(Action::StartSearch, &mut state));
         assert!(state.list_filter_active);
+    }
+
+    #[test]
+    fn esc_clears_active_filter() {
+        let mut state = fixture();
+        state.list_filter = tui_input::Input::new("beta".to_string());
+        state.list_filter_active = true;
+        state.list_cursor = 1;
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.list_filter_active);
+        assert_eq!(state.list_filter.value(), "");
+        assert_eq!(state.list_cursor, 0);
+    }
+
+    #[test]
+    fn esc_clears_applied_filter_after_defocus() {
+        // /foo, Enter to browse (defocus), then Esc should still clear the filter
+        // rather than navigating away.
+        let mut state = fixture();
+        state.list_filter = tui_input::Input::new("beta".to_string());
+        state.list_filter_active = false;
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.list_filter.value(), "");
+    }
+
+    #[test]
+    fn esc_on_clear_list_falls_through_to_navigation() {
+        // No filter → list::handle must NOT consume Esc, so the global handler
+        // can navigate back.
+        let mut state = fixture();
+        assert!(!handle(Action::Back, &mut state));
     }
 
     #[test]

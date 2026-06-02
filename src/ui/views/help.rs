@@ -51,6 +51,20 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Health badge",
+        &[
+            ("window", "computed over a fixed 24h, not the chart range"),
+            ("HEALTHY", "<1% 5xx and no error spikes"),
+            ("DEGRADED", "sustained >1% 5xx, or a single-bin spike"),
+            ("CRITICAL", "stopped, platform down, or >5% / sharp spike"),
+            ("IDLE", "running but no traffic in the last 24h"),
+            ("UNKNOWN", "no data / not loaded yet"),
+            ("ERROR", "couldn't fetch the health metrics"),
+            ("5xx", "had server errors in 24h (flag, not the verdict)"),
+            ("note", "verdict is worst-of all signals (pessimistic)"),
+        ],
+    ),
+    (
         "APIM (APIs/Routes)",
         &[
             ("Enter", "drill down: APIs > routes > policy"),

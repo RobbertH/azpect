@@ -399,6 +399,11 @@ pub struct ReplicaInstancesCache {
 #[derive(Clone, Default)]
 pub struct FuncImageCache {
     pub by_resource: HashMap<String, Option<String>>,
+    /// Whether public access is IP/VNet-restricted, per resource — the other
+    /// fact read off the same `config/web` fetch. Presence means "known"; an
+    /// absent entry means the fetch hasn't landed (or failed), so the Detail
+    /// `network:` row shows posture without the restriction detail.
+    pub access_restricted: HashMap<String, bool>,
     pub pending: HashSet<String>,
 }
 
@@ -413,6 +418,18 @@ pub struct FuncImageCache {
 #[derive(Clone, Default)]
 pub struct FuncSettingsCache {
     pub by_resource: HashMap<String, Vec<crate::azure::env_vars::EnvVar>>,
+    pub failures: HashMap<String, String>,
+    pub pending: HashSet<String>,
+}
+
+/// Per-Function-App trigger summary (one [`crate::azure::function_app_triggers::FunctionTrigger`]
+/// per function) from the `functions` list. Lazily fetched on entering the
+/// Detail view, like [`FuncSettingsCache`]. An empty vec is a legitimate result
+/// (no functions synced to ARM); `failures` carries the error so the detail
+/// view can show a hint instead of silently dropping the triggers block.
+#[derive(Clone, Default)]
+pub struct FuncTriggersCache {
+    pub by_resource: HashMap<String, Vec<crate::azure::function_app_triggers::FunctionTrigger>>,
     pub failures: HashMap<String, String>,
     pub pending: HashSet<String>,
 }
@@ -485,6 +502,12 @@ pub struct HealthCache {
     pub pending: HashSet<String>,
     /// Per-resource failure messages.
     pub failures: HashMap<String, String>,
+    /// Fixed-24h Errors+Traffic series feeding the badge verdict, independent of
+    /// the chart's selected range. Fetched alongside `by_resource` (availability)
+    /// in `spawn_load_health`; consumed by `azure::health::derive`.
+    pub metrics: HashMap<String, Vec<MetricSeries>>,
+    /// Per-resource health-metrics failure messages (all metric calls failed).
+    pub metrics_failures: HashMap<String, String>,
 }
 
 /// State for the APIM drill-in views: APIs list (per APIM service), operations
@@ -1061,6 +1084,12 @@ impl ServiceBusCache {
 pub struct LogsCache {
     /// keyed by resource id
     pub by_resource: HashMap<String, Vec<LogLine>>,
+    /// Log Analytics workspace ARM id per resource, resolved as a side effect of
+    /// the first log page (Container Apps only — their logs live in the env's
+    /// workspace, not the app resource). Used to scope `o`'s portal Logs blade
+    /// deep-link to the workspace. Absent for resources whose logs are
+    /// resource-scoped (Function Apps) or when resolution failed.
+    pub workspace_ids: HashMap<String, String>,
     /// Per-resource flag for "the last fetch came back full, so older rows
     /// may still exist in the window." Drives both the header indicator and
     /// the auto-fetch trigger on G / scroll-past-bottom.
@@ -1120,6 +1149,11 @@ pub struct AppState {
     pub subscriptions: Vec<Subscription>,
     pub selected_subscription: Option<String>,
     pub subscription_cursor: usize,
+    /// `/`-search box for the subscription picker. Mirrors `list_filter` +
+    /// `list_filter_active`: a subsequence match over each subscription's
+    /// display name and id (see [`AppState::filtered_subscription_list`]).
+    pub subscription_filter: Input,
+    pub subscription_filter_active: bool,
     pub loading_subscriptions: bool,
 
     pub resources: Vec<Resource>,
@@ -1145,6 +1179,7 @@ pub struct AppState {
     pub replica_instances: ReplicaInstancesCache,
     pub func_image: FuncImageCache,
     pub func_settings: FuncSettingsCache,
+    pub func_triggers: FuncTriggersCache,
     pub principals: PrincipalCache,
     pub apim: ApimCache,
     pub appgw: AppGatewayBackendsCache,
@@ -1216,6 +1251,8 @@ impl AppState {
             subscriptions: Vec::new(),
             selected_subscription: config.last_subscription_id.clone(),
             subscription_cursor: 0,
+            subscription_filter: Input::default(),
+            subscription_filter_active: false,
             loading_subscriptions: true,
             resources: Vec::new(),
             list_cursor: 0,
@@ -1239,6 +1276,7 @@ impl AppState {
             replica_instances: ReplicaInstancesCache::default(),
             func_image: FuncImageCache::default(),
             func_settings: FuncSettingsCache::default(),
+            func_triggers: FuncTriggersCache::default(),
             principals: PrincipalCache::default(),
             apim: ApimCache::default(),
             appgw: AppGatewayBackendsCache::default(),
@@ -1292,6 +1330,23 @@ impl AppState {
             .iter()
             .filter(|r| !self.favorites_only || self.config.is_favorite(&r.id))
             .filter(|r| needle.is_empty() || is_subsequence(&needle, &r.name.to_lowercase()))
+            .collect()
+    }
+
+    /// Subscriptions matching the picker's `/`-search box, in original order.
+    /// Subsequence match (same as [`Self::filtered_resources`]) over the display
+    /// name and the id, so a partial name or a chunk of the GUID both narrow the
+    /// list. Empty filter passes everything through. The synthetic "All
+    /// subscriptions" row is not part of this list — the view prepends it.
+    pub fn filtered_subscription_list(&self) -> Vec<&Subscription> {
+        let needle = self.subscription_filter.value().to_lowercase();
+        self.subscriptions
+            .iter()
+            .filter(|s| {
+                needle.is_empty()
+                    || is_subsequence(&needle, &s.display_name.to_lowercase())
+                    || is_subsequence(&needle, &s.id.to_lowercase())
+            })
             .collect()
     }
 }

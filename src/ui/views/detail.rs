@@ -111,12 +111,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let metrics_opt = state.metrics.by_resource.get(&resource.id);
     let failure = state.metrics.failures.get(&resource.id);
     let availability = state.health.by_resource.get(&resource.id).map(|a| a.state);
-    let (badge_color, badge_label) = if failure.is_some() {
+    // The badge derives from the fixed-24h health metrics + Resource Health, NOT
+    // the chart series (`metrics_opt`, which follow the selected range). Hold at
+    // LOADING until both health signals resolve; see `badge_for_row` for the
+    // rationale. A failure on either counts as resolved.
+    let health_metrics = state.health.metrics.get(&resource.id);
+    let metrics_resolved =
+        health_metrics.is_some() || state.health.metrics_failures.contains_key(&resource.id);
+    let availability_resolved = state.health.by_resource.contains_key(&resource.id)
+        || state.health.failures.contains_key(&resource.id);
+    let (badge_color, badge_label) = if state.health.metrics_failures.contains_key(&resource.id) {
         (theme.critical, "ERROR")
-    } else if metrics_opt.is_none() && availability.is_none() {
+    } else if !(metrics_resolved && availability_resolved) {
         (theme.muted, "LOADING")
     } else {
-        let m: &[MetricSeries] = metrics_opt.map(|v| v.as_slice()).unwrap_or(&[]);
+        let m: &[MetricSeries] = health_metrics.map(|v| v.as_slice()).unwrap_or(&[]);
         let h = derive(m, resource.state.as_deref(), availability);
         (color_for_health(h, theme), h.label())
     };
@@ -164,9 +173,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // missing so the rest of the page (tags / created / modified) doesn't get
     // pushed down once the data lands. Skeleton rows render in muted gray.
     let is_ca = resource.kind == ResourceKind::ContainerApp;
+    let is_fa = resource.kind == ResourceKind::FunctionApp;
+    let is_apim = resource.kind == ResourceKind::Apim;
     let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
     let (meta_lines, meta_is_skeleton) = if ca_meta_loading {
         (container_app_skeleton_meta_rows(), true)
+    } else if is_fa {
+        // Function Apps get their own (lighter) meta block: deployed image +
+        // runtime + network posture. No skeleton — the rows appear as their
+        // backing data lands.
+        (function_app_meta_lines(state, resource), false)
+    } else if is_apim {
+        // APIM: gateway URL + virtual IP addresses, straight off the list fetch.
+        (apim_meta_lines(resource), false)
     } else {
         (container_app_meta_lines(revision_meta, limits), false)
     };
@@ -195,6 +214,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             false,
         )
     };
+    // Function App per-function triggers (kind + what they listen to), from the
+    // functions list. FA-only; collapses to nothing for other kinds and when the
+    // app has no synced functions. Loading / failure surface as a single hint.
+    let trigger_lines = if is_fa {
+        function_trigger_lines(
+            state.func_triggers.by_resource.get(&resource.id),
+            state.func_triggers.pending.contains(&resource.id),
+            state.func_triggers.failures.get(&resource.id),
+        )
+    } else {
+        Vec::new()
+    };
     // Env vars (Container Apps + Function Apps), masked unless revealed, then
     // the kind-agnostic tags + ownership lines. Skip env_var_rows entirely for
     // Container Apps while the overview is loading — the skeleton meta block
@@ -218,6 +249,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     for (_, _, plain_text) in &replica_lines {
         context_height += wrapped_line_count(plain_text, inner.width).max(1);
     }
+    for (_, _, plain_text) in &trigger_lines {
+        context_height += wrapped_line_count(plain_text, inner.width).max(1);
+    }
     for (_, plain_text) in &env_rows {
         context_height += wrapped_line_count(plain_text, inner.width).max(1);
     }
@@ -235,43 +269,59 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ])
     .split(inner);
 
-    let mut context_lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(&resource.resource_group, Style::default().fg(theme.muted)),
-            Span::styled(" · ", Style::default().fg(theme.muted)),
-            Span::styled(resource.kind.short_tag(), Style::default().fg(theme.accent)),
-            Span::styled(" · ", Style::default().fg(theme.muted)),
-            Span::styled("●", Style::default().fg(badge_color)),
-            Span::raw(" "),
-            Span::styled(badge_label, Style::default().fg(badge_color)),
-            Span::styled(" · ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!(
-                    "window {} · per {}",
-                    state.metrics.range.label(),
-                    state.metrics.range.pretty_interval()
-                ),
-                Style::default().fg(theme.fg),
-            ),
-            Span::styled(
-                // Stays up while *any* of the detail's data is reloading
-                // (metrics, health, the Container App overview/revision, or
-                // per-replica status), so a refresh keeps the old rows visible
-                // behind this hint rather than collapsing them.
-                if state.metrics.loading
-                    || state.health.pending.contains(&resource.id)
-                    || state.container_app_overview.pending.contains(&resource.id)
-                    || state.replica_instances.pending.contains(&resource.id)
-                {
-                    "  · refreshing…"
-                } else {
-                    ""
-                },
-                Style::default().fg(theme.muted),
-            ),
-        ]),
-        second_line,
+    // 5xx presence flag, shown next to the badge whenever the 24h window had any
+    // server errors — independent of the HEALTHY/DEGRADED verdict (an app can be
+    // under the error-ratio thresholds yet still throwing 500s worth a look).
+    let errors_5xx = state
+        .health
+        .metrics
+        .get(&resource.id)
+        .map(|m| crate::azure::health::errors_total(m))
+        .unwrap_or(0.0);
+
+    let mut header_spans: Vec<Span> = vec![
+        Span::styled(&resource.resource_group, Style::default().fg(theme.muted)),
+        Span::styled(" · ", Style::default().fg(theme.muted)),
+        Span::styled(resource.kind.short_tag(), Style::default().fg(theme.accent)),
+        Span::styled(" · ", Style::default().fg(theme.muted)),
+        Span::styled("●", Style::default().fg(badge_color)),
+        Span::raw(" "),
+        Span::styled(badge_label, Style::default().fg(badge_color)),
     ];
+    if errors_5xx > 0.0 {
+        header_spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+        header_spans.push(Span::styled(
+            format!("5xx {}", format_count(errors_5xx)),
+            Style::default().fg(theme.degraded),
+        ));
+    }
+    header_spans.push(Span::styled(" · ", Style::default().fg(theme.muted)));
+    header_spans.push(Span::styled(
+        format!(
+            "window {} · per {}",
+            state.metrics.range.label(),
+            state.metrics.range.pretty_interval()
+        ),
+        Style::default().fg(theme.fg),
+    ));
+    header_spans.push(Span::styled(
+        // Stays up while *any* of the detail's data is reloading (metrics,
+        // health, the Container App overview/revision, or per-replica status),
+        // so a refresh keeps the old rows visible behind this hint rather than
+        // collapsing them.
+        if state.metrics.loading
+            || state.health.pending.contains(&resource.id)
+            || state.container_app_overview.pending.contains(&resource.id)
+            || state.replica_instances.pending.contains(&resource.id)
+        {
+            "  · refreshing…"
+        } else {
+            ""
+        },
+        Style::default().fg(theme.muted),
+    ));
+
+    let mut context_lines: Vec<Line> = vec![Line::from(header_spans), second_line];
     // Track line indices that correspond to selectable rows so the cursor's
     // row can be highlighted by patching its spans with `theme.selection()`
     // after all rows have been pushed. The order here MUST match the order
@@ -304,6 +354,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         if !replica_is_skeleton {
             selectable_line_idx.push(line_idx);
         }
+    }
+    for (label, value, _) in trigger_lines {
+        let line_idx = context_lines.len();
+        context_lines.push(styled_meta_line(label, value, theme));
+        selectable_line_idx.push(line_idx);
     }
     for (line, _) in env_rows {
         let line_idx = context_lines.len();
@@ -622,6 +677,19 @@ fn container_app_meta_lines(
         if let Some(fqdn) = l.fqdn.as_deref() {
             out.push(("fqdn:".into(), fqdn.to_string(), format!("fqdn: {fqdn}")));
         }
+        // Ingress posture — the Container App network exposure (the analogue of
+        // the Function App `network:` row, expressed via ingress).
+        let network = match l.ingress_external {
+            None => "no ingress",
+            Some(false) => "internal ingress (VNet only)",
+            Some(true) if l.access_restricted => "external ingress (IP restricted)",
+            Some(true) => "external ingress (public)",
+        };
+        out.push((
+            "network:".into(),
+            network.to_string(),
+            format!("network: {network}"),
+        ));
         if let Some(env) = l.managed_environment.as_deref() {
             out.push((
                 "environment:".into(),
@@ -814,6 +882,209 @@ fn short_replica_failure(reason: &str) -> String {
         "unavailable (permission denied)".to_string()
     } else if reason.contains("404") {
         "unavailable (revision not found)".to_string()
+    } else {
+        let one_line: String = reason.chars().take(80).collect();
+        if reason.chars().count() > 80 {
+            format!("unavailable ({one_line}\u{2026})")
+        } else {
+            format!("unavailable ({one_line})")
+        }
+    }
+}
+
+/// Cap on the number of per-function trigger rows shown in the Detail overview;
+/// an app with more functions than this gets a `+N more` summary row so a
+/// sprawling app can't blow the header height. Shared by [`render`]'s display
+/// and [`selectable_metas`] so the two stay aligned.
+const TRIGGER_CAP: usize = 12;
+
+/// Function-App-only meta lines for the Detail header: the deployed container
+/// image (container-deployed apps) and a runtime summary. Same `(label, value,
+/// plain)` tuple shape as [`container_app_meta_lines`]; absent data collapses
+/// (no line). Both rows are free — they read from caches already populated for
+/// other reasons (`func_image` for the list's VERSION column, `func_settings`
+/// for the env-vars page) rather than firing a dedicated fetch.
+fn function_app_meta_lines(state: &AppState, resource: &Resource) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let id = resource.id.as_str();
+
+    // Deployed image. `func_image` caches `Option<String>`: `Some(img)` for
+    // container-deployed apps, `Some(None)` for code-deployed (no image line),
+    // absent while still loading.
+    if let Some(Some(img)) = state.func_image.by_resource.get(id) {
+        out.push(("image:".into(), img.clone(), format!("image: {img}")));
+    }
+
+    // Worker runtime + Functions host version, distilled from the app settings
+    // we already lazy-load. Absent when settings aren't readable (the env-vars
+    // row already signals that permission gap, so we don't repeat it here).
+    if let Some(vars) = state.func_settings.by_resource.get(id) {
+        if let Some(rt) = function_runtime_summary(vars) {
+            out.push(("runtime:".into(), rt.clone(), format!("runtime: {rt}")));
+        }
+    }
+
+    // Public network access posture, mirroring the portal's three states. The
+    // Enabled/Disabled toggle rides on the list fetch (no extra call); the
+    // "with/without restrictions" detail rides on the same `config/web` fetch
+    // that feeds the image (so it's free), and is omitted until that lands.
+    let access = if !resource.meta.public_network_enabled() {
+        // publicNetworkAccess = Disabled → reachable only via private endpoints.
+        "public access disabled"
+    } else {
+        match state.func_image.access_restricted.get(id).copied() {
+            // "Enabled from select virtual networks and IP addresses".
+            Some(true) => "public access enabled (IP/VNet restricted)",
+            // "Enabled with no access restrictions".
+            Some(false) => "public access enabled (no restrictions)",
+            // config/web not back yet — show posture without the detail.
+            None => "public access enabled",
+        }
+    };
+    out.push((
+        "network:".into(),
+        access.to_string(),
+        format!("network: {access}"),
+    ));
+
+    out
+}
+
+/// APIM-only meta lines for the Detail header: the gateway endpoint URL plus the
+/// service's virtual IP addresses — public VIP(s) always, and private VIP(s)
+/// only for internal-VNet services. Same `(label, value, plain)` tuple shape as
+/// the other meta builders; absent data collapses (no line). All read off the
+/// list fetch — no dedicated APIM call.
+fn apim_meta_lines(resource: &Resource) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let m = &resource.meta;
+
+    if let Some(url) = m.gateway_url.as_deref().filter(|s| !s.is_empty()) {
+        out.push((
+            "gateway:".into(),
+            url.to_string(),
+            format!("gateway: {url}"),
+        ));
+    }
+    if !m.public_ips.is_empty() {
+        let joined = m.public_ips.join(", ");
+        out.push((
+            "public IP:".into(),
+            joined.clone(),
+            format!("public IP: {joined}"),
+        ));
+    }
+    if !m.private_ips.is_empty() {
+        let joined = m.private_ips.join(", ");
+        out.push((
+            "private IP:".into(),
+            joined.clone(),
+            format!("private IP: {joined}"),
+        ));
+    }
+
+    out
+}
+
+/// Distil the worker runtime and Functions host version out of a Function App's
+/// app settings into one line, e.g. `python · ~4`. Returns `None` when neither
+/// `FUNCTIONS_WORKER_RUNTIME` nor `FUNCTIONS_EXTENSION_VERSION` is present.
+fn function_runtime_summary(vars: &[crate::azure::env_vars::EnvVar]) -> Option<String> {
+    let find = |key: &str| {
+        vars.iter()
+            .find(|v| v.name.eq_ignore_ascii_case(key))
+            .map(|v| v.value.trim())
+            .filter(|s| !s.is_empty())
+    };
+    match (
+        find("FUNCTIONS_WORKER_RUNTIME"),
+        find("FUNCTIONS_EXTENSION_VERSION"),
+    ) {
+        (Some(r), Some(v)) => Some(format!("{r} \u{00b7} {v}")),
+        (Some(r), None) => Some(r.to_string()),
+        (None, Some(v)) => Some(format!("Functions {v}")),
+        (None, None) => None,
+    }
+}
+
+/// Build the Function-App triggers block for the Detail header: one row per
+/// function, sharing a `triggers:` label on the first row (blank continuation
+/// labels keep the values in a column). Caps at [`TRIGGER_CAP`] with a `+N more`
+/// row. A single hint row is returned while the fetch is pending or after it
+/// failed; an empty Vec when the app has no synced functions. Same `(label,
+/// value, plain)` tuple shape as the other meta builders.
+fn function_trigger_lines(
+    triggers: Option<&Vec<crate::azure::function_app_triggers::FunctionTrigger>>,
+    pending: bool,
+    failure: Option<&String>,
+) -> Vec<(String, String, String)> {
+    const LABEL: &str = "triggers:";
+    let blank_label: String = " ".repeat(LABEL.chars().count());
+
+    // Cached data wins over a transient error so a stale-but-useful list sticks
+    // around across blips.
+    if let Some(list) = triggers {
+        if list.is_empty() {
+            return Vec::new();
+        }
+        let shown = list.len().min(TRIGGER_CAP);
+        let max_name = list
+            .iter()
+            .take(shown)
+            .map(|t| t.function.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for (idx, t) in list.iter().take(shown).enumerate() {
+            let name_col = format!("{:<width$}", t.function, width = max_name);
+            let kind = if t.kind.is_empty() {
+                "\u{2014}".to_string() // em dash: function with no trigger binding
+            } else {
+                t.kind.clone()
+            };
+            let value = match &t.detail {
+                Some(d) => format!("{name_col}  {kind}: {d}"),
+                None => format!("{name_col}  {kind}"),
+            };
+            let label = if idx == 0 {
+                LABEL.to_string()
+            } else {
+                blank_label.clone()
+            };
+            let plain = format!("{label} {value}");
+            out.push((label, value, plain));
+        }
+        if list.len() > shown {
+            let value = format!("\u{2026} +{} more", list.len() - shown);
+            out.push((
+                blank_label.clone(),
+                value.clone(),
+                format!("{blank_label} {value}"),
+            ));
+        }
+        return out;
+    }
+
+    if pending {
+        return vec![(
+            LABEL.into(),
+            "loading\u{2026}".into(),
+            format!("{LABEL} loading\u{2026}"),
+        )];
+    }
+    if let Some(msg) = failure {
+        let value = short_trigger_failure(msg);
+        return vec![(LABEL.into(), value.clone(), format!("{LABEL} {value}"))];
+    }
+    Vec::new()
+}
+
+/// One-line, plain-language hint for a failed functions-list fetch. Mirrors
+/// [`short_replica_failure`]'s philosophy.
+fn short_trigger_failure(reason: &str) -> String {
+    if reason.contains("403") || reason.contains("Forbidden") {
+        "unavailable (permission denied)".to_string()
     } else {
         let one_line: String = reason.chars().take(80).collect();
         if reason.chars().count() > 80 {
@@ -1221,23 +1492,32 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         });
     }
 
-    // Container-app meta block. Skip entirely when the cache is still being
-    // populated — render shows skeletons in that case and skeletons aren't
-    // selectable.
+    // Meta block. Container Apps draw rev/image/replicas/…; Function Apps draw
+    // their own image/runtime lines. The CA block is skipped while its cache is
+    // still loading (render shows non-selectable skeletons then); the FA block
+    // has no skeleton. Stay in sync with [`render`]'s `meta_lines` selection.
     let revision_meta = state.revision_meta.by_resource.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
     let is_ca = resource.kind == ResourceKind::ContainerApp;
+    let is_fa = resource.kind == ResourceKind::FunctionApp;
+    let is_apim = resource.kind == ResourceKind::Apim;
     let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
-    if !ca_meta_loading {
-        let meta_lines = container_app_meta_lines(revision_meta, limits);
-        for (label, value, _) in meta_lines {
-            out.push(SelectableMeta {
-                yank: value.clone(),
-                modal_title: label.trim_end_matches(':').trim().to_string(),
-                modal_lines: vec![value],
-                enter_action: None,
-            });
-        }
+    let meta_lines = if is_fa {
+        function_app_meta_lines(state, resource)
+    } else if is_apim {
+        apim_meta_lines(resource)
+    } else if !ca_meta_loading {
+        container_app_meta_lines(revision_meta, limits)
+    } else {
+        Vec::new()
+    };
+    for (label, value, _) in meta_lines {
+        out.push(SelectableMeta {
+            yank: value.clone(),
+            modal_title: label.trim_end_matches(':').trim().to_string(),
+            modal_lines: vec![value],
+            enter_action: None,
+        });
     }
 
     // Replica block. Same skeleton skip; otherwise one selectable per replica
@@ -1289,6 +1569,25 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         // emitted at all, so no selectable here either.)
     }
 
+    // Function App triggers. FA-only; map each emitted trigger row 1:1 to a
+    // selectable (including the `+N more` row and any loading / failure hint) so
+    // the cursor index lines up with `render`'s push order.
+    if is_fa {
+        let trigger_lines = function_trigger_lines(
+            state.func_triggers.by_resource.get(&resource.id),
+            state.func_triggers.pending.contains(&resource.id),
+            state.func_triggers.failures.get(&resource.id),
+        );
+        for (label, value, _) in trigger_lines {
+            out.push(SelectableMeta {
+                yank: value.clone(),
+                modal_title: label.trim_end_matches(':').trim().to_string(),
+                modal_lines: vec![value],
+                enter_action: None,
+            });
+        }
+    }
+
     // Env-vars teaser. Enter on this row jumps to the dedicated EnvVars page
     // instead of opening a modal; the page already gives a full view, so a
     // modal would be redundant.
@@ -1320,6 +1619,35 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
     }
 
     out
+}
+
+/// Portal-blade suffix for the Detail row currently under the cursor, when it
+/// points at a more specific blade than the resource overview. Appended to the
+/// resource id by the `o` handler (see [`crate::ui::app`]'s `portal_url_for`);
+/// `None` falls back to the overview.
+///
+/// Keyed off the selected row's `modal_title` (the meta label, trimmed) plus the
+/// resource kind, and built from the same [`selectable_metas`] list the cursor
+/// indexes — so it always tracks the highlighted row. Currently the only
+/// row-specific target is the Function App `network:` row → the Networking
+/// blade (`networkingHub` on `Microsoft.Web/sites`).
+pub(crate) fn selected_meta_portal_suffix(
+    state: &AppState,
+    resource: &Resource,
+) -> Option<&'static str> {
+    let metas = selectable_metas(state, resource);
+    if metas.is_empty() {
+        return None;
+    }
+    let cursor = state.detail_view.cursor.min(metas.len() - 1);
+    match (resource.kind, metas[cursor].modal_title.as_str()) {
+        // Function App "Networking" blade.
+        (ResourceKind::FunctionApp, "network") => Some("/networkingHub"),
+        // Container App "Ingress" blade — where its exposure (external/internal,
+        // IP restrictions) is configured.
+        (ResourceKind::ContainerApp, "network") => Some("/ingress"),
+        _ => None,
+    }
 }
 
 /// Count how many env-vars teaser rows the render would emit for this
@@ -1788,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_lines_full_shape_emits_four_entries() {
+    fn meta_lines_full_shape_emits_expected_rows() {
         use crate::azure::container_app_overview::ContainerAppOverview;
         use crate::azure::container_app_revisions::ActiveRevisionMeta;
         use crate::ui::theme::Theme;
@@ -1805,15 +2133,89 @@ mod tests {
             cpu_millicores: 500,
             memory_bytes: 0,
             fqdn: Some("files-api.example.azurecontainerapps.io".into()),
+            ingress_external: Some(true),
             ..Default::default()
         };
         let lines = container_app_meta_lines(Some(&meta), Some(&limits));
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["rev:", "image:", "replicas:", "fqdn:"]);
+        assert_eq!(
+            labels,
+            vec!["rev:", "image:", "replicas:", "fqdn:", "network:"]
+        );
         assert_eq!(lines[0].1, "files-api--0000004");
         assert_eq!(lines[1].1, "myacr/files-api:abc123");
         assert_eq!(lines[2].1, "2 of 1\u{2013}10");
         assert_eq!(lines[3].1, "files-api.example.azurecontainerapps.io");
+        assert_eq!(lines[4].1, "external ingress (public)");
+    }
+
+    #[test]
+    fn container_app_network_row_reflects_ingress_posture() {
+        use crate::azure::container_app_overview::ContainerAppOverview;
+        let net = |ov: &ContainerAppOverview| -> String {
+            container_app_meta_lines(None, Some(ov))
+                .into_iter()
+                .find(|(l, _, _)| l == "network:")
+                .map(|(_, v, _)| v)
+                .expect("network row present")
+        };
+        // No ingress block → no inbound endpoint.
+        assert_eq!(net(&ContainerAppOverview::default()), "no ingress");
+        // Internal ingress → VNet-only.
+        assert_eq!(
+            net(&ContainerAppOverview {
+                ingress_external: Some(false),
+                ..Default::default()
+            }),
+            "internal ingress (VNet only)"
+        );
+        // External, no restrictions → public.
+        assert_eq!(
+            net(&ContainerAppOverview {
+                ingress_external: Some(true),
+                ..Default::default()
+            }),
+            "external ingress (public)"
+        );
+        // External + ipSecurityRestrictions → restricted.
+        assert_eq!(
+            net(&ContainerAppOverview {
+                ingress_external: Some(true),
+                access_restricted: true,
+                ..Default::default()
+            }),
+            "external ingress (IP restricted)"
+        );
+    }
+
+    #[test]
+    fn container_app_network_row_o_targets_the_ingress_blade() {
+        use crate::azure::container_app_overview::ContainerAppOverview;
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        let mut state = AppState::new(Config::default());
+        let mut res = r();
+        res.kind = ResourceKind::ContainerApp;
+        state.resources = vec![res.clone()];
+        state.list_cursor = 0;
+        // Both caches present so the CA meta block (incl. the network row) builds.
+        state
+            .revision_meta
+            .by_resource
+            .insert(res.id.clone(), ActiveRevisionMeta::default());
+        state.container_app_overview.by_resource.insert(
+            res.id.clone(),
+            ContainerAppOverview {
+                ingress_external: Some(true),
+                ..Default::default()
+            },
+        );
+        let metas = selectable_metas(&state, &res);
+        let idx = metas
+            .iter()
+            .position(|m| m.modal_title == "network")
+            .expect("container app detail has a network row");
+        state.detail_view.cursor = idx;
+        assert_eq!(selected_meta_portal_suffix(&state, &res), Some("/ingress"));
     }
 
     #[test]
@@ -1840,6 +2242,146 @@ mod tests {
         use crate::ui::theme::Theme;
         let theme = Theme::catppuccin_mocha();
         assert!(container_app_meta_lines(None, None).is_empty());
+    }
+
+    /// Build an APIM Resource with the given networking metadata.
+    fn apim_resource(gateway: Option<&str>, public_ips: &[&str], private_ips: &[&str]) -> Resource {
+        use crate::azure::resources::ResourceMeta;
+        Resource {
+            id: "/r/apim".into(),
+            name: "myapim".into(),
+            kind: ResourceKind::Apim,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: None,
+            created_at: None,
+            modified_at: None,
+            meta: ResourceMeta {
+                gateway_url: gateway.map(str::to_string),
+                public_ips: public_ips.iter().map(|s| s.to_string()).collect(),
+                private_ips: private_ips.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn apim_meta_lines_emits_gateway_and_virtual_ips() {
+        let res = apim_resource(
+            Some("https://myapim.azure-api.net"),
+            &["20.1.2.3"],
+            &["10.0.0.4", "10.0.0.5"],
+        );
+        let lines = apim_meta_lines(&res);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert_eq!(labels, vec!["gateway:", "public IP:", "private IP:"]);
+        assert_eq!(lines[0].1, "https://myapim.azure-api.net");
+        assert_eq!(lines[1].1, "20.1.2.3");
+        // Multiple VIPs join on one line.
+        assert_eq!(lines[2].1, "10.0.0.4, 10.0.0.5");
+    }
+
+    #[test]
+    fn apim_meta_lines_collapses_absent_private_ips() {
+        let res = apim_resource(Some("https://myapim.azure-api.net"), &["20.1.2.3"], &[]);
+        let labels: Vec<String> = apim_meta_lines(&res)
+            .iter()
+            .map(|(l, _, _)| l.clone())
+            .collect();
+        assert_eq!(labels, vec!["gateway:", "public IP:"]);
+        // Nothing at all → no rows (e.g. an APIM whose gateway hasn't resolved).
+        assert!(apim_meta_lines(&apim_resource(None, &[], &[])).is_empty());
+    }
+
+    #[test]
+    fn apim_detail_renders_gateway_and_ips() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(Config::default());
+        state.resources = vec![apim_resource(
+            Some("https://myapim.azure-api.net"),
+            &["20.1.2.3"],
+            &["10.0.0.4"],
+        )];
+        state.list_cursor = 0;
+        state.view = View::Detail;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("gateway"), "expected gateway row in {s}");
+        assert!(
+            s.contains("myapim.azure-api.net"),
+            "expected gateway url in {s}"
+        );
+        assert!(s.contains("20.1.2.3"), "expected public VIP in {s}");
+        assert!(s.contains("10.0.0.4"), "expected private VIP in {s}");
+    }
+
+    #[test]
+    fn function_app_meta_lines_includes_network_posture() {
+        let mut state = AppState::new(Config::default());
+        // r() is a Function App with default meta → public access (Azure default).
+        let res = r();
+        let net = |state: &AppState, res: &Resource| -> String {
+            function_app_meta_lines(state, res)
+                .into_iter()
+                .find(|(l, _, _)| l == "network:")
+                .map(|(_, v, _)| v)
+                .expect("network row present")
+        };
+
+        // Enabled, restriction state not yet fetched → posture without detail.
+        assert_eq!(net(&state, &res), "public access enabled");
+
+        // Same `config/web` fetch that feeds the image reports the restriction
+        // state; the row then distinguishes wide-open from gated public access.
+        state
+            .func_image
+            .access_restricted
+            .insert(res.id.clone(), false);
+        assert_eq!(net(&state, &res), "public access enabled (no restrictions)");
+        state
+            .func_image
+            .access_restricted
+            .insert(res.id.clone(), true);
+        assert_eq!(
+            net(&state, &res),
+            "public access enabled (IP/VNet restricted)"
+        );
+
+        // publicNetworkAccess = Disabled wins regardless of restriction rules.
+        let mut private = r();
+        private.meta.public_network_access = Some("Disabled".into());
+        state
+            .func_image
+            .access_restricted
+            .insert(private.id.clone(), true);
+        assert_eq!(net(&state, &private), "public access disabled");
+    }
+
+    #[test]
+    fn network_row_o_targets_the_networking_blade() {
+        let mut state = fixture_no_metrics(); // r() is a Function App
+        let resource = state.resources[0].clone();
+        let metas = selectable_metas(&state, &resource);
+        // `o` on the network row deep-links to the Networking blade.
+        let net_idx = metas
+            .iter()
+            .position(|m| m.modal_title == "network")
+            .expect("function app detail has a network row");
+        state.detail_view.cursor = net_idx;
+        assert_eq!(
+            selected_meta_portal_suffix(&state, &resource),
+            Some("/networkingHub")
+        );
+        // A row without a specific blade (the state row) falls back to overview.
+        let state_idx = metas
+            .iter()
+            .position(|m| m.modal_title == "state")
+            .expect("there is a state row");
+        state.detail_view.cursor = state_idx;
+        assert_eq!(selected_meta_portal_suffix(&state, &resource), None);
     }
 
     #[test]
@@ -2229,6 +2771,7 @@ mod tests {
                 ("Domain".into(), "tool".into()),
                 ("Terraform".into(), "true".into()),
             ],
+            ..Default::default()
         };
         let lines = general_meta_lines(&res, &PrincipalCache::default());
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
@@ -2345,5 +2888,150 @@ mod tests {
         assert!(handle(Action::OpenEnvVars, &mut state));
         assert_eq!(state.view, View::Detail);
         assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn function_runtime_summary_combines_runtime_and_version() {
+        let vars = vec![
+            ev("FUNCTIONS_EXTENSION_VERSION", "~4", false),
+            ev("FUNCTIONS_WORKER_RUNTIME", "python", false),
+        ];
+        assert_eq!(
+            function_runtime_summary(&vars).as_deref(),
+            Some("python \u{00b7} ~4")
+        );
+    }
+
+    #[test]
+    fn function_runtime_summary_partials_and_none() {
+        assert_eq!(
+            function_runtime_summary(&[ev("FUNCTIONS_WORKER_RUNTIME", "node", false)]).as_deref(),
+            Some("node")
+        );
+        assert_eq!(
+            function_runtime_summary(&[ev("FUNCTIONS_EXTENSION_VERSION", "~4", false)]).as_deref(),
+            Some("Functions ~4")
+        );
+        assert!(function_runtime_summary(&[ev("OTHER", "x", false)]).is_none());
+    }
+
+    #[test]
+    fn function_app_meta_lines_shows_image_then_runtime() {
+        let mut state = fixture_no_metrics(); // r() is a Function App
+        let resource = state.resources[0].clone();
+        state.func_image.by_resource.insert(
+            resource.id.clone(),
+            Some("myacr.azurecr.io/api:abc123".into()),
+        );
+        state.func_settings.by_resource.insert(
+            resource.id.clone(),
+            vec![ev("FUNCTIONS_WORKER_RUNTIME", "dotnet-isolated", false)],
+        );
+        let lines = function_app_meta_lines(&state, &resource);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
+        // The network posture row is appended after image + runtime.
+        assert_eq!(labels, vec!["image:", "runtime:", "network:"]);
+        assert_eq!(lines[0].1, "myacr.azurecr.io/api:abc123");
+        assert_eq!(lines[1].1, "dotnet-isolated");
+        assert_eq!(lines[2].1, "public access enabled");
+    }
+
+    #[test]
+    fn function_app_meta_lines_code_deployed_has_no_image() {
+        let mut state = fixture_no_metrics();
+        let resource = state.resources[0].clone();
+        // Code-deployed apps cache `Some(None)` — no image line, no panic.
+        state
+            .func_image
+            .by_resource
+            .insert(resource.id.clone(), None);
+        let lines = function_app_meta_lines(&state, &resource);
+        assert!(lines.iter().all(|(l, _, _)| l != "image:"));
+    }
+
+    #[test]
+    fn function_trigger_lines_one_row_per_function() {
+        use crate::azure::function_app_triggers::FunctionTrigger;
+        let triggers = vec![
+            FunctionTrigger {
+                function: "Api".into(),
+                kind: "http".into(),
+                detail: Some("GET, POST".into()),
+            },
+            FunctionTrigger {
+                function: "Cleanup".into(),
+                kind: "timer".into(),
+                detail: Some("0 0 * * * *".into()),
+            },
+        ];
+        let lines = function_trigger_lines(Some(&triggers), false, None);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, "triggers:");
+        // Continuation row shares a blank label for column alignment.
+        assert_eq!(lines[1].0.trim(), "");
+        assert!(lines[0].1.contains("Api"));
+        assert!(lines[0].1.contains("http: GET, POST"));
+        assert!(lines[1].1.contains("timer: 0 0 * * * *"));
+    }
+
+    #[test]
+    fn function_trigger_lines_empty_collapses_pending_and_failure_hint() {
+        assert!(function_trigger_lines(Some(&vec![]), false, None).is_empty());
+        let loading = function_trigger_lines(None, true, None);
+        assert_eq!(loading.len(), 1);
+        assert!(loading[0].1.contains("loading"));
+        let err = "azure api error 403: Forbidden".to_string();
+        let failed = function_trigger_lines(None, false, Some(&err));
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains("permission denied"));
+    }
+
+    #[test]
+    fn renders_function_app_image_runtime_and_triggers() {
+        use crate::azure::function_app_triggers::FunctionTrigger;
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(80, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture_no_metrics(); // r() is a Function App
+        let id = state.resources[0].id.clone();
+        state
+            .func_image
+            .by_resource
+            .insert(id.clone(), Some("myacr.azurecr.io/api:abc".into()));
+        state.func_settings.by_resource.insert(
+            id.clone(),
+            vec![ev("FUNCTIONS_WORKER_RUNTIME", "python", false)],
+        );
+        state.func_triggers.by_resource.insert(
+            id.clone(),
+            vec![FunctionTrigger {
+                function: "Ingest".into(),
+                kind: "kafka".into(),
+                detail: Some("events".into()),
+            }],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("image:"));
+        assert!(s.contains("runtime:"));
+        assert!(s.contains("triggers:"));
+        assert!(s.contains("Ingest"));
+        assert!(s.contains("kafka"));
+    }
+
+    #[test]
+    fn function_trigger_lines_caps_with_more_row() {
+        use crate::azure::function_app_triggers::FunctionTrigger;
+        let triggers: Vec<FunctionTrigger> = (0..TRIGGER_CAP + 3)
+            .map(|i| FunctionTrigger {
+                function: format!("fn{i}"),
+                kind: "queue".into(),
+                detail: Some("q".into()),
+            })
+            .collect();
+        let lines = function_trigger_lines(Some(&triggers), false, None);
+        // TRIGGER_CAP rows + one overflow summary.
+        assert_eq!(lines.len(), TRIGGER_CAP + 1);
+        assert!(lines.last().unwrap().1.contains("+3 more"));
     }
 }

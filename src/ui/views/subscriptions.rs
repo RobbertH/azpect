@@ -12,7 +12,8 @@ use crate::ui::events::Action;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Enter filter  y yank id  o portal  r refresh  ? help  q quit";
+const FOOTER_HINT: &str =
+    "j/k move  / search  Enter select  y yank id  o portal  r refresh  ? help  q quit";
 
 /// Label for the synthetic top row that clears the subscription filter.
 const ALL_LABEL: &str = "All subscriptions";
@@ -26,7 +27,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     .split(area);
 
     // Header
-    let header = Paragraph::new(Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             " subscriptions ",
             Style::default()
@@ -37,8 +38,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!("· {}", state.subscriptions.len()),
             Style::default().fg(theme.muted),
         ),
-    ]));
-    frame.render_widget(header, chunks[0]);
+    ];
+    // Active or non-empty `/`-search: echo the query as a chip, matching the
+    // resource list's header treatment.
+    if state.subscription_filter_active || !state.subscription_filter.value().is_empty() {
+        header_spans.push(Span::styled(
+            format!("  /{} ", state.subscription_filter.value()),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
     // Body: list inside a bordered block.
     let block = Block::default()
@@ -64,13 +73,35 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         )));
         frame.render_widget(p, inner);
     } else {
-        // Row 0 is the synthetic "All subscriptions" scope; the real
-        // subscriptions follow at cursor index +1.
-        let total = state.subscriptions.len() + 1;
+        // Carve off a top row for the `/`-search input when it's focused.
+        let (search_area, list_area) = if state.subscription_filter_active {
+            let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+            (Some(parts[0]), parts[1])
+        } else {
+            (None, inner)
+        };
+        if let Some(sa) = search_area {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent)),
+                    Span::styled(
+                        state.subscription_filter.value(),
+                        Style::default().fg(theme.fg),
+                    ),
+                    Span::styled("█", Style::default().fg(theme.accent)),
+                ])),
+                sa,
+            );
+        }
+
+        let filtered = state.filtered_subscription_list();
+        // Row 0 is the synthetic "All subscriptions" scope (always shown — it's
+        // the scope-reset, not a filterable row); the matching subscriptions
+        // follow at cursor index +1.
+        let total = filtered.len() + 1;
         let cursor = state.subscription_cursor.min(total - 1);
 
-        let max_name = state
-            .subscriptions
+        let max_name = filtered
             .iter()
             .map(|s| s.display_name.chars().count())
             .chain(std::iter::once(ALL_LABEL.len()))
@@ -102,7 +133,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             });
         }
 
-        for (i, sub) in state.subscriptions.iter().enumerate() {
+        for (i, sub) in filtered.iter().enumerate() {
             let selected = cursor == i + 1;
             let name = truncate_right(&sub.display_name, max_name);
             let pad_name = format!("{:<width$}", name, width = max_name);
@@ -133,8 +164,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             });
         }
 
-        let p = Paragraph::new(lines);
-        frame.render_widget(p, inner);
+        // A query that matches nothing still shows the "All" row above; add a
+        // muted hint so the empty space reads as "no matches", not "no subs".
+        if filtered.is_empty() && !state.subscription_filter.value().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "   no subscriptions match the current filter.",
+                Style::default().fg(theme.muted),
+            )));
+        }
+
+        frame.render_widget(Paragraph::new(lines), list_area);
     }
 
     let footer = Paragraph::new(Line::from(Span::styled(
@@ -146,8 +185,40 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
 /// View-local input handler. Returns `true` if the action was consumed.
 pub fn handle(action: Action, state: &mut AppState) -> bool {
-    // +1 for the synthetic "All subscriptions" row at cursor 0.
-    let total = state.subscriptions.len() + 1;
+    // +1 for the synthetic "All subscriptions" row at cursor 0. Nav/open operate
+    // over the *filtered* list so `/`-search narrows what j/k and Enter see.
+    let total = state.filtered_subscription_list().len() + 1;
+
+    // While the search box is focused, swallow most actions and let Lane 3
+    // forward raw keys into `subscription_filter`. Mirrors the resource list.
+    if state.subscription_filter_active {
+        match action {
+            Action::Back => {
+                // Esc defocuses the box (keeps the typed filter, like the list).
+                state.subscription_filter_active = false;
+                return true;
+            }
+            Action::OpenSelected => {
+                // First Enter defocuses; a second Enter (below) pins the row.
+                state.subscription_filter_active = false;
+                return true;
+            }
+            Action::MoveDown => {
+                // Down hands focus to the filtered list, then navigates.
+                state.subscription_filter_active = false;
+                // fall through to navigation handling below
+            }
+            Action::MoveUp
+            | Action::HalfPageDown
+            | Action::HalfPageUp
+            | Action::GotoTop
+            | Action::GotoBottom => {
+                // fall through to navigation handling below
+            }
+            _ => return false,
+        }
+    }
+
     match action {
         Action::MoveDown => {
             state.subscription_cursor = (state.subscription_cursor + 1).min(total - 1);
@@ -173,15 +244,19 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.subscription_cursor = total - 1;
             true
         }
+        Action::StartSearch => {
+            state.subscription_filter_active = true;
+            true
+        }
         Action::OpenSelected => {
             // Cursor 0 = "All subscriptions" → clear the filter; any other row
-            // pins that subscription. Persist the choice so the next launch
-            // honors it (`None` for All).
+            // pins that subscription (indexing the *filtered* list). Persist the
+            // choice so the next launch honors it (`None` for All).
             let new_selection = if state.subscription_cursor == 0 {
                 None
             } else {
                 state
-                    .subscriptions
+                    .filtered_subscription_list()
                     .get(state.subscription_cursor - 1)
                     .map(|s| s.id.clone())
             };
@@ -385,5 +460,78 @@ mod tests {
     fn unrelated_action_not_consumed() {
         let mut state = fixture();
         assert!(!handle(Action::Help, &mut state));
+    }
+
+    /// Set the picker's filter text (the event loop feeds it raw keys outside
+    /// the action handler; tests just seed the value directly).
+    fn type_filter(state: &mut AppState, text: &str) {
+        state.subscription_filter = tui_input::Input::default().with_value(text.to_string());
+    }
+
+    #[test]
+    fn slash_activates_search_box() {
+        let mut state = fixture();
+        assert!(handle(Action::StartSearch, &mut state));
+        assert!(state.subscription_filter_active);
+    }
+
+    #[test]
+    fn filter_narrows_the_list_and_open_indexes_the_filtered_set() {
+        let mut state = fixture();
+        type_filter(&mut state, "bet"); // matches "beta" only
+        assert_eq!(state.filtered_subscription_list().len(), 1);
+        // Rows are [All, beta]; cursor 1 = beta even though beta was index 2
+        // in the unfiltered list.
+        state.subscription_cursor = 1;
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(
+            state.selected_subscription.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+    }
+
+    #[test]
+    fn filter_matches_on_id_substring_too() {
+        let mut state = fixture();
+        type_filter(&mut state, "2222-2222");
+        let matched = state.filtered_subscription_list();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].display_name, "beta");
+    }
+
+    #[test]
+    fn nav_is_bounded_by_the_filtered_length() {
+        let mut state = fixture();
+        type_filter(&mut state, "alpha"); // 1 match → rows [All, alpha]
+                                          // Down from All lands on alpha and clamps there (no phantom beta row).
+        assert!(handle(Action::MoveDown, &mut state));
+        assert_eq!(state.subscription_cursor, 1);
+        assert!(handle(Action::MoveDown, &mut state));
+        assert_eq!(state.subscription_cursor, 1, "clamped to filtered last");
+    }
+
+    #[test]
+    fn esc_defocuses_search_box_without_leaving_picker() {
+        let mut state = fixture();
+        handle(Action::StartSearch, &mut state);
+        assert!(state.subscription_filter_active);
+        // Back is consumed (returns true) so it doesn't bubble to a view pop.
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.subscription_filter_active);
+    }
+
+    #[test]
+    fn renders_filter_chip_and_search_row_when_active() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(80, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.subscription_filter_active = true;
+        type_filter(&mut state, "bet");
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("/bet"), "filter chip should echo the query");
+        assert!(buf.contains("beta"));
+        assert!(!buf.contains("alpha"), "non-matching subs are hidden");
     }
 }

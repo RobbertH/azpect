@@ -46,6 +46,69 @@ pub fn supports_logs(kind: ResourceKind) -> bool {
     matches!(kind, ResourceKind::FunctionApp | ResourceKind::ContainerApp)
 }
 
+/// KQL for opening this resource's logs in the Azure Monitor **Logs blade** of
+/// the portal (what `o` deep-links to from the logs views). Drops the
+/// `| take {limit}` cap (the portal applies its own and the time window bounds
+/// it). `lines` are the rows currently cached for the resource; for Function
+/// Apps they pick which tables to union (see [`function_app_portal_query`]).
+/// `None` for kinds we don't query logs for.
+///
+/// Container Apps must be opened with the **workspace** as the blade scope (the
+/// app resource scope has none of these tables) — the caller is responsible for
+/// that; here we only emit the name-filtered query text.
+pub fn portal_query(resource: &Resource, lines: &[LogLine]) -> Option<String> {
+    match resource.kind {
+        ResourceKind::FunctionApp => Some(function_app_portal_query(lines)),
+        // Console logs land on two possible table/column shapes; filter to this
+        // one app by name (the env forwards every app's logs to one workspace).
+        ResourceKind::ContainerApp => Some(format!(
+            "union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs\n\
+             | where column_ifexists(\"ContainerAppName_s\", \"\") == \"{name}\" \
+             or column_ifexists(\"ContainerAppName\", \"\") == \"{name}\"\n\
+             | order by TimeGenerated desc",
+            name = resource.name,
+        )),
+        _ => None,
+    }
+}
+
+/// Tables a Function App's logs can come from, in display-preference order.
+/// Mirrors the sources [`parse_function_app_row`] / [`parse_function_app_logs_row`]
+/// stamp onto `LogLine::source`.
+const FUNCTION_APP_LOG_TABLES: [&str; 4] = [
+    "FunctionAppLogs",
+    "AppTraces",
+    "AppExceptions",
+    "AppRequests",
+];
+
+/// Build the Function App portal query, unioning **only the tables that actually
+/// produced the rows on screen**. A diagnostic-settings-only app ships solely
+/// `FunctionAppLogs`, so referencing the App Insights tables it lacks makes the
+/// portal's fuzzy union warn ("operand ... does not refer to any known table")
+/// even though data returns — restricting to observed tables avoids that.
+/// Falls back to `FunctionAppLogs` (the standard table) when nothing is cached.
+fn function_app_portal_query(lines: &[LogLine]) -> String {
+    // `source` is the table, optionally suffixed `/{FunctionName}` for
+    // FunctionAppLogs rows; take the part before the slash.
+    let present: Vec<&str> = FUNCTION_APP_LOG_TABLES
+        .iter()
+        .copied()
+        .filter(|t| lines.iter().any(|l| l.source.split('/').next() == Some(t)))
+        .collect();
+    let tables = if present.is_empty() {
+        vec!["FunctionAppLogs"]
+    } else {
+        present
+    };
+    let body = if tables.len() == 1 {
+        tables[0].to_string()
+    } else {
+        format!("union isfuzzy=true {}", tables.join(", "))
+    };
+    format!("{body}\n| order by TimeGenerated desc")
+}
+
 /// KQL templates per resource type. Lane 2 appends the errors-only filter when requested.
 ///
 /// `isfuzzy=true` makes Log Analytics skip tables that don't exist in the
@@ -127,6 +190,10 @@ pub const PAGE_SIZE: u32 = 500;
 pub struct LogsPage {
     pub lines: Vec<LogLine>,
     pub has_more: bool,
+    /// Container-App only, first page only: the ARM id of the workspace the logs
+    /// were read from, so the UI can scope `o`'s portal Logs deep-link to it.
+    /// `None` for Function Apps (resource-scoped) and on pagination.
+    pub workspace_arm_id: Option<String>,
 }
 
 pub async fn fetch(
@@ -147,10 +214,24 @@ pub async fn fetch(
     let timespan = range.timespan();
 
     let client = LogsClient::new(auth.clone())?;
+    let mut workspace_arm_id: Option<String> = None;
     let resp = match resource.kind {
         ResourceKind::ContainerApp => {
             let customer_id =
                 crate::azure::container_app_workspace::resolve(auth, &resource.id).await?;
+            // First page only: also resolve the workspace's ARM id so the UI can
+            // deep-link `o` to the workspace-scoped portal Logs blade (the app
+            // resource scope has none of the console-log tables). Best-effort —
+            // a failure here must not break log viewing.
+            if older_than.is_none() {
+                workspace_arm_id = crate::azure::container_app_workspace::arm_id_from_customer_id(
+                    auth,
+                    &customer_id,
+                )
+                .await
+                .ok()
+                .flatten();
+            }
             client
                 .query_workspace(&customer_id, &kql, &timespan)
                 .await?
@@ -160,7 +241,11 @@ pub async fn fetch(
 
     let lines = parse_logs_response(&resp, resource.kind)?;
     let has_more = lines.len() as u32 >= PAGE_SIZE;
-    Ok(LogsPage { lines, has_more })
+    Ok(LogsPage {
+        lines,
+        has_more,
+        workspace_arm_id,
+    })
 }
 
 /// Splice the errors-only filter (and an `older_than` cursor for pagination)
@@ -511,6 +596,59 @@ mod tests {
             modified_at: None,
             meta: Default::default(),
         }
+    }
+
+    fn fa_line(source: &str) -> LogLine {
+        LogLine {
+            ts: Utc::now(),
+            level: LogLevel::Info,
+            source: source.to_string(),
+            message: "m".into(),
+            fields: vec![],
+        }
+    }
+
+    #[test]
+    fn portal_query_function_app_unions_only_observed_tables() {
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        // Only FunctionAppLogs rows present (the diagnostic-settings-only case
+        // from the bug report) → single-table query, no fuzzy union to warn on.
+        let lines = vec![
+            fa_line("FunctionAppLogs/http_app_func"),
+            fa_line("FunctionAppLogs"),
+        ];
+        let q = portal_query(&r, &lines).expect("function apps have a portal query");
+        assert_eq!(q, "FunctionAppLogs\n| order by TimeGenerated desc");
+
+        // Mixed App Insights + diagnostic tables → union of exactly those, in
+        // preference order, no missing operands.
+        let lines = vec![fa_line("AppExceptions"), fa_line("FunctionAppLogs")];
+        let q = portal_query(&r, &lines).unwrap();
+        assert_eq!(
+            q,
+            "union isfuzzy=true FunctionAppLogs, AppExceptions\n| order by TimeGenerated desc"
+        );
+    }
+
+    #[test]
+    fn portal_query_function_app_falls_back_to_function_app_logs() {
+        let r = test_resource(ResourceKind::FunctionApp, "func");
+        let q = portal_query(&r, &[]).unwrap();
+        assert_eq!(q, "FunctionAppLogs\n| order by TimeGenerated desc");
+    }
+
+    #[test]
+    fn portal_query_container_app_scopes_by_name() {
+        let r = test_resource(ResourceKind::ContainerApp, "my-app");
+        let q = portal_query(&r, &[]).expect("container apps have a portal query");
+        assert!(q.contains("ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs"));
+        assert!(q.contains(r#"== "my-app""#));
+        assert!(!q.contains("take"));
+    }
+
+    #[test]
+    fn portal_query_none_for_unsupported_kinds() {
+        assert!(portal_query(&test_resource(ResourceKind::Apim, "svc"), &[]).is_none());
     }
 
     #[test]

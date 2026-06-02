@@ -39,6 +39,49 @@ pub async fn resolve(auth: &AzureAuth, container_app_id: &str) -> anyhow::Result
     extract_customer_id(&env)
 }
 
+/// Map a Log Analytics workspace `customerId` (the GUID exposed on the env's
+/// `logAnalyticsConfiguration`) to its **ARM resource id** via Resource Graph.
+///
+/// Needed because portal log deep-links scope by ARM id, but Container Apps only
+/// surface the workspace's `customerId`. The GUID is unique across the tenant,
+/// so the query isn't subscription-scoped. Best-effort: `Ok(None)` when no
+/// workspace with that customerId is visible to the caller (a failed lookup
+/// shouldn't break log viewing, which uses the customerId directly).
+pub async fn arm_id_from_customer_id(
+    auth: &AzureAuth,
+    customer_id: &str,
+) -> anyhow::Result<Option<String>> {
+    // customerId is an Azure-issued GUID; strip quotes defensively so it can't
+    // break out of the KQL string literal.
+    let cid = customer_id.to_lowercase().replace('\'', "");
+    let kql = format!(
+        "resources \
+         | where type =~ 'microsoft.operationalinsights/workspaces' \
+         | where tolower(tostring(properties.customerId)) == '{cid}' \
+         | project id | limit 1"
+    );
+    let client = ArmClient::new(auth.clone())?;
+    let resp = client
+        .post(
+            "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01",
+            &serde_json::json!({ "query": kql }),
+        )
+        .await
+        .with_context(|| "resolving workspace ARM id from customerId")?;
+    Ok(workspace_id_from_graph(&resp))
+}
+
+/// First `data[].id` from a Resource Graph response, if any.
+fn workspace_id_from_graph(resp: &serde_json::Value) -> Option<String> {
+    resp.get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Pull `customerId` out of an env response, surfacing the empty-destination
 /// case as `NoLogDestination` so the UI shows the friendly hint instead of a
 /// generic ARM error.
@@ -100,6 +143,25 @@ mod tests {
             .downcast_ref::<AzpectError>()
             .map(|e| matches!(e, AzpectError::NoLogDestination))
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn workspace_id_from_graph_takes_first_row_id() {
+        let resp = json!({
+            "data": [
+                { "id": "/subscriptions/s/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law-1" }
+            ]
+        });
+        assert_eq!(
+            workspace_id_from_graph(&resp).as_deref(),
+            Some("/subscriptions/s/resourceGroups/rg/providers/Microsoft.OperationalInsights/workspaces/law-1")
+        );
+    }
+
+    #[test]
+    fn workspace_id_from_graph_none_when_empty() {
+        assert!(workspace_id_from_graph(&json!({ "data": [] })).is_none());
+        assert!(workspace_id_from_graph(&json!({})).is_none());
     }
 
     #[test]
