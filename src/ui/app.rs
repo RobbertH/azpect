@@ -995,6 +995,23 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::KeyVaultSecretValueLoaded {
+                vault_id,
+                name,
+                result,
+            } => {
+                // Only apply if the modal is still open for this exact secret;
+                // otherwise the user closed it or reopened on another row and a
+                // stale value must not leak into the wrong modal.
+                if let Some(modal) = state.key_vault.secret_modal.as_mut() {
+                    if modal.vault_id == vault_id && modal.name == name {
+                        modal.status = match result {
+                            Ok(value) => crate::ui::state::SecretRevealStatus::Loaded(value),
+                            Err(e) => crate::ui::state::SecretRevealStatus::Error(e),
+                        };
+                    }
+                }
+            }
             AppEvent::ServiceBusNamespacesLoaded(res) => {
                 state.service_bus.namespaces_pending = false;
                 match res {
@@ -1725,6 +1742,17 @@ fn global_handle(
         kick_off_loads_for_view(state, auth, tx, /* force */ true);
         return;
     }
+    // Enter / `x` on a Key Vault secret row opens the reveal modal and fetches
+    // the value on demand. Routed here (not the view handler) because spawning
+    // the fetch needs `auth`/`tx`. Only reached when no modal is already open —
+    // the view handler owns the open modal's scroll / yank / close.
+    if matches!(action, Action::OpenSelected | Action::DecodeSecret)
+        && state.view == View::KeyVaultItems
+        && state.key_vault.secret_modal.is_none()
+    {
+        open_key_vault_secret_modal(state, auth, tx);
+        return;
+    }
     if let Action::StartCommand = action {
         state.command_active = true;
         state.command_input.reset();
@@ -1737,6 +1765,41 @@ fn global_handle(
         do_open_in_browser(state);
     }
     // Otherwise: unhandled — view ignored it, nothing to do.
+}
+
+/// Open the secret-value reveal modal for the selected secret row and kick off
+/// the on-demand value fetch. No-op (with a status hint) for certificates —
+/// they have no plaintext value — and when nothing is selected.
+fn open_key_vault_secret_modal(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::azure::key_vault::ItemKind;
+    use crate::ui::state::{SecretModal, SecretRevealStatus};
+
+    if state.key_vault.items_kind != ItemKind::Secret {
+        state.set_status("only secrets have a value to reveal (certificates don't)");
+        return;
+    }
+    let Some(vault) = state.key_vault.selected_vault.clone() else {
+        return;
+    };
+    let Some(name) = state
+        .key_vault
+        .filtered_items(&vault.id)
+        .get(state.key_vault.items_cursor)
+        .map(|i| i.name.clone())
+    else {
+        return;
+    };
+    state.key_vault.secret_modal = Some(SecretModal {
+        vault_id: vault.id.clone(),
+        name: name.clone(),
+        status: SecretRevealStatus::Loading,
+        scroll: 0,
+    });
+    spawn_load_key_vault_secret_value(auth.clone(), vault, name, tx.clone());
 }
 
 /// Compute the contextual yank target for the current view, copy it to the
@@ -3007,6 +3070,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
     if state.view == View::Detail && state.detail_view.modal.is_some() {
         crate::ui::views::detail::render_modal(f, view_area, state, theme);
     }
+    // Key Vault secret-reveal modal — same stacking rationale as Detail's.
+    if state.view == View::KeyVaultItems && state.key_vault.secret_modal.is_some() {
+        crate::ui::views::key_vault_items::render_modal(f, view_area, state, theme);
+    }
     // Quit-confirmation modal overlays the underlying view AND must beat the
     // command bar to the screen — render it before the command bar. (In
     // practice both flags can't be true at once given input gating.)
@@ -4023,6 +4090,27 @@ fn spawn_load_key_vault_items(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::KeyVaultItemsLoaded { key, result });
+    });
+}
+
+/// Fetch one secret's plaintext value for the reveal modal. Carries the
+/// `(vault_id, name)` back so the handler can ignore the result if the modal
+/// has since closed or moved to another secret.
+fn spawn_load_key_vault_secret_value(
+    auth: AzureAuth,
+    vault: crate::azure::key_vault::KeyVault,
+    name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = crate::azure::key_vault::get_secret_value(&auth, &vault, &name)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::KeyVaultSecretValueLoaded {
+            vault_id: vault.id,
+            name,
+            result,
+        });
     });
 }
 

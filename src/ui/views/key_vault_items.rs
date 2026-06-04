@@ -1,27 +1,31 @@
-//! Key Vault items drill-in: metadata-only listing of secrets *or*
-//! certificates in the pinned vault. Tab / Shift-Tab toggles between kinds.
+//! Key Vault items drill-in: listing of secrets *or* certificates in the
+//! pinned vault. Tab / Shift-Tab toggles between kinds.
 //!
-//! **No secret values are ever fetched.** The list API only returns
+//! **The listing itself is metadata-only.** The list API returns only
 //! attributes (enabled flag, expiry, created/updated timestamps, content
-//! type). For the rare case where a user actually needs a value, the global
-//! `o` keybind opens the Azure portal page for the vault.
+//! type) — no secret material is fetched while browsing. A value is pulled
+//! exactly once, on demand, when the user explicitly reveals a *single* secret
+//! with `Enter` / `x` (see [`render_modal`] and
+//! [`crate::azure::key_vault::get_secret_value`]); the plaintext lives only in
+//! the modal payload for its lifetime and never enters the list cache.
+//! Certificates have no plaintext value, so reveal is secrets-only.
 
 #![allow(dead_code, unused_variables)]
 
 use chrono::{DateTime, Duration, Utc};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::azure::key_vault::{ItemKind, KeyVaultItem};
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, KeyVaultCache};
+use crate::ui::state::{AppState, KeyVaultCache, SecretRevealStatus};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
+    "j/k move  Enter/x reveal  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 /// Items expiring within this window are flagged red. Matches typical secret
@@ -105,10 +109,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = state.key_vault.items_error.get(&key) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` (not a single `Line`) so the pretty-printed JSON envelope in
+        // the error keeps its line breaks; `wrap` then folds any long line.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -281,6 +288,36 @@ pub fn yank_text(state: &AppState) -> Option<String> {
 }
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // While the reveal modal is open it owns the foreground: scroll, yank the
+    // value, and close. Everything else is swallowed so the list underneath
+    // stays put. Opening + fetching is handled in `app::global_handle`, which
+    // has the auth/tx needed to spawn the data-plane fetch.
+    if state.key_vault.secret_modal.is_some() {
+        match action {
+            Action::Back | Action::OpenSelected | Action::DecodeSecret => {
+                state.key_vault.secret_modal = None;
+            }
+            Action::MoveDown => bump_modal_scroll(state, 1),
+            Action::MoveUp => bump_modal_scroll(state, -1),
+            Action::HalfPageDown => bump_modal_scroll(state, HALF_PAGE as i32),
+            Action::HalfPageUp => bump_modal_scroll(state, -(HALF_PAGE as i32)),
+            Action::GotoTop => {
+                if let Some(m) = state.key_vault.secret_modal.as_mut() {
+                    m.scroll = 0;
+                }
+            }
+            Action::GotoBottom => {
+                if let Some(m) = state.key_vault.secret_modal.as_mut() {
+                    // Clamped by the renderer against the wrapped line count.
+                    m.scroll = u16::MAX;
+                }
+            }
+            Action::Yank => yank_secret_value(state),
+            _ => {}
+        }
+        return true;
+    }
+
     let Some(vault_id) = state
         .key_vault
         .selected_vault
@@ -359,6 +396,154 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
 }
 
+/// Nudge the open modal's vertical scroll by `delta` rows, saturating at the
+/// ends. The renderer clamps the upper bound against the wrapped line count.
+fn bump_modal_scroll(state: &mut AppState, delta: i32) {
+    if let Some(m) = state.key_vault.secret_modal.as_mut() {
+        m.scroll = if delta >= 0 {
+            m.scroll.saturating_add(delta as u16)
+        } else {
+            m.scroll.saturating_sub((-delta) as u16)
+        };
+    }
+}
+
+/// Copy the revealed secret value to the clipboard. No-op (with a hint) until
+/// the value has actually loaded — the whole point of the modal is to make
+/// this copy a single keystroke.
+fn yank_secret_value(state: &mut AppState) {
+    let value = state
+        .key_vault
+        .secret_modal
+        .as_ref()
+        .and_then(|m| match &m.status {
+            SecretRevealStatus::Loaded(v) => Some(v.clone()),
+            _ => None,
+        });
+    let Some(value) = value else {
+        state.set_status("secret value not loaded yet");
+        return;
+    };
+    match crate::ui::clipboard::copy(&value) {
+        Ok(n) => state.set_status(format!("copied {n} bytes to clipboard")),
+        Err(e) => state.set_status(format!("clipboard write failed: {e}")),
+    }
+}
+
+/// Render the secret-value reveal modal over the items view. Mirrors the
+/// Detail view's Enter modal: centered, ~2/3 screen, with a help hint pinned
+/// to the bottom row. Dispatched from `app::dispatch_view` so it stacks above
+/// the list but below the global quit / auth overlays.
+pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use ratatui::layout::Alignment;
+
+    let Some(modal) = state.key_vault.secret_modal.as_ref() else {
+        return;
+    };
+
+    let target_w = ((area.width as u32 * 2 / 3) as u16).max(40).min(area.width);
+    let target_h = ((area.height as u32 * 2 / 3) as u16)
+        .max(8)
+        .min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(target_w) / 2,
+        y: area.y + area.height.saturating_sub(target_h) / 2,
+        width: target_w,
+        height: target_h,
+    };
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            format!(" secret · {} ", modal.name),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Reserve the bottom row for the hint so it stays visible while scrolling.
+    let body_height = inner.height.saturating_sub(1);
+    let body_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: body_height,
+    };
+    let hint_area = Rect {
+        x: inner.x,
+        y: inner.y + body_height,
+        width: inner.width,
+        height: 1,
+    };
+
+    let (body, hint): (Paragraph, &str) = match &modal.status {
+        SecretRevealStatus::Loading => (
+            Paragraph::new(Line::from(Span::styled(
+                "fetching value …",
+                Style::default().fg(theme.muted),
+            ))),
+            "Esc close",
+        ),
+        SecretRevealStatus::Error(e) => (
+            Paragraph::new(Text::styled(
+                format!("error: {e}"),
+                Style::default().fg(theme.critical),
+            ))
+            .wrap(Wrap { trim: false }),
+            "Esc close",
+        ),
+        SecretRevealStatus::Loaded(value) => {
+            // Estimate the wrapped line count so GotoBottom / over-scroll can't
+            // drag the body into blank space below the value.
+            let max_scroll = wrapped_line_estimate(value, body_area.width).saturating_sub(1);
+            let scroll = modal.scroll.min(max_scroll);
+            (
+                Paragraph::new(Text::styled(value.clone(), Style::default().fg(theme.fg)))
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                "y yank · j/k scroll · Esc close",
+            )
+        }
+    };
+    frame.render_widget(body, body_area);
+
+    let hint_p = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(theme.muted),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(hint_p, hint_area);
+}
+
+/// Rough count of rows a value occupies once wrapped to `width` — the sum over
+/// hard newlines of each line's `ceil(len / width)`. Used only to clamp scroll,
+/// so an approximation (char count, not display width) is fine.
+fn wrapped_line_estimate(value: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 1;
+    }
+    let w = width as usize;
+    value
+        .split('\n')
+        .map(|l| {
+            let chars = l.chars().count();
+            ((chars / w) + 1) as u16
+        })
+        .sum::<u16>()
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +611,148 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("api-key"), "name should render");
         assert!(buf.contains("2030-01-01"), "expiry date should render");
+    }
+
+    #[test]
+    fn long_access_denied_error_wraps_instead_of_clipping() {
+        let theme = Theme::catppuccin_mocha();
+        // Narrow buffer so a long message must wrap to be fully visible.
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let key = KeyVaultCache::items_key(
+            "/subs/x/rg/y/providers/Microsoft.KeyVault/vaults/v",
+            ItemKind::Secret,
+        );
+        state.key_vault.items_error.insert(
+            key,
+            "403 from Key Vault data plane on 'imec-kv-rnd3-dev-001': identity \
+             lacks `list` permission. If the vault uses RBAC, assign the Key \
+             Vault Secrets User role."
+                .into(),
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+
+        // Reconstruct the on-screen text row by row, joining rows with a space.
+        // A clipped (unwrapped) line would lose everything past the right edge,
+        // so the tail words only survive when the paragraph wraps.
+        let buffer = term.backend().buffer().clone();
+        let area = *buffer.area();
+        let mut screen = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push(' ');
+        }
+
+        assert!(screen.contains("error: 403"), "error prefix should render");
+        assert!(
+            screen.contains("Secrets User"),
+            "tail of long message must wrap into view, not clip"
+        );
+        assert!(
+            screen.contains("role."),
+            "final word of message must be visible after wrapping"
+        );
+    }
+
+    fn open_modal(name: &str, status: SecretRevealStatus) -> crate::ui::state::SecretModal {
+        crate::ui::state::SecretModal {
+            vault_id: "/subs/x/rg/y/providers/Microsoft.KeyVault/vaults/v".into(),
+            name: name.into(),
+            status,
+            scroll: 0,
+        }
+    }
+
+    #[test]
+    fn reveal_modal_renders_loading_then_value() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(80, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+
+        state.key_vault.secret_modal = Some(open_modal("api-key", SecretRevealStatus::Loading));
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("api-key"), "modal title should show secret name");
+        assert!(s.contains("fetching"), "loading state should render");
+
+        if let Some(m) = state.key_vault.secret_modal.as_mut() {
+            m.status = SecretRevealStatus::Loaded("hunter2-Value".into());
+        }
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("hunter2-Value"), "revealed value should render");
+    }
+
+    #[test]
+    fn reveal_modal_renders_error_wrapped() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(60, 14);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.key_vault.secret_modal = Some(open_modal(
+            "api-key",
+            SecretRevealStatus::Error(
+                "403 from Key Vault data plane on 'v': identity lacks `get` \
+                 permission on this secret."
+                    .into(),
+            ),
+        ));
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("error"), "error label should render");
+    }
+
+    #[test]
+    fn modal_open_swallows_nav_and_closes_on_esc() {
+        let mut state = fixture();
+        let key = KeyVaultCache::items_key(
+            "/subs/x/rg/y/providers/Microsoft.KeyVault/vaults/v",
+            ItemKind::Secret,
+        );
+        state
+            .key_vault
+            .items
+            .insert(key, vec![secret("a", None), secret("b", None)]);
+        state.key_vault.items_cursor = 0;
+        state.key_vault.secret_modal =
+            Some(open_modal("a", SecretRevealStatus::Loaded("x".repeat(500))));
+
+        // j scrolls the modal, not the list.
+        assert!(handle(Action::MoveDown, &mut state));
+        assert_eq!(state.key_vault.secret_modal.as_ref().unwrap().scroll, 1);
+        assert_eq!(
+            state.key_vault.items_cursor, 0,
+            "list cursor must not move while the modal owns the foreground"
+        );
+
+        // Esc closes the modal (and does not navigate away).
+        assert!(handle(Action::Back, &mut state));
+        assert!(state.key_vault.secret_modal.is_none());
+    }
+
+    #[test]
+    fn modal_x_and_enter_toggle_closed() {
+        let mut state = fixture();
+        state.key_vault.secret_modal = Some(open_modal("a", SecretRevealStatus::Loading));
+        assert!(handle(Action::DecodeSecret, &mut state));
+        assert!(
+            state.key_vault.secret_modal.is_none(),
+            "x closes an open modal"
+        );
+
+        state.key_vault.secret_modal = Some(open_modal("a", SecretRevealStatus::Loading));
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(
+            state.key_vault.secret_modal.is_none(),
+            "Enter closes an open modal"
+        );
     }
 
     #[test]

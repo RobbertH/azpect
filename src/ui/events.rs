@@ -217,6 +217,15 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::key_vault::KeyVaultItem>, String>,
     },
+    /// Background load completion: the decoded plaintext value of a single
+    /// secret, fetched on an explicit user reveal (`x` / Enter). Carries
+    /// `(vault_id, name)` so a stale result can't populate a modal the user
+    /// has since closed or reopened on a different secret. Data-plane call.
+    KeyVaultSecretValueLoaded {
+        vault_id: String,
+        name: String,
+        result: Result<String, String>,
+    },
     /// Background load completion: list of Service Bus namespaces for the
     /// current subscription scope. Resource Graph control-plane call.
     ServiceBusNamespacesLoaded(Result<Vec<crate::azure::service_bus::ServiceBusNamespace>, String>),

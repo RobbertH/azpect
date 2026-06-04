@@ -2,7 +2,7 @@
 //!
 //! ## Contract (do not change without coordinating with the UI lane)
 //!
-//! Two public functions form the surface the UI consumes:
+//! Three public functions form the surface the UI consumes:
 //!
 //! - [`list_vaults`] — Resource Graph KQL discovery of Key Vaults across the
 //!   supplied subscriptions. Control plane only (`Reader` is sufficient).
@@ -10,13 +10,20 @@
 //!   inside one vault, following `nextLink` until exhausted. Returns
 //!   **metadata only** (`enabled`, expiry, created/updated timestamps,
 //!   content type, tags) — never the secret value, never the cert body.
+//! - [`get_secret_value`] — Data-plane fetch of a *single* secret's plaintext,
+//!   called only on an explicit user reveal (`Enter` / `x`). Needs `get` on
+//!   the secret (RBAC `Key Vault Secrets User`, or a `get` access policy).
 //!
 //! ## Scope decisions worth flagging
 //!
-//! - **Metadata only, no values.** Listing returns `attributes` but never the
-//!   secret bytes; the UI deliberately does not expose a "reveal value"
-//!   keybind. The portal-open keybind (`o`) is the escape hatch for the rare
-//!   case where a user actually needs a value.
+//! - **Listing is metadata only.** `list_items` returns `attributes` but never
+//!   the secret bytes, so browsing a vault fetches no secret material. A value
+//!   is pulled exactly once, on demand, when the user explicitly reveals a
+//!   single secret via [`get_secret_value`]; the plaintext lives only in the
+//!   reveal modal's payload and never enters the list cache. Certificates have
+//!   no plaintext value, so reveal is secrets-only. The portal-open keybind
+//!   (`o`) remains the escape hatch for anything the in-app reveal doesn't
+//!   cover.
 //! - **Secrets + certs only in v1**; keys are deferred. The data-plane URL
 //!   surface is identical (`/keys` would slot in trivially) but keys add
 //!   HSM-vs-software questions the UI doesn't need yet.
@@ -245,9 +252,9 @@ pub async fn list_items(
                 &vault.name,
                 &host,
                 anyhow!(
-                    "key vault data-plane returned {}: {}",
+                    "key vault data-plane returned {}:\n{}",
                     status.as_u16(),
-                    truncate_error_body(&body)
+                    format_error_body(&body)
                 ),
             ));
         }
@@ -279,6 +286,67 @@ pub async fn list_items(
     Ok(out)
 }
 
+/// Fetch the plaintext **value** of a single secret via the data plane.
+///
+/// Unlike [`list_items`] — which is metadata-only by design — this returns the
+/// secret material, so it is only ever called on an explicit user reveal
+/// (`x` / Enter in the items view), never during listing. Requires the
+/// signed-in identity to have `get` on the secret (RBAC `Key Vault Secrets
+/// User`, or a `get` access policy). Secrets-only: certificates have no
+/// plaintext value to decode.
+pub async fn get_secret_value(
+    auth: &AzureAuth,
+    vault: &KeyVault,
+    name: &str,
+) -> anyhow::Result<String> {
+    let host_uri = vault.vault_uri_or_default();
+    let host = vault_host(&host_uri).unwrap_or_else(|| vault.name.clone());
+    let bearer = auth
+        .token(SCOPE_KEY_VAULT)
+        .await
+        .context("acquire Key Vault data-plane token")?;
+    let http = build_http()?;
+
+    // Version-less GET resolves to the secret's current version. Secret names
+    // are restricted by Azure to `[0-9a-zA-Z-]`, so no percent-encoding needed.
+    let trimmed = host_uri.trim_end_matches('/');
+    let url = format!("{trimmed}/secrets/{name}?api-version={KV_API_VERSION}");
+
+    let auth_value = HeaderValue::from_str(&format!("Bearer {bearer}"))
+        .map_err(|_| anyhow!("Key Vault bearer contained invalid header characters"))?;
+    let resp = http
+        .get(&url)
+        .header(AUTHORIZATION, auth_value)
+        .send()
+        .await
+        .map_err(|e| anyhow!("key vault data-plane network error: {e}"))
+        .map_err(|e| classify_data_plane_error(&vault.name, &host, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(classify_data_plane_error(
+            &vault.name,
+            &host,
+            anyhow!(
+                "key vault data-plane returned {}:\n{}",
+                status.as_u16(),
+                format_error_body(&body)
+            ),
+        ));
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| anyhow!("read key vault secret body: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow!("parse key vault secret response: {e}"))?;
+    parsed
+        .get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("key vault secret response had no `value` field"))
+}
+
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
@@ -288,6 +356,19 @@ fn build_http() -> anyhow::Result<reqwest::Client> {
         .user_agent(concat!("azpect/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| anyhow!("failed to build reqwest client: {e}"))
+}
+
+/// Render an error response body for display. Key Vault returns its standard
+/// `{"error":{"code":…,"message":…,"innererror":…}}` envelope as JSON; pretty-
+/// print it so the (wrapped) error reads as indented structure rather than one
+/// dense blob. Bodies that aren't JSON — some proxy/401 cases — pass through
+/// unchanged. Either way the result is length-capped by [`truncate_error_body`].
+fn format_error_body(s: &str) -> String {
+    let pretty = serde_json::from_str::<serde_json::Value>(s.trim())
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| s.to_string());
+    truncate_error_body(&pretty)
 }
 
 fn truncate_error_body(s: &str) -> String {
@@ -486,7 +567,7 @@ fn classify_data_plane_error(vault_name: &str, host: &str, e: anyhow::Error) -> 
     if lower.contains(" 401 ") || lower.contains("returned 401") || lower.contains("unauthorized") {
         return anyhow!(
             "401 from Key Vault data plane: identity rejected by '{vault_name}'. \
-             Sign in with `az login` to refresh the AAD token. underlying: {msg}"
+             Sign in with `az login` to refresh the AAD token.\nunderlying: {msg}"
         );
     }
     if lower.contains(" 403 ") || lower.contains("returned 403") || lower.contains("forbidden") {
@@ -496,7 +577,7 @@ fn classify_data_plane_error(vault_name: &str, host: &str, e: anyhow::Error) -> 
              assign `Key Vault Reader` (or `Key Vault Secrets User` for \
              secrets / `Key Vault Certificate User` for certs). If the vault \
              still uses access policies, grant `list` on the relevant object \
-             types. Control-plane `Reader` is not enough. underlying: {msg}"
+             types. Control-plane `Reader` is not enough.\nunderlying: {msg}"
         );
     }
     if lower.contains("dns")
@@ -506,7 +587,7 @@ fn classify_data_plane_error(vault_name: &str, host: &str, e: anyhow::Error) -> 
     {
         return anyhow!(
             "DNS lookup failed for '{host}' — does vault '{vault_name}' exist \
-             (or is it firewalled to a private endpoint)? underlying: {msg}"
+             (or is it firewalled to a private endpoint)?\nunderlying: {msg}"
         );
     }
     e
@@ -520,6 +601,47 @@ fn classify_data_plane_error(vault_name: &str, host: &str, e: anyhow::Error) -> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn format_error_body_pretty_prints_json_envelope() {
+        let raw = r#"{"error":{"code":"Forbidden","message":"no list permission","innererror":{"code":"AccessDenied"}}}"#;
+        let out = format_error_body(raw);
+        // Pretty-printing introduces newlines and indentation; the original is
+        // a single line.
+        assert!(out.contains('\n'), "expected multi-line output, got: {out}");
+        assert!(out.contains("\"code\": \"Forbidden\""));
+        assert!(out.contains("\"code\": \"AccessDenied\""));
+    }
+
+    #[test]
+    fn classify_breaks_underlying_and_json_onto_their_own_lines() {
+        // Mirror the real call path: the body fetch builds
+        // "…returned 403:\n{pretty json}" and classify prepends guidance plus
+        // "\nunderlying: ".
+        let body = r#"{"error":{"code":"Forbidden","message":"no list permission"}}"#;
+        let inner = anyhow!(
+            "key vault data-plane returned 403:\n{}",
+            format_error_body(body)
+        );
+        let msg = format!(
+            "{}",
+            classify_data_plane_error("v", "v.vault.azure.net", inner)
+        );
+        assert!(
+            msg.contains("not enough.\nunderlying:"),
+            "guidance and `underlying:` must be on separate lines:\n{msg}"
+        );
+        assert!(
+            msg.contains("returned 403:\n{"),
+            "the JSON body must start on its own line:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn format_error_body_passes_through_non_json() {
+        let raw = "502 Bad Gateway (html proxy page)";
+        assert_eq!(format_error_body(raw), raw);
+    }
 
     #[test]
     fn parses_vault_row() {

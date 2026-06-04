@@ -924,6 +924,38 @@ pub struct KeyVaultCache {
     pub items_cursor: usize,
     pub items_filter: Input,
     pub items_filter_active: bool,
+
+    /// `Some(_)` while a secret-value reveal modal is open (Enter / `x` on a
+    /// secret row). Holds the async fetch lifecycle so the modal can show a
+    /// spinner, the decoded value, or an error — and so the plaintext never
+    /// touches the list cache. Cleared on Esc / close.
+    pub secret_modal: Option<SecretModal>,
+}
+
+/// Payload for the secret-value reveal modal. The value is fetched on demand
+/// (see [`crate::azure::key_vault::get_secret_value`]) and lives only here, for
+/// the modal's lifetime — closing the modal drops it.
+#[derive(Clone)]
+pub struct SecretModal {
+    /// Vault the secret belongs to — matched against the async result so a
+    /// stale fetch can't populate a modal the user reopened on another secret.
+    pub vault_id: String,
+    /// Secret name (also the modal title).
+    pub name: String,
+    pub status: SecretRevealStatus,
+    /// Vertical scroll offset inside the modal body (long values wrap).
+    pub scroll: u16,
+}
+
+/// Lifecycle of a secret-value reveal.
+#[derive(Clone)]
+pub enum SecretRevealStatus {
+    /// Fetch in flight.
+    Loading,
+    /// Decoded plaintext value.
+    Loaded(String),
+    /// Fetch failed (e.g. the identity has `list` but not `get`).
+    Error(String),
 }
 
 impl KeyVaultCache {

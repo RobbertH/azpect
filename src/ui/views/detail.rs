@@ -49,10 +49,10 @@ fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
     let enter_clue = match kind {
         ResourceKind::Apim => "Enter apis",
         ResourceKind::AppGateway => "Enter backends",
-        // Enter on a meta row pops the row-details modal (see `render_modal`).
-        // The j/k navigation is implicit in the highlighted row so worth
-        // surfacing here too.
-        ResourceKind::FunctionApp | ResourceKind::ContainerApp => "j/k row  Enter details",
+        // Enter on a section pops its details modal (see `render_modal`),
+        // expanding any inline `+N more`. j/k moves between sections, so it's
+        // worth surfacing here too.
+        ResourceKind::FunctionApp | ResourceKind::ContainerApp => "j/k section  Enter details",
     };
     format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
 }
@@ -198,9 +198,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let (replica_lines, replica_is_skeleton) = if replicas_loading_skeleton {
         (
             vec![(
-                "replica:".to_string(),
+                "instances:".to_string(),
                 "loading\u{2026}".to_string(),
-                "replica: loading\u{2026}".to_string(),
+                "instances: loading\u{2026}".to_string(),
             )],
             true,
         )
@@ -322,17 +322,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ));
 
     let mut context_lines: Vec<Line> = vec![Line::from(header_spans), second_line];
-    // Track line indices that correspond to selectable rows so the cursor's
-    // row can be highlighted by patching its spans with `theme.selection()`
-    // after all rows have been pushed. The order here MUST match the order
-    // [`selectable_metas`] emits — same conditions, same data sources.
-    let mut selectable_line_idx: Vec<usize> = Vec::new();
-    // State row is selectable when there's no metrics-error overlay.
+    // Selectable rows are grouped into *sections*: a labelled head row plus any
+    // blank-label continuation rows that follow it (that's how the multi-line
+    // triggers / replicas / containers blocks are emitted). `j`/`k` move between
+    // sections — not individual lines — and the whole section highlights as one.
+    // Each entry holds the context-line indices its section spans. The order and
+    // grouping here MUST match [`selectable_metas`] — same conditions, same data
+    // sources, same blank-label rule.
+    let mut selectable_sections: Vec<Vec<usize>> = Vec::new();
+    // State row is its own section when there's no metrics-error overlay.
     if failure.is_none() {
-        selectable_line_idx.push(1);
+        selectable_sections.push(vec![1]);
     }
     for (label, value, _) in meta_lines {
         let line_idx = context_lines.len();
+        let is_head = !is_continuation_label(&label);
         let line = if meta_is_skeleton {
             styled_skeleton_line(label, value, theme)
         } else {
@@ -340,11 +344,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         };
         context_lines.push(line);
         if !meta_is_skeleton {
-            selectable_line_idx.push(line_idx);
+            add_selectable_line(&mut selectable_sections, is_head, line_idx);
         }
     }
     for (label, value, _) in replica_lines {
         let line_idx = context_lines.len();
+        let is_head = !is_continuation_label(&label);
         let line = if replica_is_skeleton {
             styled_skeleton_line(label, value, theme)
         } else {
@@ -352,37 +357,41 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         };
         context_lines.push(line);
         if !replica_is_skeleton {
-            selectable_line_idx.push(line_idx);
+            add_selectable_line(&mut selectable_sections, is_head, line_idx);
         }
     }
     for (label, value, _) in trigger_lines {
         let line_idx = context_lines.len();
+        let is_head = !is_continuation_label(&label);
         context_lines.push(styled_meta_line(label, value, theme));
-        selectable_line_idx.push(line_idx);
+        add_selectable_line(&mut selectable_sections, is_head, line_idx);
     }
     for (line, _) in env_rows {
         let line_idx = context_lines.len();
         context_lines.push(line);
-        selectable_line_idx.push(line_idx);
+        // The env-vars teaser is always its own single-line section.
+        add_selectable_line(&mut selectable_sections, true, line_idx);
     }
     for (label, value, _) in general_lines {
         let line_idx = context_lines.len();
+        let is_head = !is_continuation_label(&label);
         context_lines.push(styled_meta_line(label, value, theme));
-        selectable_line_idx.push(line_idx);
+        add_selectable_line(&mut selectable_sections, is_head, line_idx);
     }
 
-    // Apply the cursor highlight. The cursor lives in `DetailView` and is an
-    // index into the *selectable* list, so we clamp here and patch spans on
-    // the corresponding rendered line. Clamping is read-only — the handler is
-    // responsible for keeping `state.detail_view.cursor` in range across data
-    // shape changes (new rows appearing, etc.).
-    if !selectable_line_idx.is_empty() {
-        let cursor = state.detail_view.cursor.min(selectable_line_idx.len() - 1);
-        if let Some(&idx) = selectable_line_idx.get(cursor) {
-            if let Some(line) = context_lines.get_mut(idx) {
-                let hl = theme.selection();
-                for span in line.spans.iter_mut() {
-                    span.style = span.style.patch(hl);
+    // Highlight every line of the section under the cursor. The cursor lives in
+    // `DetailView` and indexes the *section* list, so we clamp here and patch
+    // spans on each line the section spans. Clamping is read-only — the handler
+    // keeps `state.detail_view.cursor` in range across data shape changes.
+    if !selectable_sections.is_empty() {
+        let cursor = state.detail_view.cursor.min(selectable_sections.len() - 1);
+        if let Some(line_idxs) = selectable_sections.get(cursor) {
+            let hl = theme.selection();
+            for &idx in line_idxs {
+                if let Some(line) = context_lines.get_mut(idx) {
+                    for span in line.spans.iter_mut() {
+                        span.style = span.style.patch(hl);
+                    }
                 }
             }
         }
@@ -659,8 +668,8 @@ fn container_app_meta_lines(
             (0, 0) => format!("{}", m.replicas),
             (min, max) => format!("{} of {min}\u{2013}{max}", m.replicas),
         };
-        let plain = format!("replicas: {replicas_value}");
-        out.push(("replicas:".into(), replicas_value, plain));
+        let plain = format!("scale: {replicas_value}");
+        out.push(("scale:".into(), replicas_value, plain));
     }
 
     if let Some(l) = limits {
@@ -709,15 +718,17 @@ fn container_app_meta_lines(
     out
 }
 
-/// Emit one row per template container, sharing the `containers:` label on
-/// the first row and using a space-padded blank label on continuation rows so
-/// values stack in a consistent column. `name` is left-padded to the longest
-/// name in the set so `image` / `resources` align across rows.
+/// Emit one row per template container, sharing the `container config:` label
+/// on the first row and using a space-padded blank label on continuation rows
+/// so values stack in a consistent column. `name` is left-padded to the longest
+/// name in the set so `image` / `resources` align across rows. These are the
+/// *configured* containers of the active revision (the template) — distinct from
+/// the live `instances:` block, which reflects the running replicas.
 fn push_template_container_rows(
     out: &mut Vec<(String, String, String)>,
     containers: &[crate::azure::container_app_overview::ContainerSpec],
 ) {
-    const LABEL: &str = "containers:";
+    const LABEL: &str = "container config:";
     let max_name = containers
         .iter()
         .map(|c| c.name.chars().count())
@@ -761,8 +772,12 @@ fn replica_status_lines(
     pending: bool,
     failure: Option<&String>,
 ) -> Vec<(String, String, String)> {
-    const LABEL_SINGLE: &str = "replica:";
-    const LABEL_MULTI: &str = "replicas:";
+    // Labelled `instances:` (not `replicas:`) to keep the live running pods
+    // distinct from the configured `scale:` count — a scaled-out app would
+    // otherwise show two `replicas:` rows. Singular/plural share one label so
+    // the runtime block is always identifiable at a glance.
+    const LABEL_SINGLE: &str = "instances:";
+    const LABEL_MULTI: &str = "instances:";
     const CAP: usize = 10;
 
     // Cached data wins over a transient error so a stale-but-useful row
@@ -1221,8 +1236,8 @@ fn container_app_skeleton_meta_rows() -> Vec<(String, String, String)> {
     const FIELDS: &[&str] = &[
         "rev:",
         "image:",
-        "replicas:",
-        "containers:",
+        "scale:",
+        "container config:",
         "env vars:",
         "fqdn:",
     ];
@@ -1471,15 +1486,130 @@ fn state_color(state: &str, theme: &Theme) -> Color {
     }
 }
 
-/// Build the Detail view's selection list — one [`SelectableMeta`] per row the
-/// cursor can land on, in display order. Render uses the order to compute line
-/// highlights; the input handler uses the contents to wire `y` and Enter to
-/// the right payload. Stay in sync with [`render`]'s push order or the cursor
-/// will point at the wrong row.
+/// True when a meta row's label is a blank continuation (all whitespace, or
+/// empty) rather than a fresh section head. The multi-line blocks (triggers,
+/// replicas, containers) repeat a spaces-only label on every row after the
+/// first; [`group_sections`] and [`render`] both use this to fold such a block
+/// into a single navigable section.
+fn is_continuation_label(label: &str) -> bool {
+    label.trim().is_empty()
+}
+
+/// Append a rendered line to the section list: `is_head` starts a new section,
+/// otherwise the line extends the current one (a blank-label continuation row).
+/// The empty-list fallback treats a stray continuation as a head so a section
+/// always exists to land on.
+fn add_selectable_line(sections: &mut Vec<Vec<usize>>, is_head: bool, line_idx: usize) {
+    if is_head {
+        sections.push(vec![line_idx]);
+    } else if let Some(last) = sections.last_mut() {
+        last.push(line_idx);
+    } else {
+        sections.push(vec![line_idx]);
+    }
+}
+
+/// Fold a flat list of `(label, value, _)` meta rows into navigable sections:
+/// a non-blank label starts a section, blank-label rows extend the current one
+/// (see [`is_continuation_label`]). Each section becomes one [`SelectableMeta`]
+/// whose modal lists the whole block. `modal_override(title)` may replace a
+/// section's modal body (and yank) with fuller, uncapped content — used to
+/// expand the inline `+N more` preview into every trigger / replica.
+fn group_sections(
+    rows: &[(String, String, String)],
+    modal_override: impl Fn(&str) -> Option<Vec<String>>,
+) -> Vec<SelectableMeta> {
+    let mut out: Vec<SelectableMeta> = Vec::new();
+    for (label, value, _) in rows {
+        if is_continuation_label(label) {
+            if let Some(last) = out.last_mut() {
+                last.modal_lines.push(value.clone());
+                last.yank.push('\n');
+                last.yank.push_str(value);
+                continue;
+            }
+        }
+        out.push(SelectableMeta {
+            yank: value.clone(),
+            modal_title: label.trim_end_matches(':').trim().to_string(),
+            modal_lines: vec![value.clone()],
+            enter_action: None,
+        });
+    }
+    for m in out.iter_mut() {
+        if let Some(lines) = modal_override(&m.modal_title) {
+            m.yank = lines.join("\n");
+            m.modal_lines = lines;
+        }
+    }
+    out
+}
+
+/// Full, uncapped trigger list for the `triggers` section modal — one line per
+/// function, names column-aligned across the *whole* set. Unlike the inline
+/// [`function_trigger_lines`] preview (capped at [`TRIGGER_CAP`] with a `+N
+/// more` summary), this never truncates, so Enter reveals every function —
+/// including the ones hidden behind that summary.
+fn trigger_modal_lines(
+    list: &[crate::azure::function_app_triggers::FunctionTrigger],
+) -> Vec<String> {
+    let max_name = list
+        .iter()
+        .map(|t| t.function.chars().count())
+        .max()
+        .unwrap_or(0);
+    list.iter()
+        .map(|t| {
+            let name_col = format!("{:<width$}", t.function, width = max_name);
+            let kind = if t.kind.is_empty() {
+                "\u{2014}".to_string()
+            } else {
+                t.kind.clone()
+            };
+            match &t.detail {
+                Some(d) => format!("{name_col}  {kind}: {d}"),
+                None => format!("{name_col}  {kind}"),
+            }
+        })
+        .collect()
+}
+
+/// Full per-replica detail for the `replicas` section modal: every replica
+/// (newest first, uncapped), each rendered as a [`replica_modal_lines`] block
+/// separated by a blank line. The inline preview caps at 10 with a `+N more`
+/// row; Enter here shows all of them.
+fn replicas_modal_lines(
+    replicas: &[crate::azure::container_app_replicas::ReplicaInstance],
+) -> Vec<String> {
+    let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
+        replicas.iter().collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    // Lead with a one-line reminder that this block is runtime, not config — the
+    // `scale:` / `container config:` rows above describe the desired state.
+    let mut out: Vec<String> = vec![
+        "Live replica instances — the pods actually running now".to_string(),
+        "(vs. the configured scale / container config above).".to_string(),
+        String::new(),
+    ];
+    for (idx, r) in sorted.iter().enumerate() {
+        if idx > 0 {
+            out.push(String::new());
+        }
+        out.extend(replica_modal_lines(r));
+    }
+    out
+}
+
+/// Build the Detail view's selection list — one [`SelectableMeta`] per
+/// *section* (a labelled row plus its blank-label continuations), in display
+/// order. Render uses the order/grouping to highlight the cursor's section; the
+/// input handler uses the contents to wire `y` and Enter. Stay in sync with
+/// [`render`]'s push order and blank-label grouping or the cursor will point at
+/// the wrong section.
 fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta> {
     let mut out: Vec<SelectableMeta> = Vec::new();
 
-    // State row. Skipped when a metrics fetch error is overlaying the slot —
+    // State section. Skipped when a metrics fetch error is overlaying the slot —
     // the row in that case is a pure error string with nothing to drill into.
     let metrics_failure = state.metrics.failures.get(&resource.id);
     if metrics_failure.is_none() {
@@ -1492,100 +1622,62 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         });
     }
 
-    // Meta block. Container Apps draw rev/image/replicas/…; Function Apps draw
-    // their own image/runtime lines. The CA block is skipped while its cache is
-    // still loading (render shows non-selectable skeletons then); the FA block
-    // has no skeleton. Stay in sync with [`render`]'s `meta_lines` selection.
+    // Meta block. Container Apps draw rev/image/replicas/containers; Function
+    // Apps draw their own image/runtime lines. The CA block is skipped while its
+    // cache is still loading (render shows non-selectable skeletons then); the FA
+    // block has no skeleton. The multi-row CA `containers:` block folds into one
+    // section. Stay in sync with [`render`]'s `meta_lines` selection.
     let revision_meta = state.revision_meta.by_resource.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
     let is_ca = resource.kind == ResourceKind::ContainerApp;
     let is_fa = resource.kind == ResourceKind::FunctionApp;
     let is_apim = resource.kind == ResourceKind::Apim;
     let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
-    let meta_lines = if is_fa {
+    let meta_lines = if ca_meta_loading {
+        Vec::new()
+    } else if is_fa {
         function_app_meta_lines(state, resource)
     } else if is_apim {
         apim_meta_lines(resource)
-    } else if !ca_meta_loading {
-        container_app_meta_lines(revision_meta, limits)
     } else {
-        Vec::new()
+        container_app_meta_lines(revision_meta, limits)
     };
-    for (label, value, _) in meta_lines {
-        out.push(SelectableMeta {
-            yank: value.clone(),
-            modal_title: label.trim_end_matches(':').trim().to_string(),
-            modal_lines: vec![value],
-            enter_action: None,
-        });
-    }
+    out.extend(group_sections(&meta_lines, |_| None));
 
-    // Replica block. Same skeleton skip; otherwise one selectable per replica
-    // row. The modal body shows the full replica record (name, created, per-
-    // container status with restart counts) since the inline row trims hard.
+    // Replica block. Same skeleton skip. The whole block is one `replicas`
+    // section; Enter shows every replica's full record (name, created, per-
+    // container status with restart counts) — uncapped, expanding the inline
+    // `+N more`. The pending/failure hint stays a plain single-line section.
     let cached_replicas = state.replica_instances.by_resource.get(&resource.id);
     let replicas_loading_skeleton = is_ca && cached_replicas.is_none();
     if !replicas_loading_skeleton {
-        if let Some(replicas) = cached_replicas {
-            let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
-                replicas.iter().collect();
-            sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
-            let shown = sorted.len().min(10);
-            for r in sorted.iter().take(shown) {
-                out.push(SelectableMeta {
-                    yank: r.name.clone(),
-                    modal_title: format!("replica · {}", short_replica_name(&r.name)),
-                    modal_lines: replica_modal_lines(r),
-                    enter_action: None,
-                });
-            }
-            // The "+N more" overflow row isn't selectable — there's nothing to
-            // drill into. Match `replica_status_lines`'s cap of 10.
-        } else if state.replica_instances.failures.contains_key(&resource.id) {
-            // Failure hint row IS selectable so the user can `y` the error.
-            let msg = state
-                .replica_instances
-                .failures
-                .get(&resource.id)
-                .cloned()
-                .unwrap_or_default();
-            out.push(SelectableMeta {
-                yank: msg.clone(),
-                modal_title: "replicas error".to_string(),
-                modal_lines: vec![msg],
-                enter_action: None,
-            });
-        } else if state.replica_instances.pending.contains(&resource.id) {
-            // `replicas: loading…` placeholder row exists — make it selectable
-            // so the cursor still has somewhere to land in this slot.
-            out.push(SelectableMeta {
-                yank: String::new(),
-                modal_title: "replicas".to_string(),
-                modal_lines: vec!["loading\u{2026}".to_string()],
-                enter_action: None,
-            });
-        }
-        // (When there's just no replicas at all — empty array — no row is
-        // emitted at all, so no selectable here either.)
+        let replica_lines = replica_status_lines(
+            cached_replicas,
+            state.replica_instances.pending.contains(&resource.id),
+            state.replica_instances.failures.get(&resource.id),
+        );
+        out.extend(group_sections(&replica_lines, |_| {
+            cached_replicas
+                .filter(|list| !list.is_empty())
+                .map(|list| replicas_modal_lines(list))
+        }));
     }
 
-    // Function App triggers. FA-only; map each emitted trigger row 1:1 to a
-    // selectable (including the `+N more` row and any loading / failure hint) so
-    // the cursor index lines up with `render`'s push order.
+    // Function App triggers. FA-only, one `triggers` section. Enter expands the
+    // inline `+N more` into the full per-function list; a loading / failure hint
+    // stays a plain single-line section (no cache to expand).
     if is_fa {
         let trigger_lines = function_trigger_lines(
             state.func_triggers.by_resource.get(&resource.id),
             state.func_triggers.pending.contains(&resource.id),
             state.func_triggers.failures.get(&resource.id),
         );
-        for (label, value, _) in trigger_lines {
-            out.push(SelectableMeta {
-                yank: value.clone(),
-                modal_title: label.trim_end_matches(':').trim().to_string(),
-                modal_lines: vec![value],
-                enter_action: None,
-            });
-        }
+        let cached_triggers = state.func_triggers.by_resource.get(&resource.id);
+        out.extend(group_sections(&trigger_lines, |_| {
+            cached_triggers
+                .filter(|list| !list.is_empty())
+                .map(|list| trigger_modal_lines(list))
+        }));
     }
 
     // Env-vars teaser. Enter on this row jumps to the dedicated EnvVars page
@@ -1601,22 +1693,16 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         });
     }
 
-    // General lines (tags, created, modified). Modal body breaks them out so
-    // the user can read the full content without column truncation.
+    // General lines (tags, created, modified). Tags get a one-per-line modal so
+    // a long list reads without the inline column truncation.
     let general_lines = general_meta_lines(resource, &state.principals);
-    for (label, value, _) in general_lines {
-        let label_trim = label.trim_end_matches(':').trim().to_string();
-        let modal_lines = match label_trim.as_str() {
-            "tags" => tag_modal_lines(resource),
-            _ => vec![value.clone()],
-        };
-        out.push(SelectableMeta {
-            yank: value.clone(),
-            modal_title: label_trim,
-            modal_lines,
-            enter_action: None,
-        });
-    }
+    out.extend(group_sections(&general_lines, |title| {
+        if title == "tags" {
+            Some(tag_modal_lines(resource))
+        } else {
+            None
+        }
+    }));
 
     out
 }
@@ -2140,7 +2226,7 @@ mod tests {
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["rev:", "image:", "replicas:", "fqdn:", "network:"]
+            vec!["rev:", "image:", "scale:", "fqdn:", "network:"]
         );
         assert_eq!(lines[0].1, "files-api--0000004");
         assert_eq!(lines[1].1, "myacr/files-api:abc123");
@@ -2233,7 +2319,7 @@ mod tests {
         };
         let lines = container_app_meta_lines(Some(&meta), None);
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
-        assert_eq!(labels, vec!["rev:", "replicas:"]);
+        assert_eq!(labels, vec!["rev:", "scale:"]);
         assert_eq!(lines[1].1, "1");
     }
 
@@ -2418,11 +2504,11 @@ mod tests {
         };
         let lines = container_app_meta_lines(Some(&meta), Some(&limits));
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
-        // First container row owns the `containers:` label; the second row's
-        // label is spaces (same width) so values stack in a single column.
-        assert_eq!(labels[0..3], ["rev:", "image:", "replicas:"]);
-        assert_eq!(labels[3], "containers:");
-        assert_eq!(labels[4], "           "); // 11 spaces == "containers:".len()
+        // First container row owns the `container config:` label; the second
+        // row's label is spaces (same width) so values stack in a single column.
+        assert_eq!(labels[0..3], ["rev:", "image:", "scale:"]);
+        assert_eq!(labels[3], "container config:");
+        assert_eq!(labels[4], "                 "); // 17 spaces == "container config:".len()
         assert!(lines[3].1.contains("files"));
         assert!(lines[3].1.contains("250 mCores"));
         assert!(lines[3].1.contains("512.0 MB"));
@@ -2468,7 +2554,7 @@ mod tests {
         }];
         let lines = replica_status_lines(Some(&replicas), false, None);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].0, "replica:");
+        assert_eq!(lines[0].0, "instances:");
         // Suffix is rendered with the leading ellipsis and the three container
         // statuses are inlined with the ✓ glyph for Ready=true.
         assert!(lines[0].1.contains("\u{2026}r58pz"));
@@ -2481,7 +2567,7 @@ mod tests {
     fn replica_status_lines_shows_loading_when_pending_with_no_cache() {
         let lines = replica_status_lines(None, true, None);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].0, "replicas:");
+        assert_eq!(lines[0].0, "instances:");
         assert!(lines[0].1.contains("loading"));
     }
 
@@ -3033,5 +3119,75 @@ mod tests {
         // TRIGGER_CAP rows + one overflow summary.
         assert_eq!(lines.len(), TRIGGER_CAP + 1);
         assert!(lines.last().unwrap().1.contains("+3 more"));
+    }
+
+    #[test]
+    fn triggers_collapse_to_one_section_whose_modal_expands_every_function() {
+        use crate::azure::function_app_triggers::FunctionTrigger;
+        let n = TRIGGER_CAP + 3;
+        let mut state = fixture_no_metrics(); // r() is a Function App
+        let resource = state.resources[0].clone();
+        state.func_triggers.by_resource.insert(
+            resource.id.clone(),
+            (0..n)
+                .map(|i| FunctionTrigger {
+                    function: format!("fn{i}"),
+                    kind: "queue".into(),
+                    detail: Some(format!("q{i}")),
+                })
+                .collect(),
+        );
+
+        let metas = selectable_metas(&state, &resource);
+        // The whole trigger block is a single navigable section, not one stop
+        // per line — j/k lands on it exactly once.
+        let trigger_sections: Vec<&SelectableMeta> = metas
+            .iter()
+            .filter(|m| m.modal_title == "triggers")
+            .collect();
+        assert_eq!(trigger_sections.len(), 1, "triggers fold into one section");
+
+        // Enter expands the inline `+N more`: the modal lists every function and
+        // never shows the literal overflow summary.
+        let modal = &trigger_sections[0].modal_lines;
+        assert_eq!(modal.len(), n, "modal shows all {n} triggers uncapped");
+        assert!(modal.iter().all(|l| !l.contains("more")));
+        assert!(modal.iter().any(|l| l.contains("fn0")));
+        assert!(modal.iter().any(|l| l.contains(&format!("fn{}", n - 1))));
+    }
+
+    #[test]
+    fn render_section_count_matches_selectable_metas_for_overflowing_triggers() {
+        // Guards the render/selectable_metas alignment invariant: the number of
+        // highlightable sections render builds must equal `selectable_metas`'
+        // length, even when triggers overflow into a `+N more` row.
+        use crate::azure::function_app_triggers::FunctionTrigger;
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture_no_metrics();
+        let resource = state.resources[0].clone();
+        state.func_triggers.by_resource.insert(
+            resource.id.clone(),
+            (0..TRIGGER_CAP + 5)
+                .map(|i| FunctionTrigger {
+                    function: format!("fn{i}"),
+                    kind: "timer".into(),
+                    detail: None,
+                })
+                .collect(),
+        );
+        state.view = View::Detail;
+
+        // Park the cursor on the last section and render: a clamp/alignment bug
+        // would panic or mis-highlight. `selectable_metas` is the source of truth
+        // for the count the handler clamps against.
+        let count = selectable_metas(&state, &resource).len();
+        assert!(count >= 2, "state + triggers at minimum");
+        state.detail_view.cursor = count - 1;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        // Inline preview still teases the overflow; the section is one stop.
+        assert!(s.contains("+5 more"));
     }
 }

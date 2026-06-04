@@ -1,14 +1,23 @@
-//! System clipboard via OSC52 escape sequences.
+//! System clipboard, via two complementary delivery paths.
 //!
-//! OSC52 is a terminal escape (`ESC ] 52 ; c ; <base64-data> BEL`) that asks
-//! the terminal emulator to copy a payload into the system clipboard. It works
-//! through SSH (because the data flows over the same channel as the rest of
-//! the TUI), without spawning xclip/wl-copy and without bringing in a
-//! cross-platform clipboard crate. Most modern terminals support it; some
-//! (e.g. Apple Terminal, older GNOME Terminal) silently no-op, which is why
-//! `copy` returns a bool the caller can surface in a status line.
+//! 1. **OSC52 escape** (`ESC ] 52 ; c ; <base64-data> BEL`) — asks the
+//!    terminal emulator to copy a payload into the system clipboard. It works
+//!    through SSH (the data rides the same channel as the rest of the TUI) and
+//!    needs no external binary. Most modern terminals honour it — but some
+//!    (Apple Terminal, GNOME Terminal / VTE) silently drop the write, which is
+//!    why a second path exists.
 //!
-//! Limitation: many terminals cap the clipboard payload size (~75 KB in
+//! 2. **Native helper** (`wl-copy` / `xclip` / `xsel` / `pbcopy`) — spawned
+//!    when present, to cover those OSC52-deaf local terminals. Pure
+//!    best-effort: nothing breaks if no helper is installed, and we add no
+//!    build-time dependency on any of them.
+//!
+//! [`copy`] always does (1) and *also* attempts (2): they're complementary,
+//! not either/or. Only (1) reaches the *local* clipboard when you're SSH'd
+//! into a remote box (a remote `xclip` would target the remote's headless
+//! display); only (2) works in terminals that ignore OSC52.
+//!
+//! Limitation: many terminals cap the OSC52 payload size (~75 KB in
 //! tmux/wezterm/kitty). We pre-truncate at [`MAX_PAYLOAD`] so a 1 MB log line
 //! doesn't get silently dropped.
 
@@ -23,15 +32,23 @@ pub const MAX_PAYLOAD: usize = 64 * 1024;
 const OSC52_PREFIX: &str = "\x1b]52;c;";
 const OSC52_SUFFIX: &str = "\x07";
 
-/// Copy `text` to the system clipboard via OSC52. Returns the number of bytes
-/// actually sent (post-truncation), or an `io::Error` if writing to the
-/// terminal failed.
+/// Copy `text` to the system clipboard. Returns the number of bytes actually
+/// sent (post-truncation), or an `io::Error` if writing the OSC52 escape to
+/// the terminal failed.
 ///
-/// Whether the terminal honoured the request is not knowable from inside the
-/// program — the caller should display a friendly status hint and let the
-/// user verify by pasting.
+/// Emits the OSC52 escape *and* — off-thread, best-effort — pushes the same
+/// payload to a native clipboard helper for terminals that ignore OSC52. A
+/// missing or failing helper is not an error: OSC52 may still have worked, and
+/// whether *either* path was honoured is not knowable from inside the program.
+/// The caller should display a friendly status hint and let the user verify by
+/// pasting.
 pub fn copy(text: &str) -> io::Result<usize> {
-    copy_to(io::stdout().lock(), text)
+    let n = copy_to(io::stdout().lock(), text)?;
+    // Hand the same payload to a native helper on a detached thread: xclip /
+    // xsel / wl-copy fork to keep serving the selection, so doing this inline
+    // could stall the UI on a misbehaving helper.
+    spawn_helper_copy(truncate_for_clipboard(text).into_owned().into_bytes());
+    Ok(n)
 }
 
 /// Test seam — same as [`copy`] but lets a unit test capture output.
@@ -43,6 +60,57 @@ pub fn copy_to<W: Write>(mut sink: W, text: &str) -> io::Result<usize> {
     sink.write_all(OSC52_SUFFIX.as_bytes())?;
     sink.flush()?;
     Ok(payload.len())
+}
+
+/// Fire-and-forget the native-helper copy on a detached thread so it can never
+/// block the UI (see [`try_helper`] for why a helper might not return quickly).
+fn spawn_helper_copy(payload: Vec<u8>) {
+    std::thread::spawn(move || copy_via_helper(&payload));
+}
+
+/// Native clipboard helpers, in priority order: Wayland, X11, X11, macOS.
+/// The first one present on `PATH` wins.
+const HELPERS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+    ("pbcopy", &[]),
+];
+
+/// Best-effort copy through whichever native helper is installed. Does nothing
+/// if none are on `PATH`; the OSC52 write in [`copy`] is the universal fallback
+/// (and the only path that reaches the *local* clipboard over SSH).
+fn copy_via_helper(payload: &[u8]) {
+    for (bin, args) in HELPERS {
+        match try_helper(bin, args, payload) {
+            Ok(()) => return,
+            // Not installed — try the next candidate.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            // Present but failed (e.g. no display) — stop; OSC52 covers us.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Spawn `bin`, feed `payload` to its stdin, and reap it. Returns the spawn
+/// error (notably [`io::ErrorKind::NotFound`] when `bin` isn't on `PATH`) so
+/// the caller can fall through to the next candidate.
+fn try_helper(bin: &str, args: &[&str], payload: &[u8]) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload)?;
+        // Drop `stdin` here → EOF, so the helper stops reading.
+    }
+    // xclip / xsel / wl-copy fork to own the selection, so this returns
+    // promptly; pbcopy exits after reading. Either way, reap to avoid a zombie.
+    child.wait()?;
+    Ok(())
 }
 
 fn truncate_for_clipboard(text: &str) -> std::borrow::Cow<'_, str> {
@@ -133,6 +201,14 @@ mod tests {
         // No partial UTF-8 char before the marker.
         let stem = truncated.trim_end_matches("…[truncated]");
         assert!(stem.is_char_boundary(stem.len()));
+    }
+
+    #[test]
+    fn missing_helper_reports_not_found() {
+        // The probe loop relies on NotFound to fall through to the next
+        // candidate, so a binary that can't exist must surface that kind.
+        let err = try_helper("azpect-no-such-clipboard-binary", &[], b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
