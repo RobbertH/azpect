@@ -20,6 +20,16 @@ pub struct EnvVar {
     /// ARM never returns the resolved value for those.
     pub value: String,
     pub is_secret: bool,
+    /// Container attribution for the env-vars page, pre-rendered: `"all (3)"`,
+    /// `"files, http-auth"`, or a single container name. `None` for resources
+    /// without a container dimension (Function Apps) and for single-container
+    /// Container Apps, where attribution is meaningless and the column is hidden.
+    /// Populated only by [`merge_container_env`]; the raw parsers leave it `None`.
+    pub attribution: Option<String>,
+    /// `true` when this row is one of several sharing a name whose values differ
+    /// across containers (the name was *exploded* into one row per distinct
+    /// value). Drives the `⚠` divergence marker. `false` for the common case.
+    pub diverges: bool,
 }
 
 /// Parse a Container App revision/template `env` array
@@ -43,6 +53,7 @@ pub fn from_container_env(env: &serde_json::Value) -> Vec<EnvVar> {
                     name,
                     value: format!("(secret: {secret})"),
                     is_secret: true,
+                    ..Default::default()
                 })
             } else {
                 let value = e
@@ -54,6 +65,7 @@ pub fn from_container_env(env: &serde_json::Value) -> Vec<EnvVar> {
                     name,
                     value,
                     is_secret: false,
+                    ..Default::default()
                 })
             }
         })
@@ -79,6 +91,7 @@ pub fn from_app_settings(properties: &serde_json::Value) -> Vec<EnvVar> {
                 name: k.clone(),
                 value,
                 is_secret,
+                ..Default::default()
             }
         })
         .collect();

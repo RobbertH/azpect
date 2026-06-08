@@ -662,7 +662,20 @@ fn container_app_meta_lines(
             out.push(("rev:".into(), m.name.clone(), format!("rev: {}", m.name)));
         }
         if let Some(img) = &m.image {
-            out.push(("image:".into(), img.clone(), format!("image: {img}")));
+            // The header shows the primary container's image. When the revision
+            // defines more containers (sidecars / init), tag a `(+N more)` so a
+            // multi-container app isn't misrepresented as single-image — the
+            // full per-container list lives in the `container config:` block.
+            let extra = limits
+                .map(|l| l.containers.len().saturating_sub(1))
+                .unwrap_or(0);
+            let value = if extra > 0 {
+                format!("{img}  (+{extra} more)")
+            } else {
+                img.clone()
+            };
+            let plain = format!("image: {value}");
+            out.push(("image:".into(), value, plain));
         }
         let replicas_value = match (m.min_replicas, m.max_replicas) {
             (0, 0) => format!("{}", m.replicas),
@@ -675,13 +688,6 @@ fn container_app_meta_lines(
     if let Some(l) = limits {
         if !l.containers.is_empty() {
             push_template_container_rows(&mut out, &l.containers);
-        }
-        if let Some(eph) = l.ephemeral_storage.as_deref() {
-            out.push((
-                "ephemeral:".into(),
-                eph.to_string(),
-                format!("ephemeral: {eph}"),
-            ));
         }
         if let Some(fqdn) = l.fqdn.as_deref() {
             out.push(("fqdn:".into(), fqdn.to_string(), format!("fqdn: {fqdn}")));
@@ -718,10 +724,13 @@ fn container_app_meta_lines(
     out
 }
 
-/// Emit one row per template container, sharing the `container config:` label
-/// on the first row and using a space-padded blank label on continuation rows
-/// so values stack in a consistent column. `name` is left-padded to the longest
-/// name in the set so `image` / `resources` align across rows. These are the
+/// Emit a block of rows per template container: a name *header* row that owns
+/// the `container config:` label (blank-padded on later containers so they stack
+/// in one column), followed by indented `image` / `cpu/mem` / `ephemeral`
+/// attribute sub-rows (the last only when the container reports ephemeral
+/// storage).
+/// Breaking each container across sub-rows keeps the values readable instead of
+/// packing name + image + resources onto one wide line. These are the
 /// *configured* containers of the active revision (the template) — distinct from
 /// the live `instances:` block, which reflects the running replicas.
 fn push_template_container_rows(
@@ -729,33 +738,53 @@ fn push_template_container_rows(
     containers: &[crate::azure::container_app_overview::ContainerSpec],
 ) {
     const LABEL: &str = "container config:";
-    let max_name = containers
-        .iter()
-        .map(|c| c.name.chars().count())
-        .max()
-        .unwrap_or(0);
+    // Attribute names for the indented sub-rows, padded to a common column so
+    // their values line up. `ephemeral` only appears for containers that report
+    // it, but it widens the column for the whole block when any do.
+    const ATTR_IMAGE: &str = "image";
+    const ATTR_RES: &str = "cpu/mem";
+    const ATTR_EPH: &str = "ephemeral";
     let blank_label: String = " ".repeat(LABEL.chars().count());
+    let mut attr_width = ATTR_IMAGE.chars().count().max(ATTR_RES.chars().count());
+    if containers.iter().any(|c| c.ephemeral_storage.is_some()) {
+        attr_width = attr_width.max(ATTR_EPH.chars().count());
+    }
+
+    // Push one sub-row: a 2-space indent, the padded attribute name, then value.
+    let push_sub = |out: &mut Vec<(String, String, String)>, attr: &str, val: &str| {
+        let value = format!("  {attr:<attr_width$}  {val}");
+        let plain = format!("{blank_label} {value}");
+        out.push((blank_label.clone(), value, plain));
+    };
 
     for (idx, c) in containers.iter().enumerate() {
-        let name_col = format!("{:<width$}", c.name, width = max_name);
-        let image = c.image.as_deref().unwrap_or("\u{2014}"); // em dash for missing
-        let res = format!(
-            "{} mCores \u{00b7} {}",
-            c.cpu_millicores,
-            format_bytes(c.memory_bytes as f64)
-        );
-        // Tag init containers so a `something ✓` in the replica's container
-        // list that comes from `initContainers` doesn't look like a missing
-        // entry up here in the template.
+        // Name header row. Tag init containers so a `something ✓` in the
+        // replica's container list that comes from `initContainers` doesn't
+        // look like a missing entry up here in the template.
         let suffix = if c.is_init { "  (init)" } else { "" };
-        let value = format!("{name_col}  {image}  {res}{suffix}");
+        let name_value = format!("{}{suffix}", c.name);
         let label = if idx == 0 {
             LABEL.to_string()
         } else {
             blank_label.clone()
         };
-        let plain = format!("{label} {value}");
-        out.push((label, value, plain));
+        let plain = format!("{label} {name_value}");
+        out.push((label, name_value, plain));
+
+        // Indented attribute sub-rows beneath the name.
+        let image = c.image.as_deref().unwrap_or("\u{2014}"); // em dash for missing
+        push_sub(out, ATTR_IMAGE, image);
+        let res = format!(
+            "{} mCores \u{00b7} {}",
+            c.cpu_millicores,
+            format_bytes(c.memory_bytes as f64)
+        );
+        push_sub(out, ATTR_RES, &res);
+        // Ephemeral storage is per container; only emit a row when the container
+        // actually reports it (some payloads omit it entirely).
+        if let Some(eph) = c.ephemeral_storage.as_deref() {
+            push_sub(out, ATTR_EPH, eph);
+        }
     }
 }
 
@@ -2490,6 +2519,8 @@ mod tests {
                     image: Some("myacr/files:abc".into()),
                     cpu_millicores: 250,
                     memory_bytes: 512 * 1024 * 1024,
+                    ephemeral_storage: Some("4Gi".into()),
+                    env_vars: Vec::new(),
                     is_init: false,
                 },
                 ContainerSpec {
@@ -2497,6 +2528,8 @@ mod tests {
                     image: Some("myacr/http-auth:abc".into()),
                     cpu_millicores: 500,
                     memory_bytes: 1024 * 1024 * 1024,
+                    ephemeral_storage: None,
+                    env_vars: Vec::new(),
                     is_init: false,
                 },
             ],
@@ -2504,16 +2537,33 @@ mod tests {
         };
         let lines = container_app_meta_lines(Some(&meta), Some(&limits));
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
-        // First container row owns the `container config:` label; the second
-        // row's label is spaces (same width) so values stack in a single column.
+        // Each container is a name header row (the first owns the
+        // `container config:` label; later rows use a spaces-only label of the
+        // same width) followed by indented `image` / `cpu/mem` (/ `ephemeral`)
+        // sub-rows. `files` reports ephemeral storage so it gets a third
+        // sub-row; `http-auth` doesn't, so it has only two.
+        let blank = " ".repeat("container config:".len()); // 17 spaces
         assert_eq!(labels[0..3], ["rev:", "image:", "scale:"]);
-        assert_eq!(labels[3], "container config:");
-        assert_eq!(labels[4], "                 "); // 17 spaces == "container config:".len()
-        assert!(lines[3].1.contains("files"));
-        assert!(lines[3].1.contains("250 mCores"));
-        assert!(lines[3].1.contains("512.0 MB"));
-        assert!(lines[4].1.contains("http-auth"));
-        assert!(lines[4].1.contains("500 mCores"));
+        // Two containers ⇒ the primary image header is tagged `(+1 more)`.
+        assert_eq!(lines[1].1, "primary:1.0  (+1 more)");
+        assert_eq!(labels[3], "container config:"); // files name header
+        assert_eq!(labels[4], blank); // image sub-row
+        assert_eq!(labels[5], blank); // cpu/mem sub-row
+        assert_eq!(labels[6], blank); // ephemeral sub-row
+        assert_eq!(labels[7], blank); // http-auth name header
+        assert_eq!(labels[8], blank); // image sub-row
+        assert_eq!(labels[9], blank); // cpu/mem sub-row
+        assert_eq!(lines[3].1, "files");
+        assert!(lines[4].1.contains("image") && lines[4].1.contains("myacr/files:abc"));
+        assert!(lines[5].1.contains("250 mCores"));
+        assert!(lines[5].1.contains("512.0 MB"));
+        assert!(lines[6].1.contains("ephemeral") && lines[6].1.contains("4Gi"));
+        assert_eq!(lines[7].1, "http-auth");
+        assert!(lines[9].1.contains("500 mCores"));
+        // http-auth has no ephemeral row, so the block ends at the cpu/mem row:
+        // 3 meta (rev/image/scale) + 7 container rows + 1 network (no fqdn).
+        assert_eq!(labels[10], "network:");
+        assert_eq!(lines.len(), 11);
     }
 
     #[test]
@@ -2917,6 +2967,7 @@ mod tests {
             name: name.into(),
             value: value.into(),
             is_secret,
+            ..Default::default()
         }
     }
 

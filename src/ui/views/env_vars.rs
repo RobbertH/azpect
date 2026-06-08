@@ -27,6 +27,10 @@ const H_SCROLL_STEP: usize = 8;
 const MASK: &str = "••••••••";
 /// Name column width; longer names are ellipsized.
 const NAME_COL: usize = 36;
+/// Width of the per-container attribution (`in`) column, rendered between the
+/// name and the value for multi-container Container Apps. Longer lists are
+/// ellipsized. Hidden entirely when no row carries attribution.
+const ATTR_COL: usize = 18;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -121,6 +125,11 @@ fn render_body(
     let visible = area.height as usize;
     let scroll = scroll_for(cursor, vars.len(), visible);
 
+    // The attribution (`in`) column only exists for multi-container Container
+    // Apps; when no row carries it (Function Apps, single-container apps) the
+    // column is omitted so the page reads exactly as before.
+    let show_attr = vars.iter().any(|v| v.attribution.is_some());
+
     let lines: Vec<Line> = vars
         .iter()
         .enumerate()
@@ -150,12 +159,28 @@ fn render_body(
             } else {
                 theme.accent
             };
-            let spans = vec![
+            let mut spans = vec![
                 Span::raw(if selected { "▍ " } else { "  " }),
                 Span::styled(name, Style::default().fg(theme.fg)),
-                Span::styled(" = ", Style::default().fg(theme.muted)),
-                Span::styled(value, Style::default().fg(value_color)),
             ];
+            if show_attr {
+                // Pinned LEFT of the value so it's always visible regardless of
+                // horizontal value-scroll. `⚠` flags a name whose value differs
+                // across containers (the row was exploded per distinct value).
+                let attr = format!(
+                    "{:<width$}",
+                    truncate_right(v.attribution.as_deref().unwrap_or(""), ATTR_COL),
+                    width = ATTR_COL
+                );
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    if v.diverges { "⚠ " } else { "  " },
+                    Style::default().fg(theme.degraded),
+                ));
+                spans.push(Span::styled(attr, Style::default().fg(theme.muted)));
+            }
+            spans.push(Span::styled(" = ", Style::default().fg(theme.muted)));
+            spans.push(Span::styled(value, Style::default().fg(value_color)));
             if selected {
                 Line::from(spans).style(theme.selection())
             } else {
@@ -304,6 +329,7 @@ mod tests {
             name: name.into(),
             value: value.into(),
             is_secret,
+            ..Default::default()
         }
     }
 
@@ -415,6 +441,57 @@ mod tests {
         );
         state.env_vars_view.cursor = 1;
         assert_eq!(yank_text(&state).as_deref(), Some("B=2"));
+    }
+
+    #[test]
+    fn renders_container_attribution_column_when_present() {
+        let theme = Theme::catppuccin_mocha();
+        let vars = vec![
+            EnvVar {
+                name: "SHARED".into(),
+                value: "yes".into(),
+                is_secret: false,
+                attribution: Some("all (2)".into()),
+                diverges: false,
+            },
+            EnvVar {
+                name: "LOG_LEVEL".into(),
+                value: "info".into(),
+                is_secret: false,
+                attribution: Some("files".into()),
+                diverges: true,
+            },
+        ];
+        let mut state = state_with(ResourceKind::ContainerApp, vars);
+        state.env_vars_view.revealed = true;
+        let backend = TestBackend::new(80, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        // Attribution column is rendered between name and value.
+        assert!(s.contains("all (2)"), "missing 'all (N)' attribution");
+        assert!(s.contains("files"), "missing single-container attribution");
+        // The divergent row carries the warning marker.
+        assert!(s.contains('⚠'), "missing divergence marker");
+    }
+
+    #[test]
+    fn no_attribution_column_for_flat_env_vars() {
+        // Function App vars carry no attribution, so the column is suppressed and
+        // the page reads exactly as before (no stray 'all (' / '⚠').
+        let theme = Theme::catppuccin_mocha();
+        let mut state = state_with(
+            ResourceKind::FunctionApp,
+            vec![ev("API_KEY", "v", false), ev("PORT", "8080", false)],
+        );
+        state.env_vars_view.revealed = true;
+        let backend = TestBackend::new(80, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("API_KEY"));
+        assert!(!s.contains('⚠'), "divergence marker leaked into flat list");
+        assert!(!s.contains("all ("), "attribution leaked into flat list");
     }
 
     #[test]
