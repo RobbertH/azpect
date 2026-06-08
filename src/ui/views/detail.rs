@@ -788,11 +788,14 @@ fn push_template_container_rows(
     }
 }
 
-/// Emit one row per live replica with per-container readiness inlined. The
-/// replica name is trimmed to the random suffix (everything after the final
-/// `-`) since the long prefix repeats across every replica of the same
-/// revision and would dominate the row. Sorted newest-first by `created_at`;
-/// capped at 10 rows so a scaled-out app can't blow the Detail header height.
+/// Emit a block of rows per live replica: a header row carrying the replica's
+/// trailing random suffix (the long prefix repeats across every replica of the
+/// same revision, so only the suffix is shown) plus its aggregate `runningState`
+/// in parens, followed by one indented sub-row per container with its readiness
+/// glyph and restart count. This
+/// mirrors the `container config:` block above so the live runtime reads the
+/// same way as the configured template. Sorted newest-first by `created_at`;
+/// capped at 10 replicas so a scaled-out app can't blow the Detail header.
 ///
 /// Returns an empty Vec when there are no replicas (e.g. revision with
 /// `replicas: 0`); a single hint row when the fetch is pending or has failed.
@@ -803,10 +806,11 @@ fn replica_status_lines(
 ) -> Vec<(String, String, String)> {
     // Labelled `instances:` (not `replicas:`) to keep the live running pods
     // distinct from the configured `scale:` count — a scaled-out app would
-    // otherwise show two `replicas:` rows. Singular/plural share one label so
-    // the runtime block is always identifiable at a glance.
-    const LABEL_SINGLE: &str = "instances:";
-    const LABEL_MULTI: &str = "instances:";
+    // otherwise show two `replicas:` rows.
+    const LABEL: &str = "instances:";
+    // Inline preview is capped at this many *replicas* (each now spans a header
+    // row plus a sub-row per container); the rest fold into a `+N more` row and
+    // the full list lives in the Enter modal.
     const CAP: usize = 10;
 
     // Cached data wins over a transient error so a stale-but-useful row
@@ -823,49 +827,53 @@ fn replica_status_lines(
 
         let total = sorted.len();
         let shown = total.min(CAP);
-        let label = if total == 1 {
-            LABEL_SINGLE
-        } else {
-            LABEL_MULTI
-        };
-        let blank_label: String = " ".repeat(label.chars().count());
+        let blank_label: String = " ".repeat(LABEL.chars().count());
 
-        // Trim each replica name to its suffix so the rows fit; align in a
-        // column based on the longest suffix in the visible subset.
-        let suffixes: Vec<String> = sorted
+        // Column-align the container names across every shown replica so the
+        // readiness glyphs and restart counts stack in one column down the whole
+        // block (the same alignment trick the `container config:` block uses).
+        let name_width = sorted
             .iter()
             .take(shown)
-            .map(|r| short_replica_name(&r.name))
-            .collect();
-        let max_suffix = suffixes
-            .iter()
-            .map(|s| s.chars().count())
+            .flat_map(|r| r.containers.iter())
+            .map(|c| container_display_name(c).chars().count())
             .max()
             .unwrap_or(0);
 
         let mut out: Vec<(String, String, String)> = Vec::new();
         for (idx, r) in sorted.iter().take(shown).enumerate() {
-            let suffix = format!("{:<width$}", suffixes[idx], width = max_suffix);
-            let statuses = r
-                .containers
-                .iter()
-                .map(format_container_status)
-                .collect::<Vec<_>>()
-                .join("  ");
-            let restarts = r
-                .containers
-                .iter()
-                .map(|c| c.restart_count)
-                .max()
-                .unwrap_or(0);
-            let value = format!("{suffix}  {statuses}     restarts {restarts}");
+            // Replica header row — owns the `instances:` label on the first
+            // replica, blank-padded thereafter so the block stacks in one column.
+            // The replica's aggregate `runningState` is appended in parens. This
+            // is Azure's *replica*-level state, distinct from the per-container
+            // readiness glyphs below it, and the two can disagree — e.g. a
+            // scaled-to-zero app parks a replica as `NotRunning` while its
+            // container's last snapshot is still `Running`/ready.
+            let suffix = short_replica_name(&r.name);
+            let name = match r.running_state.as_deref() {
+                Some(state) => format!("{suffix}  ({state})"),
+                None => suffix,
+            };
             let row_label = if idx == 0 {
-                label.to_string()
+                LABEL.to_string()
             } else {
                 blank_label.clone()
             };
-            let plain = format!("{row_label} {value}");
-            out.push((row_label, value, plain));
+            let plain = format!("{row_label} {name}");
+            out.push((row_label, name, plain));
+
+            // One indented sub-row per container: padded name, readiness glyph,
+            // and its own restart count (more precise than the old max-across).
+            for c in &r.containers {
+                let cname = container_display_name(c);
+                let glyph = ready_glyph(c.ready);
+                let value = format!(
+                    "  {cname:<name_width$}  {glyph}  restarts {}",
+                    c.restart_count
+                );
+                let plain = format!("{blank_label} {value}");
+                out.push((blank_label.clone(), value, plain));
+            }
         }
         if total > shown {
             let extra = total - shown;
@@ -880,13 +888,13 @@ fn replica_status_lines(
     }
 
     if pending {
-        let plain = format!("{LABEL_MULTI} loading\u{2026}");
-        return vec![(LABEL_MULTI.into(), "loading\u{2026}".into(), plain)];
+        let plain = format!("{LABEL} loading\u{2026}");
+        return vec![(LABEL.into(), "loading\u{2026}".into(), plain)];
     }
     if let Some(msg) = failure {
         let value = short_replica_failure(msg);
-        let plain = format!("{LABEL_MULTI} {value}");
-        return vec![(LABEL_MULTI.into(), value, plain)];
+        let plain = format!("{LABEL} {value}");
+        return vec![(LABEL.into(), value, plain)];
     }
     Vec::new()
 }
@@ -902,21 +910,24 @@ fn short_replica_name(full: &str) -> String {
     }
 }
 
-/// Format one container's status inline: `name ✓` for Ready, `name ✗` for
-/// not Ready, `name ?` when the probe state is unknown (container still
-/// initialising or no probe configured).
-fn format_container_status(c: &crate::azure::container_app_replicas::ReplicaContainer) -> String {
-    let glyph = match c.ready {
+/// Glyph for a container's readiness probe: `✓` Ready, `✗` not Ready, `?` when
+/// the state is unknown (container still initialising or no probe configured).
+fn ready_glyph(ready: Option<bool>) -> char {
+    match ready {
         Some(true) => '\u{2713}',  // ✓
         Some(false) => '\u{2717}', // ✗
         None => '?',
-    };
-    let name = if c.name.is_empty() {
+    }
+}
+
+/// A container's display name, falling back to `?` for the (degenerate) empty
+/// name some replica payloads carry.
+fn container_display_name(c: &crate::azure::container_app_replicas::ReplicaContainer) -> &str {
+    if c.name.is_empty() {
         "?"
     } else {
         c.name.as_str()
-    };
-    format!("{name} {glyph}")
+    }
 }
 
 /// Translate a raw replicas-endpoint failure into a short, plain-language
@@ -1831,16 +1842,8 @@ fn replica_modal_lines(
         lines.push(String::new());
         lines.push("containers:".to_string());
         for c in &replica.containers {
-            let glyph = match c.ready {
-                Some(true) => "\u{2713}",
-                Some(false) => "\u{2717}",
-                None => "?",
-            };
-            let name = if c.name.is_empty() {
-                "?".to_string()
-            } else {
-                c.name.clone()
-            };
+            let glyph = ready_glyph(c.ready);
+            let name = container_display_name(c);
             let running = c.running_state.as_deref().unwrap_or("?");
             lines.push(format!(
                 "  {name} {glyph}  restarts {}  ({running})",
@@ -2567,7 +2570,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_status_lines_renders_one_row_per_replica() {
+    fn replica_status_lines_renders_header_plus_container_rows() {
         use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
         use chrono::TimeZone;
         let replicas = vec![ReplicaInstance {
@@ -2603,14 +2606,19 @@ mod tests {
             ],
         }];
         let lines = replica_status_lines(Some(&replicas), false, None);
-        assert_eq!(lines.len(), 1);
+        // One header row (the replica suffix) + one sub-row per container.
+        assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].0, "instances:");
-        // Suffix is rendered with the leading ellipsis and the three container
-        // statuses are inlined with the ✓ glyph for Ready=true.
+        // Header carries the suffix with its leading ellipsis and the replica's
+        // aggregate running state in parens.
         assert!(lines[0].1.contains("\u{2026}r58pz"));
-        assert!(lines[0].1.contains("files \u{2713}"));
-        assert!(lines[0].1.contains("http-auth \u{2713}"));
-        assert!(lines[0].1.contains("restarts 0"));
+        assert!(lines[0].1.contains("(Running)"));
+        // Container sub-rows are blank-label continuations, each with its own
+        // readiness glyph (✓ for Ready=true) and restart count.
+        assert_eq!(lines[1].0.trim(), "");
+        assert!(lines[1].1.contains("files") && lines[1].1.contains('\u{2713}'));
+        assert!(lines[1].1.contains("restarts 0"));
+        assert!(lines[3].1.contains("http-auth") && lines[3].1.contains('\u{2713}'));
     }
 
     #[test]
@@ -2654,8 +2662,8 @@ mod tests {
         };
         let replicas: Vec<_> = (0..15).map(make).collect();
         let lines = replica_status_lines(Some(&replicas), false, None);
-        // 10 replica rows + 1 "+5 more" row.
-        assert_eq!(lines.len(), 11);
+        // 10 replicas × (header + 1 container sub-row) + 1 "+5 more" summary.
+        assert_eq!(lines.len(), 21);
         assert!(lines.last().unwrap().1.contains("+5 more"));
     }
 
