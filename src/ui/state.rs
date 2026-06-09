@@ -3,6 +3,7 @@
 
 #![allow(dead_code, unused_variables)]
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use tui_input::Input;
@@ -1139,9 +1140,17 @@ pub struct LogsCache {
     pub errors_only: bool,
     pub loading: bool,
     pub last_error: Option<String>,
-    /// Scroll offset/cursor inside the logs table.
+    /// Cursor row inside the logs table (index into the cached lines).
     /// Kept separate from `AppState::list_cursor` so navigating logs does not corrupt the resource selection in the List view.
     pub scroll: usize,
+    /// Index of the first visible row — the viewport's top. Distinct from
+    /// `scroll` (the cursor) so the cursor can move freely within the viewport
+    /// and the window only scrolls once the cursor reaches an edge. Persisted
+    /// across frames; reconciled in [`crate::ui::views::logs`]'s render, the
+    /// only place that knows the viewport height (it depends on the dynamic
+    /// breadcrumb / command / status rows). `Cell` because render takes
+    /// `&AppState` yet must write back the offset it just computed.
+    pub view_top: Cell<usize>,
     /// When true, render the source and message columns as multi-line wrapped
     /// text so long values are fully visible (row heights expand). Toggled with `w`.
     pub wrap: bool,

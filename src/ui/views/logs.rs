@@ -240,11 +240,20 @@ fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppSta
     let msg_w = (area.width.saturating_sub(used)).max(20) as usize;
     let source_w = SOURCE_COL as usize;
 
-    // Pick the slice of rows to render. In non-wrap mode every row is height 1
-    // so this collapses to "as many rows as fit". In wrap mode each row may
-    // span multiple cells; visible_range walks both directions from the cursor
-    // until the cumulative height fills the area.
-    let (start, end) = visible_range(lines, cursor, data_height, wrap, source_w, msg_w);
+    // Pick the slice of rows to render under the edge-scroll policy: the window
+    // stays put at the persisted `view_top` and only moves once the cursor
+    // crosses an edge. `start` is the reconciled top — write it back for the
+    // next frame (render is the only place that knows the viewport height).
+    let (start, end) = visible_range(
+        lines,
+        state.logs.view_top.get(),
+        cursor,
+        data_height,
+        wrap,
+        source_w,
+        msg_w,
+    );
+    state.logs.view_top.set(start);
 
     let rows: Vec<Row> = lines[start..=end]
         .iter()
@@ -540,11 +549,16 @@ fn line_height(l: &LogLine, wrap: bool, source_w: usize, msg_w: usize) -> usize 
     s.max(m)
 }
 
-/// Choose the [start, end] index range of log lines to render so that the
-/// `cursor` row is visible and the rendered rows together fit within
-/// `data_height` cells of vertical space.
+/// Choose the `[start, end]` index range of log lines to render under an
+/// **edge-scroll** policy: the viewport stays anchored at `view_top` while the
+/// cursor moves freely inside it, and only scrolls once the cursor would fall
+/// off an edge — down so the cursor lands on the last visible row, up so it
+/// lands on the first. `start` is the reconciled viewport top; the caller
+/// persists it for the next frame. Rows can exceed one cell in wrap mode, so
+/// "fits" is measured in accumulated cell heights, not row counts.
 fn visible_range(
     lines: &[LogLine],
+    view_top: usize,
     cursor: usize,
     data_height: usize,
     wrap: bool,
@@ -554,20 +568,51 @@ fn visible_range(
     if lines.is_empty() {
         return (0, 0);
     }
-    let cursor = cursor.min(lines.len() - 1);
-    // Walk backwards from the cursor accumulating heights until we've filled
-    // the visible area, then walk forward to extend if there's slack left.
-    let mut used = line_height(&lines[cursor], wrap, source_w, msg_w);
-    let mut start = cursor;
-    while start > 0 {
-        let h = line_height(&lines[start - 1], wrap, source_w, msg_w);
-        if used + h > data_height {
-            break;
+    let last = lines.len() - 1;
+    let cursor = cursor.min(last);
+    // Highest top that still keeps the last row pinned to the viewport bottom.
+    // Clamping `view_top` to it stops the window from drifting past the end
+    // (and collapses to 0 when the whole buffer fits), so we never render
+    // wasted blank space above or below — e.g. after the buffer shrinks under a
+    // stale top.
+    let max_top = backward_start(lines, last, data_height, wrap, source_w, msg_w);
+    let top = view_top.min(max_top);
+
+    if cursor < top {
+        // Cursor crossed the top edge → scroll up so it sits on the first row.
+        let start = cursor;
+        (
+            start,
+            forward_end(lines, start, data_height, wrap, source_w, msg_w),
+        )
+    } else {
+        let end = forward_end(lines, top, data_height, wrap, source_w, msg_w);
+        if cursor > end {
+            // Cursor crossed the bottom edge → scroll down so it sits on the
+            // last row.
+            (
+                backward_start(lines, cursor, data_height, wrap, source_w, msg_w),
+                cursor,
+            )
+        } else {
+            // Cursor already inside the window → leave it exactly where it is.
+            (top, end)
         }
-        used += h;
-        start -= 1;
     }
-    let mut end = cursor;
+}
+
+/// Walk forward from `top`, accumulating row heights until the viewport is
+/// full, returning the last row that fits (at minimum `top` itself).
+fn forward_end(
+    lines: &[LogLine],
+    top: usize,
+    data_height: usize,
+    wrap: bool,
+    source_w: usize,
+    msg_w: usize,
+) -> usize {
+    let mut used = line_height(&lines[top], wrap, source_w, msg_w);
+    let mut end = top;
     while end + 1 < lines.len() {
         let h = line_height(&lines[end + 1], wrap, source_w, msg_w);
         if used + h > data_height {
@@ -576,7 +621,30 @@ fn visible_range(
         used += h;
         end += 1;
     }
-    (start, end)
+    end
+}
+
+/// Walk backward from `bottom` so that `bottom` is the last visible row,
+/// returning the resulting viewport top.
+fn backward_start(
+    lines: &[LogLine],
+    bottom: usize,
+    data_height: usize,
+    wrap: bool,
+    source_w: usize,
+    msg_w: usize,
+) -> usize {
+    let mut used = line_height(&lines[bottom], wrap, source_w, msg_w);
+    let mut start = bottom;
+    while start > 0 {
+        let h = line_height(&lines[start - 1], wrap, source_w, msg_w);
+        if used + h > data_height {
+            break;
+        }
+        used += h;
+        start -= 1;
+    }
+    start
 }
 
 /// Best-effort IANA timezone name (e.g. `Europe/Brussels`) for the header.
@@ -804,6 +872,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.logs.by_resource.remove(&id);
             }
             state.logs.scroll = 0;
+            state.logs.view_top.set(0);
             true
         }
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
@@ -1002,6 +1071,7 @@ fn set_window(state: &mut AppState, range: TimeRange) -> bool {
         state.logs.by_resource.remove(&id);
     }
     state.logs.scroll = 0;
+    state.logs.view_top.set(0);
     true
 }
 
@@ -1332,9 +1402,10 @@ mod tests {
     }
 
     #[test]
-    fn visible_range_anchors_on_cursor_in_wrap_mode() {
+    fn visible_range_keeps_tall_cursor_row_visible_in_wrap_mode() {
         // Three lines: a, big, c. With wrap and a small viewport, the cursor
-        // row must stay visible even if it pushes neighbours out.
+        // row (the 4-cell middle one) must stay visible even though it fills the
+        // whole area on its own.
         let lines = vec![
             line(1, LogLevel::Info, "s", "a"),
             line(2, LogLevel::Info, "s", &"x".repeat(80)),
@@ -1342,8 +1413,70 @@ mod tests {
         ];
         // 20-wide message column → middle row is 4 cells tall; data_height 4
         // forces it to be the only row.
-        let (start, end) = visible_range(&lines, 1, 4, true, 32, 20);
+        let (start, end) = visible_range(&lines, 1, 1, 4, true, 32, 20);
         assert_eq!((start, end), (1, 1));
+    }
+
+    #[test]
+    fn edge_scroll_keeps_window_until_cursor_crosses_an_edge() {
+        // Ten 1-cell rows, a 3-row viewport (no wrap).
+        let lines: Vec<LogLine> = (0..10)
+            .map(|i| line(i, LogLevel::Info, "s", &format!("line {i}")))
+            .collect();
+        let vr = |top, cur| visible_range(&lines, top, cur, 3, false, 32, 40);
+
+        // Cursor moving down *within* the window leaves it anchored…
+        assert_eq!(vr(0, 0), (0, 2));
+        assert_eq!(vr(0, 1), (0, 2));
+        assert_eq!(vr(0, 2), (0, 2)); // sitting on the bottom edge — still no scroll
+                                      // …one past the bottom edge → scroll down by one, cursor pinned to bottom.
+        assert_eq!(vr(0, 3), (1, 3));
+        // Cursor above the top edge → scroll up, cursor pinned to the top.
+        assert_eq!(vr(5, 4), (4, 6));
+        // Cursor already inside a window anchored at 5 → unchanged.
+        assert_eq!(vr(5, 6), (5, 7));
+    }
+
+    #[test]
+    fn visible_range_clamps_stale_top_so_short_buffer_pins_to_row_zero() {
+        // Buffer smaller than the viewport: a stale high `view_top` must not
+        // leave blank space — the window snaps back so row 0 is visible.
+        let lines: Vec<LogLine> = (0..3).map(|i| line(i, LogLevel::Info, "s", "x")).collect();
+        assert_eq!(visible_range(&lines, 2, 2, 10, false, 32, 40), (0, 2));
+    }
+
+    #[test]
+    fn render_persists_and_advances_view_top_on_scroll_past_bottom() {
+        let theme = Theme::catppuccin_mocha();
+        // Short terminal so the buffer overflows the viewport.
+        let backend = TestBackend::new(100, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::FunctionApp);
+        let id = state.resources[0].id.clone();
+        let lines: Vec<LogLine> = (0..50)
+            .map(|i| line(i, LogLevel::Info, "src", &format!("message {i}")))
+            .collect();
+        state.logs.by_resource.insert(id, lines);
+
+        // First frame: cursor at the top, window pinned to the top.
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        assert_eq!(state.logs.view_top.get(), 0);
+
+        // Drive the cursor well past the bottom of the viewport, redraw: the
+        // window must follow it down, keeping it visible.
+        for _ in 0..30 {
+            handle(Action::MoveDown, &mut state);
+        }
+        assert_eq!(state.logs.scroll, 30);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let top = state.logs.view_top.get();
+        assert!(top > 0, "window should have scrolled down, view_top={top}");
+        assert!(top <= 30, "cursor must stay visible, view_top={top}");
+
+        // Back to the top: the window follows back up to row 0.
+        handle(Action::GotoTop, &mut state);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        assert_eq!(state.logs.view_top.get(), 0);
     }
 
     #[test]

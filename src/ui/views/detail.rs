@@ -397,7 +397,47 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
 
-    let context = Paragraph::new(context_lines).wrap(Wrap { trim: false });
+    // The context pane is a fixed-height Paragraph with no implicit scroll, so on
+    // short terminals a richly-populated Container App overflows `max_context`
+    // (above) and its lower sections clip — yet `j`/`k` still move the cursor
+    // into them. Compute a scroll offset that pulls the cursor's section into
+    // view. Row positions use the same char-based wrap approximation as the
+    // height reservation, so the offset tracks what's actually drawn.
+    let context_scroll = if selectable_sections.is_empty() {
+        0u16
+    } else {
+        let cursor = state.detail_view.cursor.min(selectable_sections.len() - 1);
+        // Wrapped-row offset at the start of each context line (plus a final
+        // total), built from each line's rendered text.
+        let mut acc = 0usize;
+        let mut row_starts: Vec<usize> = Vec::with_capacity(context_lines.len() + 1);
+        for line in &context_lines {
+            row_starts.push(acc);
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            acc += wrapped_line_count(&plain, inner.width).max(1);
+        }
+        row_starts.push(acc);
+        let visible = body[0].height as usize;
+        selectable_sections
+            .get(cursor)
+            .and_then(|idxs| {
+                let top = row_starts[*idxs.first()?];
+                let bottom = row_starts[*idxs.last()? + 1];
+                // Scroll down just enough to reveal the section's bottom, then
+                // back up if that would hide its top (taller-than-pane sections
+                // pin to their top).
+                let mut scroll = bottom.saturating_sub(visible);
+                if top < scroll {
+                    scroll = top;
+                }
+                Some(scroll.min(u16::MAX as usize) as u16)
+            })
+            .unwrap_or(0)
+    };
+
+    let context = Paragraph::new(context_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((context_scroll, 0));
     frame.render_widget(context, body[0]);
 
     // Sparkline grid: 4 rows of equal fixed height (1 label line + 2 bars),
@@ -792,9 +832,9 @@ fn push_template_container_rows(
 /// trailing random suffix (the long prefix repeats across every replica of the
 /// same revision, so only the suffix is shown) plus its aggregate `runningState`
 /// in parens, followed by one indented sub-row per container with its readiness
-/// glyph and restart count. This
-/// mirrors the `container config:` block above so the live runtime reads the
-/// same way as the configured template. Sorted newest-first by `created_at`;
+/// glyph and restart count. This mirrors the `container config:` block above so
+/// the live runtime reads the same way as the configured template. Sorted
+/// newest-first by `created_at`;
 /// capped at 10 replicas so a scaled-out app can't blow the Detail header.
 ///
 /// Returns an empty Vec when there are no replicas (e.g. revision with
@@ -1268,10 +1308,11 @@ fn styled_skeleton_line(
 
 /// Placeholder rows shown for the Container-App meta block while the
 /// `container_app_overview` and/or `revision_meta` caches are still being
-/// populated. Mirrors the structure the real renderer produces once data lands
-/// (rev / image / replicas / containers / env vars / fqdn), so the height the
-/// Detail view reserves stays roughly constant across the load → loaded
-/// transition and the rows below (tags / created / modified) don't jump.
+/// populated. Mirrors the *shape* of the real meta block (rev / image / scale /
+/// container config / env vars / fqdn) so it doesn't pop in from nothing when
+/// data lands. It under-reserves height: the loaded view is taller — the
+/// container-config and instances blocks each span several rows — so the rows
+/// below (tags / created / modified) still shift down somewhat on arrival.
 fn container_app_skeleton_meta_rows() -> Vec<(String, String, String)> {
     const FIELDS: &[&str] = &[
         "rev:",
@@ -1549,15 +1590,26 @@ fn add_selectable_line(sections: &mut Vec<Vec<usize>>, is_head: bool, line_idx: 
     }
 }
 
+/// Replacement modal content for a section, returned by the `modal_override`
+/// passed to [`group_sections`]. `modal_lines` is the (uncapped) body shown on
+/// Enter; `yank` overrides what `y` copies, falling back to the body joined
+/// with newlines when `None`. The split lets a section show explanatory prose
+/// in its modal without that prose leaking into the copied text.
+struct ModalOverride {
+    modal_lines: Vec<String>,
+    yank: Option<String>,
+}
+
 /// Fold a flat list of `(label, value, _)` meta rows into navigable sections:
 /// a non-blank label starts a section, blank-label rows extend the current one
 /// (see [`is_continuation_label`]). Each section becomes one [`SelectableMeta`]
 /// whose modal lists the whole block. `modal_override(title)` may replace a
-/// section's modal body (and yank) with fuller, uncapped content — used to
-/// expand the inline `+N more` preview into every trigger / replica.
+/// section's modal body (and optionally its yank) with fuller, uncapped
+/// content — used to expand the inline `+N more` preview into every trigger /
+/// replica.
 fn group_sections(
     rows: &[(String, String, String)],
-    modal_override: impl Fn(&str) -> Option<Vec<String>>,
+    modal_override: impl Fn(&str) -> Option<ModalOverride>,
 ) -> Vec<SelectableMeta> {
     let mut out: Vec<SelectableMeta> = Vec::new();
     for (label, value, _) in rows {
@@ -1577,9 +1629,9 @@ fn group_sections(
         });
     }
     for m in out.iter_mut() {
-        if let Some(lines) = modal_override(&m.modal_title) {
-            m.yank = lines.join("\n");
-            m.modal_lines = lines;
+        if let Some(ov) = modal_override(&m.modal_title) {
+            m.yank = ov.yank.unwrap_or_else(|| ov.modal_lines.join("\n"));
+            m.modal_lines = ov.modal_lines;
         }
     }
     out
@@ -1621,16 +1673,29 @@ fn trigger_modal_lines(
 fn replicas_modal_lines(
     replicas: &[crate::azure::container_app_replicas::ReplicaInstance],
 ) -> Vec<String> {
-    let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
-        replicas.iter().collect();
-    sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
     // Lead with a one-line reminder that this block is runtime, not config — the
-    // `scale:` / `container config:` rows above describe the desired state.
+    // `scale:` / `container config:` rows above describe the desired state. This
+    // preamble is modal-only chrome; [`replicas_detail_lines`] omits it so `y`
+    // copies the data alone.
     let mut out: Vec<String> = vec![
         "Live replica instances — the pods actually running now".to_string(),
         "(vs. the configured scale / container config above).".to_string(),
         String::new(),
     ];
+    out.extend(replicas_detail_lines(replicas));
+    out
+}
+
+/// The per-replica detail blocks without the explanatory preamble: every replica
+/// (newest first, uncapped) rendered via [`replica_modal_lines`] and separated
+/// by a blank line. This is what `y` copies for the instances section.
+fn replicas_detail_lines(
+    replicas: &[crate::azure::container_app_replicas::ReplicaInstance],
+) -> Vec<String> {
+    let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
+        replicas.iter().collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    let mut out: Vec<String> = Vec::new();
     for (idx, r) in sorted.iter().enumerate() {
         if idx > 0 {
             out.push(String::new());
@@ -1699,7 +1764,12 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         out.extend(group_sections(&replica_lines, |_| {
             cached_replicas
                 .filter(|list| !list.is_empty())
-                .map(|list| replicas_modal_lines(list))
+                .map(|list| ModalOverride {
+                    modal_lines: replicas_modal_lines(list),
+                    // `y` copies the per-replica detail only — the modal's prose
+                    // preamble is on-screen chrome, not data worth pasting.
+                    yank: Some(replicas_detail_lines(list).join("\n")),
+                })
         }));
     }
 
@@ -1716,7 +1786,10 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
         out.extend(group_sections(&trigger_lines, |_| {
             cached_triggers
                 .filter(|list| !list.is_empty())
-                .map(|list| trigger_modal_lines(list))
+                .map(|list| ModalOverride {
+                    modal_lines: trigger_modal_lines(list),
+                    yank: None,
+                })
         }));
     }
 
@@ -1738,7 +1811,10 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
     let general_lines = general_meta_lines(resource, &state.principals);
     out.extend(group_sections(&general_lines, |title| {
         if title == "tags" {
-            Some(tag_modal_lines(resource))
+            Some(ModalOverride {
+                modal_lines: tag_modal_lines(resource),
+                yank: None,
+            })
         } else {
             None
         }
@@ -2665,6 +2741,279 @@ mod tests {
         // 10 replicas × (header + 1 container sub-row) + 1 "+5 more" summary.
         assert_eq!(lines.len(), 21);
         assert!(lines.last().unwrap().1.contains("+5 more"));
+    }
+
+    #[test]
+    fn replica_status_lines_omits_parens_when_running_state_absent() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        let replicas = vec![ReplicaInstance {
+            name: "ca--rev-suffix-abc12".into(),
+            created_at: None,
+            running_state: None,
+            containers: vec![ReplicaContainer {
+                name: "files".into(),
+                ready: Some(true),
+                started: Some(true),
+                restart_count: 0,
+                running_state: None,
+            }],
+        }];
+        let lines = replica_status_lines(Some(&replicas), false, None);
+        // Header carries the suffix but no `(state)` parens when Azure didn't
+        // report a replica-level runningState (avoids an empty `()`).
+        assert!(lines[0].1.contains("\u{2026}abc12"));
+        assert!(
+            !lines[0].1.contains('('),
+            "no empty parens: {:?}",
+            lines[0].1
+        );
+    }
+
+    #[test]
+    fn replica_modal_lines_lists_name_timing_and_containers() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use chrono::TimeZone;
+        let replica = ReplicaInstance {
+            name: "ca--rev-suffix-r58pz".into(),
+            created_at: Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 5, 26, 16, 37, 49)
+                    .unwrap(),
+            ),
+            running_state: Some("Running".into()),
+            containers: vec![
+                ReplicaContainer {
+                    name: "files".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 2,
+                    running_state: Some("Running".into()),
+                },
+                ReplicaContainer {
+                    name: "http-auth".into(),
+                    ready: Some(false),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Waiting".into()),
+                },
+            ],
+        };
+        let lines = replica_modal_lines(&replica);
+        // Full name (not the trimmed suffix), full timestamp, replica-level state.
+        assert!(lines.iter().any(|l| l == "name: ca--rev-suffix-r58pz"));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("created: 2026-05-26 16:37:49 UTC")));
+        assert!(lines.iter().any(|l| l == "running state: Running"));
+        assert!(lines.iter().any(|l| l == "containers:"));
+        // Per-container: readiness glyph + its own restart count + running state.
+        let files = lines.iter().find(|l| l.contains("files")).unwrap();
+        assert!(files.contains('\u{2713}'), "ready glyph: {files:?}");
+        assert!(files.contains("restarts 2"), "restart count: {files:?}");
+        assert!(files.contains("(Running)"), "container state: {files:?}");
+        let auth = lines.iter().find(|l| l.contains("http-auth")).unwrap();
+        assert!(auth.contains('\u{2717}'), "not-ready glyph: {auth:?}");
+        assert!(auth.contains("(Waiting)"), "container state: {auth:?}");
+    }
+
+    #[test]
+    fn replicas_modal_keeps_preamble_but_detail_lines_drop_it() {
+        use crate::azure::container_app_replicas::ReplicaInstance;
+        use chrono::TimeZone;
+        let older = ReplicaInstance {
+            name: "ca--rev-older".into(),
+            created_at: Some(chrono::Utc.with_ymd_and_hms(2026, 5, 26, 10, 0, 0).unwrap()),
+            running_state: Some("Running".into()),
+            containers: vec![],
+        };
+        let newer = ReplicaInstance {
+            name: "ca--rev-newer".into(),
+            created_at: Some(chrono::Utc.with_ymd_and_hms(2026, 5, 26, 12, 0, 0).unwrap()),
+            running_state: Some("Running".into()),
+            containers: vec![],
+        };
+        let modal = replicas_modal_lines(&[older.clone(), newer.clone()]);
+        // Modal leads with the runtime-vs-config prose.
+        assert!(modal[0].contains("Live replica instances"));
+        // Newest replica precedes the older one.
+        let pos_newer = modal
+            .iter()
+            .position(|l| l.contains("ca--rev-newer"))
+            .unwrap();
+        let pos_older = modal
+            .iter()
+            .position(|l| l.contains("ca--rev-older"))
+            .unwrap();
+        assert!(pos_newer < pos_older, "newest-first ordering");
+
+        // The detail-only helper (what `y` copies) omits the prose entirely.
+        let detail = replicas_detail_lines(&[older, newer]);
+        assert!(!detail.iter().any(|l| l.contains("Live replica instances")));
+        assert!(detail.iter().any(|l| l.contains("ca--rev-newer")));
+    }
+
+    #[test]
+    fn instances_section_yank_excludes_prose_but_modal_keeps_it() {
+        use crate::azure::container_app_overview::ContainerAppOverview;
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        let mut state = fixture_no_metrics();
+        state.resources[0].kind = ResourceKind::ContainerApp;
+        let res = state.resources[0].clone();
+        // Both caches present so the meta + replica blocks build (not skeleton).
+        state
+            .revision_meta
+            .by_resource
+            .insert(res.id.clone(), ActiveRevisionMeta::default());
+        state
+            .container_app_overview
+            .by_resource
+            .insert(res.id.clone(), ContainerAppOverview::default());
+        state.replica_instances.by_resource.insert(
+            res.id.clone(),
+            vec![ReplicaInstance {
+                name: "ca--rev-r58pz".into(),
+                created_at: None,
+                running_state: Some("Running".into()),
+                containers: vec![ReplicaContainer {
+                    name: "files".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                }],
+            }],
+        );
+        let metas = selectable_metas(&state, &res);
+        let inst = metas
+            .iter()
+            .find(|m| m.modal_title == "instances")
+            .expect("instances section present");
+        // Modal body keeps the explanatory preamble…
+        assert!(inst
+            .modal_lines
+            .iter()
+            .any(|l| l.contains("Live replica instances")));
+        // …but the yank is data-only, per SelectableMeta's "plain value" contract.
+        assert!(
+            !inst.yank.contains("Live replica instances"),
+            "yank leaked prose: {:?}",
+            inst.yank
+        );
+        assert!(inst.yank.contains("ca--rev-r58pz"));
+    }
+
+    #[test]
+    fn container_app_detail_renders_all_sections_and_scrolls_to_cursor() {
+        // Loaded Container App with the richest header (multi-row container-config
+        // + instances blocks + tags). Guards two things at once: render builds the
+        // same sections selectable_metas counts (the handler clamps the cursor
+        // against that count), and the context pane scrolls so a low section under
+        // the cursor is actually visible on a short terminal.
+        use crate::azure::container_app_overview::{ContainerAppOverview, ContainerSpec};
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::azure::resources::ResourceMeta;
+        let theme = Theme::catppuccin_mocha();
+        let mut state = fixture_no_metrics();
+        state.resources[0].kind = ResourceKind::ContainerApp;
+        // A tag gives us a low general section to scroll to.
+        state.resources[0].meta = ResourceMeta {
+            tags: vec![("Domain".into(), "files".into())],
+            ..Default::default()
+        };
+        let res = state.resources[0].clone();
+        state.revision_meta.by_resource.insert(
+            res.id.clone(),
+            ActiveRevisionMeta {
+                name: "files--0000004".into(),
+                image: Some("acr/files:abc".into()),
+                replicas: 1,
+                min_replicas: 1,
+                max_replicas: 10,
+            },
+        );
+        state.container_app_overview.by_resource.insert(
+            res.id.clone(),
+            ContainerAppOverview {
+                cpu_millicores: 500,
+                memory_bytes: 512 * 1024 * 1024,
+                fqdn: Some("files.example.azurecontainerapps.io".into()),
+                ingress_external: Some(true),
+                containers: vec![
+                    ContainerSpec {
+                        name: "files".into(),
+                        image: Some("acr/files:abc".into()),
+                        cpu_millicores: 250,
+                        memory_bytes: 256 * 1024 * 1024,
+                        ephemeral_storage: Some("2Gi".into()),
+                        env_vars: Vec::new(),
+                        is_init: false,
+                    },
+                    ContainerSpec {
+                        name: "http-auth".into(),
+                        image: Some("acr/http-auth:abc".into()),
+                        cpu_millicores: 250,
+                        memory_bytes: 256 * 1024 * 1024,
+                        ephemeral_storage: None,
+                        env_vars: Vec::new(),
+                        is_init: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        state.replica_instances.by_resource.insert(
+            res.id.clone(),
+            vec![ReplicaInstance {
+                name: "files--0000004-abc-r58pz".into(),
+                created_at: None,
+                running_state: Some("Running".into()),
+                containers: vec![
+                    ReplicaContainer {
+                        name: "files".into(),
+                        ready: Some(true),
+                        started: Some(true),
+                        restart_count: 0,
+                        running_state: Some("Running".into()),
+                    },
+                    ReplicaContainer {
+                        name: "http-auth".into(),
+                        ready: Some(true),
+                        started: Some(true),
+                        restart_count: 0,
+                        running_state: Some("Running".into()),
+                    },
+                ],
+            }],
+        );
+
+        let count = selectable_metas(&state, &res).len();
+        assert!(
+            count >= 4,
+            "state + meta + instances + tags at minimum, got {count}"
+        );
+
+        // Short terminal so the rich CA overflows the context pane.
+        let backend = TestBackend::new(80, 22);
+        let mut term = Terminal::new(backend).unwrap();
+        state.view = View::Detail;
+
+        // Cursor on the last section (the tags row, well below the fold): the
+        // scroll offset must pull it into view. Without it this row clips.
+        state.detail_view.cursor = count - 1;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let bottom = format!("{:?}", term.backend().buffer());
+        assert!(
+            bottom.contains("Domain"),
+            "last section scrolled into view: {bottom}"
+        );
+
+        // Cursor at the top: the upper meta rows are visible (scroll resets to 0).
+        state.detail_view.cursor = 0;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let top = format!("{:?}", term.backend().buffer());
+        assert!(top.contains("rev:"), "top sections visible: {top}");
     }
 
     #[test]
