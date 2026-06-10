@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::service_bus::ServiceBusNamespace;
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
@@ -105,12 +106,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Some(_) => {
             let show_sub_cols = state.selected_subscription.is_none();
 
-            let name_w = filtered
+            // NAME absorbs the leftover width; on a narrow terminal it caps to
+            // the budget and truncates with an ellipsis (see `build_row`) rather
+            // than the table clipping it silently. `fixed_w` sums the Length()s
+            // below — keep them in sync.
+            let fixed_w: u16 = 10 + 10 + 22 + 10 + if show_sub_cols { 22 } else { 0 } + 14;
+            let n_cols: u16 = if show_sub_cols { 7 } else { 6 };
+            let longest = filtered
                 .iter()
                 .map(|n| n.name.chars().count() as u16)
                 .max()
-                .unwrap_or(0)
-                .max(4);
+                .unwrap_or(0);
+            let name_w = name_col_width(body_area.width, fixed_w, n_cols, longest);
 
             let mut widths: Vec<Constraint> = vec![
                 Constraint::Length(name_w), // NAME
@@ -137,7 +144,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.service_bus.namespaces_cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|ns| build_row(ns, state, show_sub_cols, theme))
+                .map(|ns| build_row(ns, state, show_sub_cols, name_w, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -159,6 +166,7 @@ fn build_row<'a>(
     ns: &'a ServiceBusNamespace,
     state: &'a AppState,
     show_sub_cols: bool,
+    name_w: u16,
     theme: &Theme,
 ) -> Row<'a> {
     let status = match ns.status.as_deref() {
@@ -167,7 +175,8 @@ fn build_row<'a>(
         None => Cell::from("?").style(Style::default().fg(theme.muted)),
     };
     let mut cells: Vec<Cell> = vec![
-        Cell::from(ns.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&ns.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         Cell::from(ns.sku.as_deref().unwrap_or("—").to_string())
             .style(Style::default().fg(theme.fg)),
         status,

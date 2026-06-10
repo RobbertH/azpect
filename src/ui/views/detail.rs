@@ -339,6 +339,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let is_head = !is_continuation_label(&label);
         let line = if meta_is_skeleton {
             styled_skeleton_line(label, value, theme)
+        } else if label == CA_ISSUE_LABEL {
+            // Platform error for a failed revision — paint it critical, like the
+            // badge, so "what went wrong" reads as a problem and not a fact.
+            styled_meta_line_valued(label, value, theme.critical, theme)
+        } else if label == CA_STATUS_LABEL {
+            let color = revision_state_color(&value, theme);
+            styled_meta_line_valued(label, value, color, theme)
         } else {
             styled_meta_line(label, value, theme)
         };
@@ -681,6 +688,14 @@ fn short_missing_reason(reason: &str) -> String {
     }
 }
 
+/// Meta-row labels for a failing active revision (running status + the
+/// platform's error detail). Kept as consts so [`container_app_meta_lines`]
+/// (the producer) and [`render`]'s colour branch can't drift — both match on
+/// these exact strings to paint the rows in the badge's severity colour rather
+/// than the neutral accent every other meta row uses.
+const CA_STATUS_LABEL: &str = "status:";
+const CA_ISSUE_LABEL: &str = "issue:";
+
 /// Build the Container-App-only meta lines that sit below `state:` in the
 /// Detail header. Each entry is `(label, value, plain_text)`: the first two
 /// drive styled rendering (bold muted label + accent value), the third is the
@@ -700,6 +715,25 @@ fn container_app_meta_lines(
     if let Some(m) = revision_meta {
         if !m.name.is_empty() {
             out.push(("rev:".into(), m.name.clone(), format!("rev: {}", m.name)));
+        }
+        // Surface a failing revision right under its name, the way the portal's
+        // "Revisions with Issues" table does: the running status, then the
+        // platform's "running status details". Skipped entirely for a healthy
+        // `Running` revision so steady-state apps stay uncluttered. These two
+        // labels are colour-keyed by [`render`]'s meta loop.
+        if !m.running_state.is_empty() && m.running_state != "Running" {
+            out.push((
+                CA_STATUS_LABEL.into(),
+                m.running_state.clone(),
+                format!("{CA_STATUS_LABEL} {}", m.running_state),
+            ));
+        }
+        if let Some(err) = &m.provisioning_error {
+            out.push((
+                CA_ISSUE_LABEL.into(),
+                err.clone(),
+                format!("{CA_ISSUE_LABEL} {err}"),
+            ));
         }
         if let Some(img) = &m.image {
             // The header shows the primary container's image. When the revision
@@ -1285,6 +1319,27 @@ fn styled_meta_line(
     ])
 }
 
+/// Same shape as [`styled_meta_line`] but with a caller-chosen value colour.
+/// Used for the failing-revision `status:` / `issue:` rows so a broken Container
+/// App's reason reads in the health badge's red, not the neutral accent.
+fn styled_meta_line_valued(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_color: Color,
+    theme: &Theme,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            label.into(),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(value.into(), Style::default().fg(value_color)),
+    ])
+}
+
 /// Same shape as [`styled_meta_line`] but the value is rendered in `theme.muted`
 /// rather than `theme.accent`. Used for "loading…" placeholders so the layout
 /// reserves space ahead of the real data arriving without those rows screaming
@@ -1564,6 +1619,19 @@ fn state_color(state: &str, theme: &Theme) -> Color {
         "Suspended" => theme.degraded,
         "Starting" | "Stopping" | "Progressing" => theme.accent,
         _ => theme.muted,
+    }
+}
+
+/// Colour for a revision `runningState` shown on the Detail `status:` row.
+/// Terminal failures read critical (matching the health badge that drove the
+/// user here); transient in-progress states read degraded. `Running` never
+/// reaches this — [`container_app_meta_lines`] only emits the row for abnormal
+/// states — so the accent fallback is just defensive.
+fn revision_state_color(running_state: &str, theme: &Theme) -> Color {
+    match running_state {
+        "ActivationFailed" | "Failed" | "Stopped" | "Degraded" => theme.critical,
+        "Processing" | "Activating" | "Unknown" => theme.degraded,
+        _ => theme.accent,
     }
 }
 
@@ -2322,6 +2390,7 @@ mod tests {
             replicas: 2,
             min_replicas: 1,
             max_replicas: 10,
+            ..Default::default()
         };
         let limits = ContainerAppOverview {
             cpu_millicores: 500,
@@ -2341,6 +2410,45 @@ mod tests {
         assert_eq!(lines[2].1, "2 of 1\u{2013}10");
         assert_eq!(lines[3].1, "files-api.example.azurecontainerapps.io");
         assert_eq!(lines[4].1, "external ingress (public)");
+    }
+
+    #[test]
+    fn container_app_meta_surfaces_failing_revision_status_and_error() {
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        let meta = ActiveRevisionMeta {
+            name: "edc-api--0000005".into(),
+            running_state: "ActivationFailed".into(),
+            provisioning_error: Some(
+                "Deployment Progress Deadline Exceeded. 0/1 replicas ready.".into(),
+            ),
+            ..Default::default()
+        };
+        let lines = container_app_meta_lines(Some(&meta), None);
+        let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
+        // status + issue land right under rev:, before scale: — mirroring the
+        // portal's "Revisions with Issues" running-status / details columns.
+        assert_eq!(labels, vec!["rev:", "status:", "issue:", "scale:"]);
+        assert_eq!(lines[1].1, "ActivationFailed");
+        assert_eq!(
+            lines[2].1,
+            "Deployment Progress Deadline Exceeded. 0/1 replicas ready."
+        );
+    }
+
+    #[test]
+    fn container_app_meta_omits_status_and_issue_when_healthy() {
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        let meta = ActiveRevisionMeta {
+            name: "edc-api--0000006".into(),
+            running_state: "Running".into(),
+            provisioning_error: None,
+            ..Default::default()
+        };
+        let labels: Vec<String> = container_app_meta_lines(Some(&meta), None)
+            .into_iter()
+            .map(|(l, _, _)| l)
+            .collect();
+        assert!(!labels.iter().any(|l| l == "status:" || l == "issue:"));
     }
 
     #[test]
@@ -2424,6 +2532,7 @@ mod tests {
             replicas: 1,
             min_replicas: 0,
             max_replicas: 0,
+            ..Default::default()
         };
         let lines = container_app_meta_lines(Some(&meta), None);
         let labels: Vec<&str> = lines.iter().map(|(l, _, _)| l.as_str()).collect();
@@ -2590,6 +2699,7 @@ mod tests {
             replicas: 1,
             min_replicas: 1,
             max_replicas: 1,
+            ..Default::default()
         };
         let limits = ContainerAppOverview {
             containers: vec![
@@ -2931,6 +3041,7 @@ mod tests {
                 replicas: 1,
                 min_replicas: 1,
                 max_replicas: 10,
+                ..Default::default()
             },
         );
         state.container_app_overview.by_resource.insert(
@@ -3183,9 +3294,18 @@ mod tests {
     }
 
     #[test]
-    fn open_logs_apim_blocks() {
+    fn open_logs_apim_transitions() {
+        // APIM gateway request logs are supported, so `l` opens the logs view.
         let mut state = fixture_no_metrics();
         state.resources[0].kind = ResourceKind::Apim;
+        assert!(handle(Action::OpenLogs, &mut state));
+        assert_eq!(state.view, View::Logs);
+    }
+
+    #[test]
+    fn open_logs_appgw_blocks() {
+        let mut state = fixture_no_metrics();
+        state.resources[0].kind = ResourceKind::AppGateway;
         assert!(handle(Action::OpenLogs, &mut state));
         assert_eq!(state.view, View::Detail);
         assert!(state.status_message.is_some());

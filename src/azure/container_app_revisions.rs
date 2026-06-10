@@ -32,6 +32,17 @@ pub struct ActiveRevisionMeta {
     /// Zero means "not set" (KEDA default applies on the server side).
     pub min_replicas: u32,
     pub max_replicas: u32,
+    /// Revision `properties.runningState` (`Running`, `Processing`,
+    /// `Activating`, `ActivationFailed`, `Stopped`, `Failed`, `Degraded`,
+    /// `Unknown`). The Detail page surfaces it whenever it isn't the healthy
+    /// steady `Running` so the user can see *why* the badge is red without
+    /// hopping to the portal. Empty when the API omits it.
+    pub running_state: String,
+    /// Platform error for a failed revision (`properties.provisioningError`) —
+    /// the portal's "Running status details", e.g. "Deployment Progress
+    /// Deadline Exceeded. 0/1 replicas ready." `None` when the revision
+    /// provisioned cleanly.
+    pub provisioning_error: Option<String>,
 }
 
 /// Composite result of `fetch` — the availability signal AND the display meta.
@@ -122,12 +133,26 @@ pub fn derive_active_revision(value: &serde_json::Value) -> Option<ActiveRevisio
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
+    let running_state = props
+        .get("runningState")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let provisioning_error = props
+        .get("provisioningError")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
     Some(ActiveRevisionMeta {
         name,
         image,
         replicas,
         min_replicas,
         max_replicas,
+        running_state,
+        provisioning_error,
     })
 }
 
@@ -417,5 +442,46 @@ mod tests {
         let meta = derive_active_revision(&payload).expect("expected active meta");
         assert_eq!(meta.min_replicas, 0);
         assert_eq!(meta.max_replicas, 0);
+    }
+
+    #[test]
+    fn active_revision_meta_carries_running_state_and_provisioning_error() {
+        let payload = json!({ "value": [{
+            "name": "edc-api--0000005",
+            "properties": {
+                "active": true,
+                "createdTime": "2026-05-27T14:05:11Z",
+                "runningState": "ActivationFailed",
+                "provisioningError": "Deployment Progress Deadline Exceeded. 0/1 replicas ready.",
+                "replicas": 0,
+                "template": { "containers": [{ "image": "edc-api:abc" }] }
+            }
+        }]});
+        let meta = derive_active_revision(&payload).expect("expected active meta");
+        assert_eq!(meta.running_state, "ActivationFailed");
+        assert_eq!(
+            meta.provisioning_error.as_deref(),
+            Some("Deployment Progress Deadline Exceeded. 0/1 replicas ready.")
+        );
+    }
+
+    #[test]
+    fn active_revision_meta_clean_revision_has_no_provisioning_error() {
+        // A healthy revision: runningState present, provisioningError absent or
+        // blank → `None`, so the Detail page shows no failure callout.
+        let payload = json!({ "value": [{
+            "name": "edc-api--0000006",
+            "properties": {
+                "active": true,
+                "createdTime": "2026-05-28T00:00:00Z",
+                "runningState": "Running",
+                "provisioningError": "",
+                "replicas": 1,
+                "template": { "containers": [{ "image": "edc-api:def" }] }
+            }
+        }]});
+        let meta = derive_active_revision(&payload).expect("expected active meta");
+        assert_eq!(meta.running_state, "Running");
+        assert_eq!(meta.provisioning_error, None);
     }
 }

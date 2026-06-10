@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::key_vault::KeyVault;
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
@@ -108,12 +109,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Some(_) => {
             let show_sub_cols = state.selected_subscription.is_none();
 
-            let name_w = filtered
+            // NAME gets whatever width is left after the fixed columns; on a
+            // narrow terminal it shrinks and the name truncates *with* an
+            // ellipsis (see `name`/`build_row`) rather than the table silently
+            // clipping it. `fixed_w` is the sum of the Length()s below; keep the
+            // two in sync.
+            let fixed_w: u16 = 9 + 6 + 6 + 10 + 22 + if show_sub_cols { 22 } else { 0 } + 14;
+            let n_cols: u16 = if show_sub_cols { 8 } else { 7 };
+            let longest = filtered
                 .iter()
                 .map(|v| v.name.chars().count() as u16)
                 .max()
-                .unwrap_or(0)
-                .max(4);
+                .unwrap_or(0);
+            let name_w = name_col_width(body_area.width, fixed_w, n_cols, longest);
 
             let mut widths: Vec<Constraint> = vec![
                 Constraint::Length(name_w), // NAME
@@ -147,7 +155,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.key_vault.vaults_cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|vault| build_row(vault, state, show_sub_cols, theme))
+                .map(|vault| build_row(vault, state, show_sub_cols, name_w, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -169,6 +177,7 @@ fn build_row<'a>(
     vault: &'a KeyVault,
     state: &'a AppState,
     show_sub_cols: bool,
+    name_w: u16,
     theme: &Theme,
 ) -> Row<'a> {
     let auth = match vault.rbac_authorization_enabled {
@@ -188,7 +197,8 @@ fn build_row<'a>(
         None => Cell::from("?").style(Style::default().fg(theme.muted)),
     };
     let mut cells: Vec<Cell> = vec![
-        Cell::from(vault.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&vault.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         Cell::from(vault.sku.as_deref().unwrap_or("—").to_string())
             .style(Style::default().fg(theme.muted)),
         auth,
@@ -356,6 +366,27 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("myvault"), "name should render");
         assert!(buf.contains("RBAC"), "auth model should render");
+    }
+
+    #[test]
+    fn long_name_truncates_with_ellipsis_on_narrow_terminal() {
+        let theme = Theme::catppuccin_mocha();
+        // Too narrow for the full name once the fixed columns take their share —
+        // the squeeze the user hit on a half-width terminal.
+        let backend = TestBackend::new(90, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.key_vault.vaults = Some(vec![vault("kv-adp-onefab-egress-prod1")]);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(
+            buf.contains('\u{2026}'),
+            "a clipped name must show an ellipsis, not a silent cut"
+        );
+        assert!(
+            !buf.contains("kv-adp-onefab-egress-prod1"),
+            "the full over-long name should not render"
+        );
     }
 
     #[test]

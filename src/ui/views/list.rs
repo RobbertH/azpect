@@ -1162,10 +1162,22 @@ mod tests {
     }
 
     #[test]
-    fn open_logs_blocks_apim() {
+    fn open_logs_allows_apim() {
         let mut state = fixture();
         state.view = View::List;
-        // cursor 0 is FunctionApp (supports logs); cursor 1 is APIM (not).
+        // cursor 1 is APIM — its gateway request logs are supported.
+        state.list_cursor = 1;
+        assert!(handle(Action::OpenLogs, &mut state));
+        assert_eq!(state.view, View::Logs);
+    }
+
+    #[test]
+    fn open_logs_blocks_unsupported_kind() {
+        let mut state = fixture();
+        state.view = View::List;
+        // Application Gateway has no log template — opening logs must no-op
+        // with a status message rather than transition.
+        state.resources[1].kind = ResourceKind::AppGateway;
         state.list_cursor = 1;
         assert!(handle(Action::OpenLogs, &mut state));
         assert_eq!(state.view, View::List);

@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::cosmos::CosmosAccount;
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
@@ -106,12 +107,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Some(_) => {
             let show_sub_cols = state.selected_subscription.is_none();
 
-            let name_w = filtered
+            // NAME absorbs the leftover width; on a narrow terminal it caps to
+            // the budget and truncates with an ellipsis (see `build_row`) rather
+            // than the table clipping it silently. `fixed_w` sums the Length()s
+            // below — keep them in sync.
+            let fixed_w: u16 = 11 + 10 + 22 + 10 + if show_sub_cols { 22 } else { 0 } + 14;
+            let n_cols: u16 = if show_sub_cols { 7 } else { 6 };
+            let longest = filtered
                 .iter()
                 .map(|a| a.name.chars().count() as u16)
                 .max()
-                .unwrap_or(0)
-                .max(4);
+                .unwrap_or(0);
+            let name_w = name_col_width(body_area.width, fixed_w, n_cols, longest);
 
             let mut widths: Vec<Constraint> = vec![
                 Constraint::Length(name_w), // NAME
@@ -138,7 +145,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.cosmos.accounts_cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|acc| build_row(acc, state, show_sub_cols, theme))
+                .map(|acc| build_row(acc, state, show_sub_cols, name_w, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -160,6 +167,7 @@ fn build_row<'a>(
     acc: &'a CosmosAccount,
     state: &'a AppState,
     show_sub_cols: bool,
+    name_w: u16,
     theme: &Theme,
 ) -> Row<'a> {
     let mode = if acc.is_serverless {
@@ -173,7 +181,8 @@ fn build_row<'a>(
         None => Cell::from("?").style(Style::default().fg(theme.muted)),
     };
     let mut cells: Vec<Cell> = vec![
-        Cell::from(acc.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&acc.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         mode,
         public,
         Cell::from(acc.resource_group.as_str()).style(Style::default().fg(theme.muted)),

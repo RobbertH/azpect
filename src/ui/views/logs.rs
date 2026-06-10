@@ -677,10 +677,12 @@ fn local_tz_label() -> String {
 }
 
 fn level_cell(line: &LogLine, theme: &Theme) -> (String, Color) {
-    // For Function App requests, the source typically encodes a status; if the
-    // message starts with a 3-digit status code we surface that instead of the
-    // generic level.
-    if line.source.eq_ignore_ascii_case("AppRequests") {
+    // For request-shaped sources (Function App `AppRequests`, APIM gateway
+    // logs) the message leads with the HTTP status code; surface that in the
+    // level column instead of the generic ERR/WARN/INFO.
+    if line.source.eq_ignore_ascii_case("AppRequests")
+        || line.source.eq_ignore_ascii_case("ApiManagementGatewayLogs")
+    {
         if let Some(code) = extract_status(&line.message) {
             let color = match code {
                 100..=299 => theme.healthy,
@@ -1119,14 +1121,45 @@ mod tests {
     }
 
     #[test]
-    fn renders_apim_unsupported() {
+    fn renders_appgw_unsupported() {
         let theme = Theme::catppuccin_mocha();
         let backend = TestBackend::new(80, 12);
         let mut term = Terminal::new(backend).unwrap();
-        let state = fixture(ResourceKind::Apim);
+        let state = fixture(ResourceKind::AppGateway);
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
-        assert!(s.contains("APIM"));
+        assert!(s.contains("AppGW"));
+    }
+
+    #[test]
+    fn renders_apim_request_rows() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::Apim);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(
+                    1,
+                    LogLevel::Info,
+                    "ApiManagementGatewayLogs",
+                    "200 GET /echo/resource  ·  22ms",
+                ),
+                line(
+                    2,
+                    LogLevel::Error,
+                    "ApiManagementGatewayLogs",
+                    "502 POST /orders  ·  31ms",
+                ),
+            ],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        // Status codes surface in the level column; paths in the message.
+        assert!(s.contains("200"));
+        assert!(s.contains("502"));
+        assert!(s.contains("/echo/resource"));
     }
 
     #[test]

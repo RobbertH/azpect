@@ -40,10 +40,13 @@ pub struct LogLine {
     pub fields: Vec<(String, String)>,
 }
 
-/// Whether we know how to query logs for this resource type. APIM and
-/// Application Gateway are `false` in v1.
+/// Whether we know how to query logs for this resource type. Application
+/// Gateway is `false` — it has no resource-centric request-log template yet.
 pub fn supports_logs(kind: ResourceKind) -> bool {
-    matches!(kind, ResourceKind::FunctionApp | ResourceKind::ContainerApp)
+    matches!(
+        kind,
+        ResourceKind::FunctionApp | ResourceKind::ContainerApp | ResourceKind::Apim
+    )
 }
 
 /// KQL for opening this resource's logs in the Azure Monitor **Logs blade** of
@@ -68,6 +71,12 @@ pub fn portal_query(resource: &Resource, lines: &[LogLine]) -> Option<String> {
              | order by TimeGenerated desc",
             name = resource.name,
         )),
+        // APIM gateway request logs are resource-scoped (the service's own
+        // diagnostic settings forward them), so the blade opens on the APIM
+        // resource scope — no name filter needed.
+        ResourceKind::Apim => {
+            Some("ApiManagementGatewayLogs\n| order by TimeGenerated desc".to_string())
+        }
         _ => None,
     }
 }
@@ -170,6 +179,29 @@ pub const KQL_CONTAINER_APP_ERRORS_FILTER: &str = r#"
      or column_ifexists("Log", "") matches regex @"(?i)\b(error|exception|fatal|panic|stack)\b"
 "#;
 
+/// APIM gateway request log. Every request that transits the gateway lands in
+/// `ApiManagementGatewayLogs` (resource-specific schema) when the service has
+/// diagnostic settings forwarding to a workspace. Wrapped in a single-operand
+/// `union isfuzzy=true` so that a service with NO diagnostic settings (the
+/// table doesn't exist in the workspace) fails with SEM0529 rather than a bare
+/// "failed to resolve table" — [`crate::ui::views::logs::friendly_log_error`]
+/// folds SEM0529 into the actionable "configure diagnostic settings" hint.
+pub const KQL_APIM: &str = r#"
+union isfuzzy=true ApiManagementGatewayLogs
+| order by TimeGenerated desc
+| take {limit}
+"#;
+
+/// Errors-only filter for APIM: any 4xx/5xx at the gateway or backend, plus
+/// gateway-level failures that never produced a response code (`ResponseCode`
+/// 0 with `IsRequestSuccess == false`). `column_ifexists` keeps the query valid
+/// even on the rare workspace where one of these columns is absent.
+pub const KQL_APIM_ERRORS_FILTER: &str = r#"
+| where column_ifexists("ResponseCode", int(0)) >= 400
+     or column_ifexists("BackendResponseCode", int(0)) >= 400
+     or column_ifexists("IsRequestSuccess", true) == false
+"#;
+
 /// Maximum length of `LogLine.message` before truncation.
 const MESSAGE_TRUNCATE: usize = 500;
 
@@ -262,7 +294,8 @@ fn build_kql(
             container_app_kql(&resource.name),
             KQL_CONTAINER_APP_ERRORS_FILTER,
         ),
-        ResourceKind::Apim | ResourceKind::AppGateway => {
+        ResourceKind::Apim => (KQL_APIM.to_string(), KQL_APIM_ERRORS_FILTER),
+        ResourceKind::AppGateway => {
             return Err(anyhow!(
                 "logs not supported for {:?} in v1 (no resource-centric Log Analytics template)",
                 resource.kind
@@ -382,9 +415,10 @@ fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) 
     let (level, source, message) = match kind {
         ResourceKind::FunctionApp => parse_function_app_row(columns, cells),
         ResourceKind::ContainerApp => parse_container_app_row(columns, cells),
-        // Unreachable in practice — supports_logs() filters these out
+        ResourceKind::Apim => parse_apim_row(columns, cells),
+        // Unreachable in practice — supports_logs() filters this out
         // before fetch() is ever called.
-        ResourceKind::Apim | ResourceKind::AppGateway => return None,
+        ResourceKind::AppGateway => return None,
     };
 
     let message = truncate(message, MESSAGE_TRUNCATE);
@@ -564,6 +598,109 @@ fn parse_container_app_row(
     (level, source, log)
 }
 
+/// Render one `ApiManagementGatewayLogs` row as a request line:
+/// `<status> <METHOD> <path>  ·  <total>ms (backend <n>ms)`, with the gateway
+/// failure reason appended when the request didn't succeed. The leading status
+/// code lets the logs view surface it in the level column (same treatment as
+/// Function App `AppRequests`); every raw column is still preserved in
+/// `LogLine::fields` for the detail view.
+fn parse_apim_row(columns: &[&str], cells: &[serde_json::Value]) -> (LogLevel, String, String) {
+    let method = cell(columns, cells, "Method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = cell(columns, cells, "Url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let path = request_path(url);
+
+    // Only treat a value as a status code if it's a real HTTP code. A failed
+    // request that never reached the backend logs `ResponseCode` 0, which we'd
+    // rather show as a generic error than as a bogus "0" status.
+    let code = cell_num(columns, cells, "ResponseCode").filter(|c| *c >= 100);
+    let total_ms = cell_num(columns, cells, "TotalTime");
+    let backend_ms = cell_num(columns, cells, "BackendTime");
+    let success = cell(columns, cells, "IsRequestSuccess")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let level = match code {
+        Some(c) if c >= 500 => LogLevel::Error,
+        Some(c) if c >= 400 => LogLevel::Warn,
+        Some(_) => {
+            if success {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            }
+        }
+        // No usable status: a gateway-level failure (e.g. backend unreachable)
+        // reads as an error; an inexplicably-missing code on a success is Info.
+        None => {
+            if success {
+                LogLevel::Info
+            } else {
+                LogLevel::Error
+            }
+        }
+    };
+
+    let mut message = String::new();
+    if let Some(c) = code {
+        message.push_str(&format!("{c} "));
+    }
+    if !method.is_empty() {
+        message.push_str(&method);
+        message.push(' ');
+    }
+    message.push_str(if path.is_empty() { "/" } else { &path });
+    if let Some(total) = total_ms {
+        message.push_str(&format!("  ·  {total}ms"));
+        if let Some(backend) = backend_ms {
+            message.push_str(&format!(" (backend {backend}ms)"));
+        }
+    }
+    if !success {
+        if let Some(reason) = cell(columns, cells, "LastErrorReason")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            message.push_str(&format!("  ·  {reason}"));
+        }
+    }
+
+    (
+        level,
+        "ApiManagementGatewayLogs".to_string(),
+        message.trim_end().to_string(),
+    )
+}
+
+/// Strip scheme + host from the APIM `Url` column so only the request path (and
+/// query) is shown. Returns the input unchanged when it's already a bare path
+/// or doesn't parse as an absolute URL.
+fn request_path(url: &str) -> String {
+    match url.find("://") {
+        Some(idx) => {
+            let after_scheme = &url[idx + 3..];
+            match after_scheme.find('/') {
+                Some(slash) => after_scheme[slash..].to_string(),
+                // URL with a host but no path component.
+                None => "/".to_string(),
+            }
+        }
+        None => url.to_string(),
+    }
+}
+
+/// Read a numeric Log Analytics cell as an `i64`, tolerating both integer and
+/// real (`22.0`) encodings — APIM timing columns can come back either way.
+fn cell_num(columns: &[&str], cells: &[serde_json::Value], name: &str) -> Option<i64> {
+    let v = cell(columns, cells, name)?;
+    v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64))
+}
+
 fn truncate(s: String, max: usize) -> String {
     if s.len() <= max {
         return s;
@@ -648,7 +785,15 @@ mod tests {
 
     #[test]
     fn portal_query_none_for_unsupported_kinds() {
-        assert!(portal_query(&test_resource(ResourceKind::Apim, "svc"), &[]).is_none());
+        assert!(portal_query(&test_resource(ResourceKind::AppGateway, "agw"), &[]).is_none());
+    }
+
+    #[test]
+    fn portal_query_apim_targets_gateway_logs() {
+        let r = test_resource(ResourceKind::Apim, "svc");
+        let q = portal_query(&r, &[]).expect("APIM has a portal query");
+        assert!(q.contains("ApiManagementGatewayLogs"));
+        assert!(!q.contains("take"));
     }
 
     #[test]
@@ -670,9 +815,114 @@ mod tests {
     }
 
     #[test]
-    fn apim_kql_returns_err() {
+    fn apim_kql_queries_gateway_logs() {
         let r = test_resource(ResourceKind::Apim, "apim");
+        let kql = build_kql(&r, false, None).unwrap();
+        assert!(kql.contains("ApiManagementGatewayLogs"));
+        assert!(kql.contains("isfuzzy=true"));
+        assert!(kql.contains(&format!("take {PAGE_SIZE}")));
+    }
+
+    #[test]
+    fn apim_errors_filter_inserted_before_order_by() {
+        let r = test_resource(ResourceKind::Apim, "apim");
+        let kql = build_kql(&r, true, None).unwrap();
+        let order_idx = kql.find("| order by").expect("order by present");
+        let filter_idx = kql
+            .find(r#"column_ifexists("ResponseCode", int(0)) >= 400"#)
+            .expect("errors filter present");
+        assert!(filter_idx < order_idx, "filter must come before order by");
+    }
+
+    #[test]
+    fn appgw_kql_returns_err() {
+        let r = test_resource(ResourceKind::AppGateway, "agw");
         assert!(build_kql(&r, false, None).is_err());
+    }
+
+    #[test]
+    fn parses_apim_request_rows() {
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Method", "type": "string" },
+                    { "name": "Url", "type": "string" },
+                    { "name": "ResponseCode", "type": "int" },
+                    { "name": "BackendTime", "type": "int" },
+                    { "name": "TotalTime", "type": "int" },
+                    { "name": "IsRequestSuccess", "type": "bool" },
+                    { "name": "LastErrorReason", "type": "string" }
+                ],
+                "rows": [
+                    [ "2026-01-01T00:00:00Z", "GET", "https://svc.azure-api.net/echo/resource?x=1", 200, 14, 22, true, "" ],
+                    [ "2026-01-01T00:00:01Z", "POST", "https://svc.azure-api.net/orders", 502, 0, 31, false, "BackendConnectionFailure" ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::Apim).unwrap();
+        assert_eq!(lines.len(), 2);
+
+        assert_eq!(lines[0].level, LogLevel::Info);
+        assert_eq!(lines[0].source, "ApiManagementGatewayLogs");
+        // Status leads the message (level column reads it); host is stripped.
+        assert!(lines[0].message.starts_with("200 GET /echo/resource?x=1"));
+        assert!(lines[0].message.contains("22ms"));
+        assert!(lines[0].message.contains("backend 14ms"));
+        // Every column is preserved for the detail view.
+        assert!(lines[0]
+            .fields
+            .iter()
+            .any(|(k, v)| k == "ResponseCode" && v == "200"));
+
+        assert_eq!(lines[1].level, LogLevel::Error);
+        assert!(lines[1].message.starts_with("502 POST /orders"));
+        assert!(
+            lines[1].message.contains("BackendConnectionFailure"),
+            "failure reason should be appended, got {:?}",
+            lines[1].message
+        );
+    }
+
+    #[test]
+    fn apim_failed_request_without_status_reads_as_error() {
+        // Gateway couldn't reach the backend: ResponseCode 0, success false.
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Method", "type": "string" },
+                    { "name": "Url", "type": "string" },
+                    { "name": "ResponseCode", "type": "int" },
+                    { "name": "IsRequestSuccess", "type": "bool" }
+                ],
+                "rows": [
+                    [ "2026-01-01T00:00:00Z", "GET", "/echo", 0, false ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::Apim).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].level, LogLevel::Error);
+        // No bogus "0" status prefix — message starts with the method.
+        assert!(
+            lines[0].message.starts_with("GET /echo"),
+            "got {:?}",
+            lines[0].message
+        );
+    }
+
+    #[test]
+    fn request_path_strips_scheme_and_host() {
+        assert_eq!(
+            request_path("https://svc.azure-api.net/echo/resource?x=1"),
+            "/echo/resource?x=1"
+        );
+        assert_eq!(request_path("https://svc.azure-api.net"), "/");
+        // Already a bare path — left untouched.
+        assert_eq!(request_path("/echo/resource"), "/echo/resource");
     }
 
     #[test]
