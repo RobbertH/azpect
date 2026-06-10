@@ -156,9 +156,12 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
     guard.leave();
     drop(terminal);
 
-    // Persist config; non-fatal.
-    if let Err(e) = crate::config::save(&state.config) {
-        tracing::warn!("failed to save config: {e:#}");
+    // Persist config; non-fatal. Demo sessions never write — favorites or a
+    // last-resource id from the mock tenant must not leak into the real config.
+    if !auth.is_demo() {
+        if let Err(e) = crate::config::save(&state.config) {
+            tracing::warn!("failed to save config: {e:#}");
+        }
     }
 
     result
@@ -3537,7 +3540,20 @@ fn spawn_ticker(tx: UnboundedSender<AppEvent>) {
     });
 }
 
+// Every spawn_load_* below starts with the same demo-mode short-circuit: in
+// `azpect --demo` the canned dataset from `crate::azure::demo` is sent through
+// the normal AppEvent so the rest of the app (caches, loading flags, views)
+// behaves identically — just without any network. `AzureAuth::token` also
+// refuses every scope in demo mode, so a path missed here fails closed
+// instead of reaching a live tenant.
+
 fn spawn_load_subscriptions(auth: AzureAuth, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SubscriptionsLoaded(Ok(
+            crate::azure::demo::subscriptions(),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::subscriptions::list(&auth)
             .await
@@ -3547,6 +3563,12 @@ fn spawn_load_subscriptions(auth: AzureAuth, tx: UnboundedSender<AppEvent>) {
 }
 
 fn spawn_load_resources(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::ResourcesLoaded(Ok(
+            crate::azure::demo::resources(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::resources::list(&auth, &sub_ids)
             .await
@@ -3561,6 +3583,13 @@ fn spawn_load_metrics(
     range: TimeRange,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::MetricsLoaded {
+            resource_id: resource.id.clone(),
+            result: Ok(crate::azure::demo::metrics(&resource, range)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let resource_id = resource.id.clone();
         let result = crate::azure::metrics::fetch(&auth, &resource, range)
@@ -3580,6 +3609,31 @@ fn spawn_load_health(
     tx: UnboundedSender<AppEvent>,
 ) {
     use crate::azure::resources::ResourceKind;
+    if auth.is_demo() {
+        // Mirror the real fan-out: availability (+ revision meta for Container
+        // Apps) and the fixed-24h health metrics, all from the mock tenant.
+        if kind == ResourceKind::ContainerApp {
+            let info = crate::azure::demo::revision_info(&resource_id);
+            let _ = tx.send(AppEvent::HealthLoaded {
+                resource_id: resource_id.clone(),
+                result: Ok(info.availability),
+            });
+            let _ = tx.send(AppEvent::ContainerAppRevisionMetaLoaded {
+                resource_id: resource_id.clone(),
+                result: Ok(info.active_revision),
+            });
+        } else {
+            let _ = tx.send(AppEvent::HealthLoaded {
+                resource_id: resource_id.clone(),
+                result: Ok(crate::azure::demo::availability(&resource_id)),
+            });
+        }
+        let _ = tx.send(AppEvent::HealthMetricsLoaded {
+            resource_id: resource_id.clone(),
+            result: Ok(crate::azure::demo::health_metrics(&resource_id, kind)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         // Two independent signals feed the health badge, fetched concurrently:
         //   1. availability — the platform's up/degraded/down state
@@ -3650,6 +3704,14 @@ fn spawn_load_container_app_overview(
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::container_app_overview(&resource_id));
+        let _ = tx.send(AppEvent::ContainerAppOverviewLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::container_app_overview::fetch(&auth, &resource_id)
             .await
@@ -3667,6 +3729,14 @@ fn spawn_load_container_app_replicas(
     revision_name: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::replicas(&resource_id, &revision_name));
+        let _ = tx.send(AppEvent::ContainerAppReplicasLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result =
             crate::azure::container_app_replicas::fetch(&auth, &resource_id, &revision_name)
@@ -3684,6 +3754,14 @@ fn spawn_load_function_app_image(
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::web_config(&resource_id));
+        let _ = tx.send(AppEvent::FunctionAppImageLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::function_app_config::fetch(&auth, &resource_id)
             .await
@@ -3700,6 +3778,14 @@ fn spawn_load_function_app_settings(
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::function_app_settings(&resource_id));
+        let _ = tx.send(AppEvent::FunctionAppSettingsLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::function_app_settings::fetch(&auth, &resource_id)
             .await
@@ -3716,6 +3802,14 @@ fn spawn_load_function_app_triggers(
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::function_app_triggers(&resource_id));
+        let _ = tx.send(AppEvent::FunctionAppTriggersLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::function_app_triggers::fetch(&auth, &resource_id)
             .await
@@ -3728,6 +3822,11 @@ fn spawn_load_function_app_triggers(
 }
 
 fn spawn_resolve_principal(auth: AzureAuth, object_id: String, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::principal_display_name(&object_id));
+        let _ = tx.send(AppEvent::PrincipalResolved { object_id, result });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::principals::resolve_display_name(&auth, &object_id)
             .await
@@ -3836,6 +3935,11 @@ fn spawn_missing_list_health(
 }
 
 fn spawn_load_apim_apis(auth: AzureAuth, service_id: String, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::apim_apis(&service_id));
+        let _ = tx.send(AppEvent::ApimApisLoaded { service_id, result });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::apim::list_apis(&auth, &service_id)
             .await
@@ -3845,6 +3949,11 @@ fn spawn_load_apim_apis(auth: AzureAuth, service_id: String, tx: UnboundedSender
 }
 
 fn spawn_load_apim_operations(auth: AzureAuth, api_id: String, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::apim_operations(&api_id));
+        let _ = tx.send(AppEvent::ApimOperationsLoaded { api_id, result });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::apim::list_operations(&auth, &api_id)
             .await
@@ -3858,6 +3967,14 @@ fn spawn_load_apim_operation_policy(
     operation_id: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::apim_operation_policy(&operation_id));
+        let _ = tx.send(AppEvent::ApimOperationPolicyLoaded {
+            operation_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::apim::fetch_operation_policy(&auth, &operation_id)
             .await
@@ -3870,6 +3987,14 @@ fn spawn_load_apim_operation_policy(
 }
 
 fn spawn_load_appgw_backends(auth: AzureAuth, resource_id: String, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::appgw_backends(&resource_id));
+        let _ = tx.send(AppEvent::AppGatewayBackendsLoaded {
+            resource_id,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::appgw_backends::list_backend_pools(&auth, &resource_id)
             .await
@@ -3886,6 +4011,12 @@ fn spawn_load_storage_accounts(
     sub_ids: Vec<String>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageAccountsLoaded(Ok(
+            crate::azure::demo::storage_accounts(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::storage::list_accounts(&auth, &sub_ids)
             .await
@@ -3899,6 +4030,13 @@ fn spawn_load_storage_containers(
     account: crate::azure::storage::StorageAccount,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageContainersLoaded {
+            account_id: account.id.clone(),
+            result: Ok(crate::azure::demo::storage_containers(&account)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let account_id = account.id.clone();
         let result = crate::azure::storage::list_containers(&auth, &account)
@@ -3917,6 +4055,13 @@ fn spawn_load_storage_overview(
     account: crate::azure::storage::StorageAccount,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageOverviewLoaded {
+            account_id: account.id.clone(),
+            result: Ok(crate::azure::demo::storage_overview(&account)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let account_id = account.id.clone();
         let result = crate::azure::storage::fetch_account_overview_stats(&auth, &account)
@@ -3932,6 +4077,12 @@ fn spawn_load_storage_blobs(
     container: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
+        let result = Ok(crate::azure::demo::storage_blobs(&account_name, &container));
+        let _ = tx.send(AppEvent::StorageBlobsLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
         // Filtering is now client-side, so we always fetch the full container
@@ -3954,6 +4105,17 @@ fn spawn_load_storage_blob_preview(
     blob: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key =
+            crate::ui::state::StorageCache::blob_preview_key(&account_name, &container, &blob);
+        let result = Ok(crate::azure::demo::blob_preview(
+            &account_name,
+            &container,
+            &blob,
+        ));
+        let _ = tx.send(AppEvent::StorageBlobPreviewLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key =
             crate::ui::state::StorageCache::blob_preview_key(&account_name, &container, &blob);
@@ -3971,6 +4133,12 @@ fn spawn_load_storage_blob_preview(
 }
 
 fn spawn_load_registries(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistriesLoaded(Ok(
+            crate::azure::demo::registries(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::registries::list_registries(&auth, &sub_ids)
             .await
@@ -3984,6 +4152,13 @@ fn spawn_load_repositories(
     registry: crate::azure::registries::Registry,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistryRepositoriesLoaded {
+            registry_id: registry.id.clone(),
+            result: Ok(crate::azure::demo::repositories(&registry)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let registry_id = registry.id.clone();
         let result = crate::azure::registries::list_repositories(&auth, &registry)
@@ -4002,6 +4177,12 @@ fn spawn_load_tags(
     repository: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::RegistryCache::tags_key(&registry.id, &repository);
+        let result = Ok(crate::azure::demo::tags(&repository));
+        let _ = tx.send(AppEvent::RegistryTagsLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::RegistryCache::tags_key(&registry.id, &repository);
         let result = crate::azure::registries::list_tags(&auth, &registry, &repository)
@@ -4016,6 +4197,12 @@ fn spawn_load_cosmos_accounts(
     sub_ids: Vec<String>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::CosmosAccountsLoaded(Ok(
+            crate::azure::demo::cosmos_accounts(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::cosmos::list_accounts(&auth, &sub_ids)
             .await
@@ -4029,6 +4216,13 @@ fn spawn_load_cosmos_databases(
     account: crate::azure::cosmos::CosmosAccount,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::CosmosDatabasesLoaded {
+            account_id: account.id.clone(),
+            result: Ok(crate::azure::demo::cosmos_databases(&account)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let account_id = account.id.clone();
         let result = crate::azure::cosmos::list_databases(&auth, &account)
@@ -4044,6 +4238,12 @@ fn spawn_load_cosmos_containers(
     db: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::CosmosCache::containers_key(&account.id, &db);
+        let result = Ok(crate::azure::demo::cosmos_containers(&account, &db));
+        let _ = tx.send(AppEvent::CosmosContainersLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::CosmosCache::containers_key(&account.id, &db);
         let result = crate::azure::cosmos::list_containers(&auth, &account, &db)
@@ -4060,6 +4260,12 @@ fn spawn_load_cosmos_items(
     coll: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+        let result = Ok(crate::azure::demo::cosmos_items(&coll));
+        let _ = tx.send(AppEvent::CosmosItemsLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
         let result = crate::azure::cosmos::query_top_items(&auth, &account, &db, &coll)
@@ -4070,6 +4276,12 @@ fn spawn_load_cosmos_items(
 }
 
 fn spawn_load_key_vaults(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::KeyVaultsLoaded(Ok(
+            crate::azure::demo::key_vaults(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::key_vault::list_vaults(&auth, &sub_ids)
             .await
@@ -4084,6 +4296,12 @@ fn spawn_load_key_vault_items(
     kind: crate::azure::key_vault::ItemKind,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::KeyVaultCache::items_key(&vault.id, kind);
+        let result = Ok(crate::azure::demo::key_vault_items(kind));
+        let _ = tx.send(AppEvent::KeyVaultItemsLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::KeyVaultCache::items_key(&vault.id, kind);
         let result = crate::azure::key_vault::list_items(&auth, &vault, kind)
@@ -4102,6 +4320,15 @@ fn spawn_load_key_vault_secret_value(
     name: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::key_vault_secret_value(&name));
+        let _ = tx.send(AppEvent::KeyVaultSecretValueLoaded {
+            vault_id: vault.id,
+            name,
+            result,
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::key_vault::get_secret_value(&auth, &vault, &name)
             .await
@@ -4115,6 +4342,12 @@ fn spawn_load_key_vault_secret_value(
 }
 
 fn spawn_load_sb_namespaces(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded(Ok(
+            crate::azure::demo::sb_namespaces(&sub_ids),
+        )));
+        return;
+    }
     tokio::spawn(async move {
         let result = crate::azure::service_bus::list_namespaces(&auth, &sub_ids)
             .await
@@ -4128,6 +4361,13 @@ fn spawn_load_sb_queues(
     namespace: crate::azure::service_bus::ServiceBusNamespace,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::ServiceBusQueuesLoaded {
+            namespace_id: namespace.id.clone(),
+            result: Ok(crate::azure::demo::sb_queues(&namespace)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let namespace_id = namespace.id.clone();
         let result = crate::azure::service_bus::list_queues(&auth, &namespace)
@@ -4145,6 +4385,13 @@ fn spawn_load_sb_topics(
     namespace: crate::azure::service_bus::ServiceBusNamespace,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::ServiceBusTopicsLoaded {
+            namespace_id: namespace.id.clone(),
+            result: Ok(crate::azure::demo::sb_topics(&namespace)),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let namespace_id = namespace.id.clone();
         let result = crate::azure::service_bus::list_topics(&auth, &namespace)
@@ -4163,6 +4410,12 @@ fn spawn_load_sb_subscriptions(
     topic: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    if auth.is_demo() {
+        let key = crate::ui::state::ServiceBusCache::subscriptions_key(&namespace.id, &topic);
+        let result = Ok(crate::azure::demo::sb_subscriptions(&namespace, &topic));
+        let _ = tx.send(AppEvent::ServiceBusSubscriptionsLoaded { key, result });
+        return;
+    }
     tokio::spawn(async move {
         let key = crate::ui::state::ServiceBusCache::subscriptions_key(&namespace.id, &topic);
         let result = crate::azure::service_bus::list_subscriptions(&auth, &namespace, &topic)
@@ -4181,6 +4434,19 @@ fn spawn_load_logs(
     tx: UnboundedSender<AppEvent>,
 ) {
     let append = older_than.is_some();
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogsLoaded {
+            resource_id: resource.id.clone(),
+            append,
+            result: Ok(crate::azure::demo::logs(
+                &resource,
+                range,
+                errors_only,
+                older_than,
+            )),
+        });
+        return;
+    }
     tokio::spawn(async move {
         let resource_id = resource.id.clone();
         let result = crate::azure::logs::fetch(&auth, &resource, range, errors_only, older_than)

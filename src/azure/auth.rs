@@ -94,9 +94,15 @@ impl fmt::Debug for CachedToken {
 }
 
 /// The credential wrapper. Cheap to clone (interior `Arc`).
+///
+/// `credential: None` marks **demo mode** (`azpect --demo`): no credential
+/// chain exists and [`AzureAuth::token`] refuses every scope, so no request
+/// carrying real or fake credentials can ever leave the machine. Data fetches
+/// are short-circuited upstream (see `crate::azure::demo`); the token failure
+/// here is the defense-in-depth backstop for any path that slips through.
 #[derive(Clone)]
 pub struct AzureAuth {
-    credential: Arc<DefaultAzureCredential>,
+    credential: Option<Arc<DefaultAzureCredential>>,
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
 }
 
@@ -122,9 +128,25 @@ impl AzureAuth {
             )
         })?;
         Ok(Self {
-            credential,
+            credential: Some(credential),
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Demo-mode auth: no credential chain, no tokens, no network. Every data
+    /// fetch is served by `crate::azure::demo` instead; [`Self::token`] errors
+    /// for any scope so a missed code path fails closed rather than calling
+    /// out to a live tenant.
+    pub fn demo() -> Self {
+        Self {
+            credential: None,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// True when running against the built-in mock tenant (`azpect --demo`).
+    pub fn is_demo(&self) -> bool {
+        self.credential.is_none()
     }
 
     /// Drop every cached token. Call after a re-auth (e.g. `az login`) so the
@@ -136,6 +158,11 @@ impl AzureAuth {
 
     /// Acquire (and cache) a bearer token for `scope`.
     pub async fn token(&self, scope: &str) -> anyhow::Result<String> {
+        let Some(credential) = &self.credential else {
+            return Err(anyhow!(
+                "demo mode: Azure network calls are disabled (no credential)"
+            ));
+        };
         let now = Utc::now();
         let refresh_before = chrono::Duration::from_std(REFRESH_BEFORE_EXPIRY)
             .unwrap_or_else(|_| chrono::Duration::seconds(60));
@@ -156,7 +183,7 @@ impl AzureAuth {
         // indefinitely — see [`TOKEN_ACQUISITION_TIMEOUT`].
         let access_token = match tokio::time::timeout(
             TOKEN_ACQUISITION_TIMEOUT,
-            self.credential.get_token(&[scope], None),
+            credential.get_token(&[scope], None),
         )
         .await
         {
@@ -233,7 +260,7 @@ mod tests {
             return;
         };
         let auth = AzureAuth {
-            credential,
+            credential: Some(credential),
             cache: Arc::new(RwLock::new(HashMap::from([(
                 SCOPE_ARM.to_string(),
                 CachedToken {
@@ -244,6 +271,30 @@ mod tests {
         };
         let rendered = format!("{auth:?}");
         assert!(!rendered.contains("leak-me-if-you-can"));
+    }
+
+    #[test]
+    fn demo_auth_is_demo_and_real_is_not() {
+        assert!(AzureAuth::demo().is_demo());
+        if let Ok(credential) = DefaultAzureCredential::new() {
+            let real = AzureAuth {
+                credential: Some(credential),
+                cache: Arc::new(RwLock::new(HashMap::new())),
+            };
+            assert!(!real.is_demo());
+        }
+    }
+
+    #[tokio::test]
+    async fn demo_auth_refuses_every_token_scope() {
+        let auth = AzureAuth::demo();
+        for scope in [SCOPE_ARM, SCOPE_LOGS, SCOPE_STORAGE, SCOPE_GRAPH] {
+            let err = auth.token(scope).await.unwrap_err();
+            assert!(
+                format!("{err:#}").contains("demo mode"),
+                "scope {scope} must fail closed in demo mode"
+            );
+        }
     }
 
     #[test]

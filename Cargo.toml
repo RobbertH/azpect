@@ -8,6 +8,8 @@ repository = "https://github.com/RobbertH/azpect"
 readme = "README.md"
 keywords = ["azure", "tui", "monitoring", "ratatui", "observability"]
 categories = ["command-line-utilities"]
+# README screenshots live in the repo only; keep them out of the crate.
+exclude = ["assets/"]
 
 [[bin]]
 name = "azpect"

@@ -5,6 +5,12 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(name = "azpect", version, about = "Azure API observability TUI")]
 struct Cli {
+    /// Browse a built-in mock tenant (fictional data, zero Azure calls).
+    /// No login required; nothing is read from or written to your account.
+    /// Useful for screenshots and demos.
+    #[arg(long, global = true)]
+    demo: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -27,12 +33,26 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
-        let auth = azpect::azure::auth::AzureAuth::new().await?;
+        // Demo mode never builds a credential chain — the mock tenant needs no
+        // login and AzureAuth::demo() refuses every token scope, so no request
+        // can reach a live tenant.
+        let auth = if cli.demo {
+            azpect::azure::auth::AzureAuth::demo()
+        } else {
+            azpect::azure::auth::AzureAuth::new().await?
+        };
         let cfg = azpect::config::load()?;
 
         match cli.command {
             Some(Command::DebugAuth) => {
-                let subs = azpect::azure::subscriptions::list(&auth).await?;
+                if cli.demo {
+                    println!("demo mode: no real credential; mock subscriptions follow.");
+                }
+                let subs = if cli.demo {
+                    azpect::azure::demo::subscriptions()
+                } else {
+                    azpect::azure::subscriptions::list(&auth).await?
+                };
                 println!("Resolved {} subscription(s):", subs.len());
                 for s in &subs {
                     println!("  {}  {}  ({})", s.id, s.display_name, s.state);

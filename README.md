@@ -5,6 +5,8 @@ Inspired by [k9s](https://github.com/derailed/k9s) and [flowrs](https://github.c
 
 `azpect` lists Function Apps, API Management instances, Container Apps, and Application Gateways across every subscription you can access. It also drills into Storage accounts (containers / blobs), Container Registries (repositories / tags), Cosmos DB (databases / containers / item preview), Key Vaults (secrets + certificates, metadata only), and Service Bus (queues / topics / subscriptions, with active and dead-letter message counts).
 
+![API resources across subscriptions, with health badges](https://raw.githubusercontent.com/RobbertH/azpect/main/assets/apis.png)
+
 ## Install
 
 ### Homebrew (macOS, Linux)
@@ -21,6 +23,16 @@ brew install azpect
 ```
 
 Upgrade later with `brew upgrade azpect`.
+
+## Demo mode
+
+```sh
+azpect --demo
+```
+
+Browses a built-in mock tenant (the fictional "Contoso" company) with fake
+subscriptions, resources, metrics, and logs. No `az login` needed and no
+network calls are made — handy for trying the UI, demos, and screenshots.
 
 ## Configuration
 
