@@ -14,12 +14,15 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Enter policy  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str =
+    "j/k move  Enter policy  / filter  y yank  o portal  Esc back  r refresh  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 const METHOD_COL_WIDTH: usize = 7;
 const URL_COL_WIDTH: usize = 40;
 const NAME_COL_WIDTH: usize = 30;
+/// Two-cell selection-marker gutter on the left, matched by the header row.
+const MARKER_PAD: &str = "  ";
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -66,12 +69,55 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ]);
     frame.render_widget(header, chunks[0]);
 
+    let filter_value = state.apim.operations_filter.value();
+    let filter_active = state.apim.operations_filter_active;
+
+    // Title: total count, switching to `N of M` while a filter narrows the
+    // list, plus a `/{filter}` chip. Mirrors the APIs view.
+    let (total, filtered_len) = match api_id {
+        Some(id) => (
+            state.apim.operations.get(id).map(|v| v.len()),
+            state.apim.filtered_operations(id).len(),
+        ),
+        None => (None, 0),
+    };
+    let count_label = match total {
+        Some(t) if !filter_value.is_empty() => format!("· {filtered_len} of {t} "),
+        Some(t) => format!("· {t} "),
+        None => String::new(),
+    };
+    let mut title_spans: Vec<Span> = vec![
+        Span::styled(" routes ", Style::default().fg(theme.fg)),
+        Span::styled(count_label, Style::default().fg(theme.muted)),
+    ];
+    if filter_active || !filter_value.is_empty() {
+        title_spans.push(Span::styled(
+            format!("/{filter_value} "),
+            Style::default().fg(theme.accent),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" routes ", Style::default().fg(theme.fg)));
+        .title(Line::from(title_spans));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
+
+    // Optional filter input row at the top of the inner area.
+    let (search_area, inner) = if filter_active {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, inner)
+    };
+    if let Some(sa) = search_area {
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent)),
+            Span::styled(filter_value, Style::default().fg(theme.fg)),
+            Span::styled("█", Style::default().fg(theme.accent)),
+        ]));
+        frame.render_widget(p, sa);
+    }
 
     let Some(api_id) = api_id else {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -95,6 +141,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let ops = state.apim.operations.get(api_id);
     let loading = state.apim.operations_pending.contains(api_id);
+    let filtered = state.apim.filtered_operations(api_id);
     match ops {
         None if loading => {
             let p = Paragraph::new(Line::from(Span::styled(
@@ -117,12 +164,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             )));
             frame.render_widget(p, inner);
         }
-        Some(rows) => {
-            let cursor = state.apim.operations_cursor.min(rows.len() - 1);
-            let visible = inner.height as usize;
-            let scroll = scroll_for(cursor, rows.len(), visible);
+        Some(_) if filtered.is_empty() => {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "no operations match the current filter.",
+                Style::default().fg(theme.muted),
+            )));
+            frame.render_widget(p, inner);
+        }
+        Some(_) => {
+            // Reserve the top row of the body for the column-header line.
+            let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+            frame.render_widget(Paragraph::new(column_header(theme)), parts[0]);
+            let rows_area = parts[1];
 
-            let lines: Vec<Line> = rows
+            let cursor = state.apim.operations_cursor.min(filtered.len() - 1);
+            let visible = rows_area.height as usize;
+            let scroll = scroll_for(cursor, filtered.len(), visible);
+
+            let lines: Vec<Line> = filtered
                 .iter()
                 .enumerate()
                 .skip(scroll)
@@ -161,11 +220,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     }
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(Paragraph::new(lines), rows_area);
         }
     }
 
     render_footer(frame, chunks[2], theme);
+}
+
+/// Column-header row, aligned to the same widths the data rows use (including
+/// the two-cell selection-marker gutter on the left).
+fn column_header(theme: &Theme) -> Line<'static> {
+    let style = Style::default()
+        .fg(theme.muted)
+        .add_modifier(Modifier::BOLD);
+    let head = format!(
+        "{MARKER_PAD}{:<mw$} {:<uw$}  {}",
+        "method",
+        "url",
+        "name",
+        mw = METHOD_COL_WIDTH,
+        uw = URL_COL_WIDTH,
+    );
+    Line::from(Span::styled(head, style))
 }
 
 /// Method-colored chips so the verb stands out at a glance. Falls back to
@@ -222,14 +298,46 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     let Some(api_id) = state.apim.selected_api_id.clone() else {
         return false;
     };
-    let len = state
-        .apim
-        .operations
-        .get(&api_id)
-        .map(|v| v.len())
-        .unwrap_or(0);
+    // Navigation operates on the filtered slice so the cursor never points past
+    // the end of what's rendered. Mirrors `apim_apis::handle`.
+    let len = state.apim.filtered_operations(&api_id).len();
+
+    // While the filter input has focus, swallow most actions but let the
+    // dispatcher's filter-forwarding gate push raw chars into the buffer.
+    // Esc cancels (deactivates AND clears); Enter commits (deactivates, keeps
+    // the value). Down hands focus back to the filtered list.
+    if state.apim.operations_filter_active {
+        match action {
+            Action::Back => {
+                state.apim.operations_filter_active = false;
+                state.apim.operations_filter.reset();
+                state.apim.operations_cursor = 0;
+                return true;
+            }
+            Action::OpenSelected => {
+                state.apim.operations_filter_active = false;
+                return true;
+            }
+            Action::MoveDown => {
+                state.apim.operations_filter_active = false;
+                // fall through to navigation handling below
+            }
+            Action::MoveUp
+            | Action::HalfPageDown
+            | Action::HalfPageUp
+            | Action::GotoTop
+            | Action::GotoBottom => {
+                // fall through to navigation handling below
+            }
+            _ => return false,
+        }
+    }
 
     match action {
+        Action::StartSearch => {
+            state.apim.operations_filter_active = true;
+            true
+        }
         Action::MoveDown => {
             if len > 0 {
                 state.apim.operations_cursor = (state.apim.operations_cursor + 1).min(len - 1);
@@ -262,11 +370,12 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::OpenSelected => {
+            // Resolve via the filtered slice so the cursor's row matches what
+            // the user actually sees on screen.
             let op_id = state
                 .apim
-                .operations
-                .get(&api_id)
-                .and_then(|rows| rows.get(state.apim.operations_cursor))
+                .filtered_operations(&api_id)
+                .get(state.apim.operations_cursor)
                 .map(|op| op.id.clone());
             if let Some(op_id) = op_id {
                 state.apim.selected_operation_id = Some(op_id);
@@ -382,6 +491,124 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("set in policy"));
+    }
+
+    fn three_ops() -> AppState {
+        let mut state = fixture();
+        state.apim.operations.insert(
+            "/svc/myapim/apis/echo".into(),
+            vec![
+                Operation {
+                    id: "/svc/myapim/apis/echo/operations/get-orders".into(),
+                    name: "get-orders".into(),
+                    display_name: "List orders".into(),
+                    method: "GET".into(),
+                    url_template: "/orders".into(),
+                },
+                Operation {
+                    id: "/svc/myapim/apis/echo/operations/post-payments".into(),
+                    name: "post-payments".into(),
+                    display_name: "Create payment".into(),
+                    method: "POST".into(),
+                    url_template: "/payments".into(),
+                },
+                Operation {
+                    id: "/svc/myapim/apis/echo/operations/del-catalog".into(),
+                    name: "del-catalog".into(),
+                    display_name: "Remove catalog item".into(),
+                    method: "DELETE".into(),
+                    url_template: "/catalog".into(),
+                },
+            ],
+        );
+        state
+    }
+
+    #[test]
+    fn renders_column_headers() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let state = three_ops();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("method"), "method header missing: {buf}");
+        assert!(buf.contains("url"), "url header missing: {buf}");
+        assert!(buf.contains("name"), "name header missing: {buf}");
+    }
+
+    #[test]
+    fn slash_opens_filter_input() {
+        let mut state = three_ops();
+        assert!(handle(Action::StartSearch, &mut state));
+        assert!(state.apim.operations_filter_active);
+    }
+
+    #[test]
+    fn esc_in_filter_clears_buffer() {
+        let mut state = three_ops();
+        state.apim.operations_filter_active = true;
+        state.apim.operations_filter = tui_input::Input::default().with_value("pay".to_string());
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.apim.operations_filter_active);
+        assert_eq!(state.apim.operations_filter.value(), "");
+    }
+
+    #[test]
+    fn filter_matches_name_url_and_method() {
+        let mut state = three_ops();
+        // url-template match
+        state.apim.operations_filter =
+            tui_input::Input::default().with_value("catalog".to_string());
+        let names: Vec<&str> = state
+            .apim
+            .filtered_operations("/svc/myapim/apis/echo")
+            .iter()
+            .map(|o| o.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Remove catalog item"]);
+        // method match (case-insensitive)
+        state.apim.operations_filter = tui_input::Input::default().with_value("post".to_string());
+        let names: Vec<&str> = state
+            .apim
+            .filtered_operations("/svc/myapim/apis/echo")
+            .iter()
+            .map(|o| o.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Create payment"]);
+    }
+
+    #[test]
+    fn navigation_and_open_use_filtered_slice() {
+        let mut state = three_ops();
+        state.apim.operations_filter = tui_input::Input::default().with_value("pay".to_string());
+        state.apim.operations_cursor = 0;
+        // Only one match → GotoBottom clamps to filtered len-1 == 0.
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert_eq!(state.apim.operations_cursor, 0);
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::ApimPolicy);
+        assert_eq!(
+            state.apim.selected_operation_id.as_deref(),
+            Some("/svc/myapim/apis/echo/operations/post-payments"),
+            "drills into the filtered row, not the same index in the raw list",
+        );
+    }
+
+    #[test]
+    fn renders_filter_chip_in_title() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = three_ops();
+        state.apim.operations_filter = tui_input::Input::default().with_value("pay".to_string());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("/pay"), "title chip should show /pay: {buf}");
+        assert!(
+            buf.contains("1 of 3"),
+            "count should switch to `N of M` when filtering: {buf}",
+        );
     }
 
     #[test]

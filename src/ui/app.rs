@@ -474,6 +474,15 @@ async fn event_loop(
                     state.apim.apis_cursor = 0;
                     continue;
                 }
+                // APIM operations name filter — same carve-out shape as APIs.
+                if should_forward_to_apim_operations_filter(state, key) {
+                    state
+                        .apim
+                        .operations_filter
+                        .handle_event(&CtEvent::Key(key));
+                    state.apim.operations_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -1262,6 +1271,25 @@ fn should_forward_to_apim_apis_filter(state: &AppState, key: crossterm::event::K
         )
 }
 
+/// Mirror of `should_forward_to_apim_apis_filter` for the APIM operations
+/// (routes) name filter.
+fn should_forward_to_apim_operations_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::ApimOperations
+        && state.apim.operations_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Mirror of `should_forward_to_filter` for the logs view's less-style search
 /// box. Same carve-outs: arrows / page nav drive the underlying table so the
 /// user can scroll context around the live highlights while still typing.
@@ -1724,7 +1752,8 @@ fn decide_action(
         || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
         || (state.view == View::ServiceBusSubscriptions
             && state.service_bus.subscriptions_filter_active)
-        || (state.view == View::ApimApis && state.apim.apis_filter_active);
+        || (state.view == View::ApimApis && state.apim.apis_filter_active)
+        || (state.view == View::ApimOperations && state.apim.operations_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -2158,11 +2187,11 @@ fn yank_target(state: &AppState) -> Option<String> {
                 .map(|api| api.id.clone())
         }),
         View::ApimOperations => state.apim.selected_api_id.as_deref().and_then(|api_id| {
+            // Index the *filtered* slice so yank follows what's on screen.
             state
                 .apim
-                .operations
-                .get(api_id)
-                .and_then(|rows| rows.get(state.apim.operations_cursor))
+                .filtered_operations(api_id)
+                .get(state.apim.operations_cursor)
                 .map(|op| op.id.clone())
         }),
         View::ApimPolicy => crate::ui::views::apim_policy::yank_text(state)

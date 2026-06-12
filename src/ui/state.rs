@@ -607,6 +607,9 @@ pub struct ApimCache {
     pub operations_pending: HashSet<String>,
     pub operations_error: HashMap<String, String>,
     pub operations_cursor: usize,
+    /// `/`-search over the operations list. Same shape as `apis_filter`.
+    pub operations_filter: Input,
+    pub operations_filter_active: bool,
     /// Which API the operations view is currently drilling into. Pinned when
     /// the user opens an API from `ApimApis` so navigating back to that view
     /// doesn't lose track. `None` outside the operations/policy views.
@@ -635,6 +638,26 @@ impl ApimCache {
                         || a.display_name.to_lowercase().contains(&needle)
                         || a.path.to_lowercase().contains(&needle)
                         || a.name.to_lowercase().contains(&needle)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `operations_filter` to the operations under `api_id`.
+    /// Case-insensitive substring match over display name, URL template, HTTP
+    /// method, and slug; empty filter returns everything.
+    pub fn filtered_operations(&self, api_id: &str) -> Vec<&crate::azure::apim::Operation> {
+        let needle = self.operations_filter.value().to_lowercase();
+        match self.operations.get(api_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|o| {
+                    needle.is_empty()
+                        || o.display_name.to_lowercase().contains(&needle)
+                        || o.url_template.to_lowercase().contains(&needle)
+                        || o.method.to_lowercase().contains(&needle)
+                        || o.name.to_lowercase().contains(&needle)
                 })
                 .collect(),
             None => Vec::new(),

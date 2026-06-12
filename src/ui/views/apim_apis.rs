@@ -16,11 +16,15 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter operations  / filter  Esc back  r refresh  ? help  q quit";
+    "j/k move  Enter operations  / filter  y yank  o portal  Esc back  r refresh  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
-const NAME_COL_WIDTH: usize = 36;
-const PATH_COL_WIDTH: usize = 24;
+const NAME_COL_WIDTH: usize = 32;
+const PATH_COL_WIDTH: usize = 20;
+const SERVICE_URL_COL_WIDTH: usize = 44;
+/// Gap between columns, and the two-cell selection-marker gutter on the left.
+const COL_GAP: &str = "  ";
+const MARKER_PAD: &str = "  ";
 
 /// Resource id of the APIM service we're drilling into. Resolved off the
 /// currently selected resource — kept here (not in state) because the cursor
@@ -161,8 +165,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             frame.render_widget(p, body_area);
         }
         Some(_) => {
+            // Reserve the top row of the body for the column-header line; the
+            // data rows scroll beneath it.
+            let parts =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body_area);
+            frame.render_widget(Paragraph::new(column_header(theme)), parts[0]);
+            let rows_area = parts[1];
+
             let cursor = state.apim.apis_cursor.min(filtered.len() - 1);
-            let visible = body_area.height as usize;
+            let visible = rows_area.height as usize;
             let scroll = scroll_for(cursor, filtered.len(), visible);
 
             let lines: Vec<Line> = filtered
@@ -177,17 +188,32 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                         truncate_right(&api.display_name, NAME_COL_WIDTH),
                         w = NAME_COL_WIDTH
                     );
+                    // Fold the leading `/` into the path cell so it aligns under
+                    // the "path" header.
                     let path = format!(
                         "{:<w$}",
-                        truncate_right(&api.path, PATH_COL_WIDTH),
+                        truncate_right(&format!("/{}", api.path), PATH_COL_WIDTH),
                         w = PATH_COL_WIDTH
                     );
+                    // Static backend (`properties.serviceUrl`). `None` means the
+                    // backend is chosen in policy, mirroring the operations view.
+                    let (service_url, url_style) = match api.service_url.as_deref() {
+                        Some(u) => (
+                            truncate_right(u, SERVICE_URL_COL_WIDTH),
+                            Style::default().fg(theme.fg),
+                        ),
+                        None => (
+                            "— (set in policy)".to_string(),
+                            Style::default().fg(theme.muted),
+                        ),
+                    };
                     let spans = vec![
-                        Span::raw(if selected { "▍ " } else { "  " }),
+                        Span::raw(if selected { "▍ " } else { MARKER_PAD }),
                         Span::styled(name, Style::default().fg(theme.fg)),
-                        Span::raw("  "),
-                        Span::styled("/".to_string(), Style::default().fg(theme.muted)),
+                        Span::raw(COL_GAP),
                         Span::styled(path, Style::default().fg(theme.accent)),
+                        Span::raw(COL_GAP),
+                        Span::styled(service_url, url_style),
                     ];
                     if selected {
                         Line::from(spans).style(theme.selection())
@@ -196,11 +222,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     }
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(lines), body_area);
+            frame.render_widget(Paragraph::new(lines), rows_area);
         }
     }
 
     render_footer(frame, chunks[2], theme);
+}
+
+/// Column-header row, aligned to the same widths the data rows use (including
+/// the two-cell selection-marker gutter on the left).
+fn column_header(theme: &Theme) -> Line<'static> {
+    let style = Style::default()
+        .fg(theme.muted)
+        .add_modifier(Modifier::BOLD);
+    let head = format!(
+        "{MARKER_PAD}{:<nw$}{COL_GAP}{:<pw$}{COL_GAP}{}",
+        "name",
+        "path",
+        "service url",
+        nw = NAME_COL_WIDTH,
+        pw = PATH_COL_WIDTH,
+    );
+    Line::from(Span::styled(head, style))
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -388,6 +431,65 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("Echo API"));
         assert!(buf.contains("echo"));
+    }
+
+    #[test]
+    fn renders_column_headers() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.apim.apis.insert(
+            "/svc/myapim".into(),
+            vec![Api {
+                id: "/svc/myapim/apis/echo".into(),
+                name: "echo".into(),
+                display_name: "Echo API".into(),
+                path: "echo".into(),
+                service_url: Some("https://echo.example.com".into()),
+            }],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("name"), "name header missing: {buf}");
+        assert!(buf.contains("path"), "path header missing: {buf}");
+        assert!(
+            buf.contains("service url"),
+            "service url header missing: {buf}"
+        );
+    }
+
+    #[test]
+    fn renders_service_url_column() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.apim.apis.insert(
+            "/svc/myapim".into(),
+            vec![
+                Api {
+                    id: "/svc/myapim/apis/echo".into(),
+                    name: "echo".into(),
+                    display_name: "Echo API".into(),
+                    path: "echo".into(),
+                    service_url: Some("https://echo.example.com".into()),
+                },
+                Api {
+                    id: "/svc/myapim/apis/policy".into(),
+                    name: "policy".into(),
+                    display_name: "Policy API".into(),
+                    path: "policy".into(),
+                    service_url: None,
+                },
+            ],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        // Static backend is shown verbatim; the policy-routed API gets the
+        // placeholder instead of a blank cell.
+        assert!(buf.contains("https://echo.example.com"), "url cell: {buf}");
+        assert!(buf.contains("set in policy"), "placeholder cell: {buf}");
     }
 
     #[test]
