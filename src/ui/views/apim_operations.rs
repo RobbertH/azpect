@@ -20,7 +20,6 @@ const HALF_PAGE: usize = 10;
 
 const METHOD_COL_WIDTH: usize = 7;
 const URL_COL_WIDTH: usize = 40;
-const NAME_COL_WIDTH: usize = 30;
 /// Two-cell selection-marker gutter on the left, matched by the header row.
 const MARKER_PAD: &str = "  ";
 
@@ -181,6 +180,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let visible = rows_area.height as usize;
             let scroll = scroll_for(cursor, filtered.len(), visible);
 
+            // `name` is the trailing column, so it gets exactly the width left
+            // after the marker gutter + method + url columns and their gaps —
+            // never more (so the `…` always lands inside the pane rather than
+            // being clipped at the edge) and never a fixed cap that wastes the
+            // rest of the row. The `1` and `2` are the literal gaps in the row
+            // format below.
+            let name_width = (rows_area.width as usize)
+                .saturating_sub(MARKER_PAD.len() + METHOD_COL_WIDTH + 1 + URL_COL_WIDTH + 2);
+
             let lines: Vec<Line> = filtered
                 .iter()
                 .enumerate()
@@ -196,8 +204,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     );
                     let name = format!(
                         "{:<w$}",
-                        truncate_right(&op.display_name, NAME_COL_WIDTH),
-                        w = NAME_COL_WIDTH
+                        truncate_right(&op.display_name, name_width),
+                        w = name_width
                     );
                     let method_color = color_for_method(&op.method, theme);
                     let spans = vec![

@@ -21,7 +21,6 @@ const HALF_PAGE: usize = 10;
 
 const NAME_COL_WIDTH: usize = 32;
 const PATH_COL_WIDTH: usize = 20;
-const SERVICE_URL_COL_WIDTH: usize = 44;
 /// Gap between columns, and the two-cell selection-marker gutter on the left.
 const COL_GAP: &str = "  ";
 const MARKER_PAD: &str = "  ";
@@ -176,6 +175,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let visible = rows_area.height as usize;
             let scroll = scroll_for(cursor, filtered.len(), visible);
 
+            // `service url` is the trailing column, so it gets exactly the width
+            // left after the marker gutter + the two fixed columns and their
+            // gaps — never more (so the `…` always lands inside the pane rather
+            // than being clipped by ratatui at the edge) and never a fixed cap
+            // that wastes the rest of the row.
+            let url_width = (rows_area.width as usize).saturating_sub(
+                MARKER_PAD.len() + NAME_COL_WIDTH + COL_GAP.len() + PATH_COL_WIDTH + COL_GAP.len(),
+            );
+
             let lines: Vec<Line> = filtered
                 .iter()
                 .enumerate()
@@ -198,10 +206,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     // Static backend (`properties.serviceUrl`). `None` means the
                     // backend is chosen in policy, mirroring the operations view.
                     let (service_url, url_style) = match api.service_url.as_deref() {
-                        Some(u) => (
-                            truncate_right(u, SERVICE_URL_COL_WIDTH),
-                            Style::default().fg(theme.fg),
-                        ),
+                        Some(u) => (truncate_right(u, url_width), Style::default().fg(theme.fg)),
                         None => (
                             "— (set in policy)".to_string(),
                             Style::default().fg(theme.muted),
