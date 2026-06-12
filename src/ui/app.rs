@@ -35,7 +35,10 @@ use crate::azure::metrics::TimeRange;
 use crate::azure::resources::Resource;
 use crate::config::Config;
 use crate::ui::events::{is_chord_starter, key_to_action, resolve_chord, Action, AppEvent};
-use crate::ui::state::{AppState, AuthMenuFocus, AuthPrompt, PendingLogin, View};
+use crate::ui::state::{
+    AppState, AppliedEnvEdit, AuthMenuFocus, AuthPrompt, EnvVarEditMode, EnvVarEditPhase,
+    EnvVarField, PendingLogin, View,
+};
 use crate::ui::theme::Theme;
 
 /// How often the tick task fires. Drives spinner refresh, chord timeout, etc.
@@ -260,6 +263,14 @@ async fn event_loop(
                         }
                         _ => continue,
                     }
+                }
+                // Guarded env-var editor. While open it owns every key (typing,
+                // field switching, and the final confirm) and routes the write
+                // spawn, which needs auth/tx — so it sits in the event loop, not
+                // a view handler. Sits below quit/auth so those overlays win.
+                if state.env_var_edit.is_some() {
+                    handle_env_var_edit_key(state, key, auth, tx);
+                    continue;
                 }
                 // Command palette has top priority. While active, all keys
                 // except Esc (cancel), Enter (execute), and Tab / Shift+Tab
@@ -1076,6 +1087,35 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::EnvVarWriteCompleted {
+                applied,
+                is_demo,
+                result,
+            } => match result {
+                Ok(()) => {
+                    // Optimistic: show the new value at once, close the modal,
+                    // then confirm against the server (skipped in the demo, where
+                    // a refetch would just wipe the simulated edit).
+                    apply_env_edit_to_cache(state, &applied);
+                    state.env_var_edit = None;
+                    let short = applied.resource_id.rsplit('/').next().unwrap_or("resource");
+                    state.set_status(format!("wrote {} on {short}", applied.name));
+                    if !is_demo {
+                        refetch_env_after_write(state, &applied, auth, tx);
+                    }
+                }
+                Err(e) => {
+                    // Keep the modal up on the confirm step so the user can read
+                    // the error and retry or cancel; nothing was committed.
+                    if let Some(edit) = state.env_var_edit.as_mut() {
+                        edit.in_flight = false;
+                        edit.phase = EnvVarEditPhase::Confirming;
+                        edit.error = Some(e);
+                    } else {
+                        state.set_status(format!("env-var write failed: {e}"));
+                    }
+                }
+            },
         }
 
         // Drain a pending login request: the modal handler set it on Enter,
@@ -2217,15 +2257,20 @@ fn yank_target(state: &AppState) -> Option<String> {
 
 fn yank_from_logs(state: &AppState) -> Option<String> {
     let resource = state.selected_resource()?;
-    let lines = state.logs.by_resource.get(&resource.id);
-    let empty = lines.map(|l| l.is_empty()).unwrap_or(true);
+    let empty = state
+        .logs
+        .by_resource
+        .get(&resource.id)
+        .map(|l| l.is_empty())
+        .unwrap_or(true);
     // Error banner is showing iff there's an error AND no rows to display.
     if empty {
         if let Some(err) = state.logs.last_error.as_deref() {
             return Some(crate::ui::views::logs::friendly_log_error(err));
         }
     }
-    let lines = lines?;
+    // The cursor indexes the source-filtered view, same as the table render.
+    let lines = state.visible_log_lines(&resource.id);
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
     let line = lines.get(cursor)?;
     Some(format!(
@@ -3086,6 +3131,11 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
     if state.auth_prompt != AuthPrompt::Hidden {
         render_auth_modal(f, area, state, theme);
     }
+    // Guarded env-var editor (Ctrl+E / Ctrl+N from the env-vars page). Drawn on
+    // top of its page; mutually exclusive with the quit/auth overlays by gating.
+    if state.env_var_edit.is_some() {
+        crate::ui::views::env_var_edit::render(f, area, state, theme);
+    }
 
     if let Some(sa) = status_area {
         render_status_row(f, sa, state, theme);
@@ -3301,6 +3351,329 @@ fn handle_auth_prompt_key(state: &mut AppState, key: crossterm::event::KeyEvent)
                 state.auth_tenant_input.handle_event(&CtEvent::Key(key));
             }
         },
+    }
+}
+
+/// The concrete payload handed to [`spawn_env_var_write`].
+enum EnvWrite {
+    /// Function App: the FULL post-edit settings list (the PUT replaces the
+    /// whole collection, so every existing key must be present).
+    FunctionApp {
+        settings: Vec<crate::azure::env_vars::EnvVar>,
+    },
+    /// Container App: the targeted template entry plus its new literal value;
+    /// the spawn does the GET-modify-PATCH against the raw template.
+    ContainerApp {
+        target: crate::azure::container_app_env_update::EnvTarget,
+        value: String,
+    },
+}
+
+/// Key handler for the guarded add/edit-env-var modal. Owns every key while the
+/// modal is open. Two phases: `Editing` (type into the fields) and `Confirming`
+/// (final yes/no with the diff shown). The modal is taken out of `state` for the
+/// duration so the field widgets and the rest of `state` (cache, spawn) can be
+/// mutated without borrow conflicts; it's put back unless the flow closed it.
+fn handle_env_var_edit_key(
+    state: &mut AppState,
+    key: crossterm::event::KeyEvent,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let mut edit = match state.env_var_edit.take() {
+        Some(e) => e,
+        None => return,
+    };
+
+    // While a write is in flight, freeze the fields. Esc abandons the modal —
+    // the background write still completes and updates the cache via its event.
+    if edit.in_flight {
+        if key.code != KeyCode::Esc {
+            state.env_var_edit = Some(edit);
+        }
+        return;
+    }
+
+    match edit.phase {
+        EnvVarEditPhase::Editing => match key.code {
+            // Esc abandons the whole editor (modal dropped, not put back).
+            KeyCode::Esc => {}
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Only Add has two editable fields; Edit locks the name.
+                if matches!(edit.mode, EnvVarEditMode::Add) {
+                    edit.focus = match edit.focus {
+                        EnvVarField::Name => EnvVarField::Value,
+                        EnvVarField::Value => EnvVarField::Name,
+                    };
+                }
+                state.env_var_edit = Some(edit);
+            }
+            KeyCode::Enter => {
+                let name = edit.name.value().trim().to_string();
+                if name.is_empty() {
+                    edit.error = Some("name can't be empty".into());
+                } else if let EnvVarEditMode::Edit { original_value } = &edit.mode {
+                    if original_value == edit.value.value() {
+                        edit.error = Some("value unchanged — nothing to write".into());
+                    } else {
+                        edit.error = None;
+                        edit.confirm_yes = false; // opt-in: default to Cancel
+                        edit.phase = EnvVarEditPhase::Confirming;
+                    }
+                } else {
+                    edit.error = None;
+                    edit.confirm_yes = false;
+                    edit.phase = EnvVarEditPhase::Confirming;
+                }
+                state.env_var_edit = Some(edit);
+            }
+            _ => {
+                // Forward typing to the focused field. In Edit mode the name is
+                // display-only, so only the value field accepts input.
+                match edit.focus {
+                    EnvVarField::Name if matches!(edit.mode, EnvVarEditMode::Add) => {
+                        edit.name.handle_event(&CtEvent::Key(key));
+                    }
+                    EnvVarField::Value => {
+                        edit.value.handle_event(&CtEvent::Key(key));
+                    }
+                    _ => {}
+                }
+                state.env_var_edit = Some(edit);
+            }
+        },
+        EnvVarEditPhase::Confirming => match key.code {
+            // Esc steps back to editing so the user can tweak, rather than
+            // throwing away what they typed.
+            KeyCode::Esc => {
+                edit.phase = EnvVarEditPhase::Editing;
+                edit.error = None;
+                state.env_var_edit = Some(edit);
+            }
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char('h')
+            | KeyCode::Char('l')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
+                edit.confirm_yes = !edit.confirm_yes;
+                state.env_var_edit = Some(edit);
+            }
+            // Direct yes/no shortcuts, regardless of focus.
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                commit_env_var_edit(state, edit, auth, tx);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {}
+            KeyCode::Enter => {
+                if edit.confirm_yes {
+                    commit_env_var_edit(state, edit, auth, tx);
+                }
+                // else: focus was on Cancel — drop the modal.
+            }
+            _ => {
+                state.env_var_edit = Some(edit);
+            }
+        },
+    }
+}
+
+/// Build the write payload from the confirmed edit, apply the in-flight flag,
+/// and spawn the Azure write. Leaves the modal up (with `in_flight = true`) so
+/// the completion event can close it on success or surface an error on failure.
+fn commit_env_var_edit(
+    state: &mut AppState,
+    mut edit: crate::ui::state::EnvVarEdit,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::azure::resources::ResourceKind;
+
+    let name = edit.name.value().trim().to_string();
+    let value = edit.value.value().to_string();
+    let applied = AppliedEnvEdit {
+        resource_id: edit.resource_id.clone(),
+        kind: edit.resource_kind,
+        name: name.clone(),
+        value: value.clone(),
+        container: edit.container.clone(),
+        is_init: edit.is_init,
+        attribution: edit.attribution.clone(),
+    };
+
+    let write = match edit.resource_kind {
+        ResourceKind::FunctionApp => {
+            // Full-replace: we MUST send every existing setting, so refuse if the
+            // current set isn't cached (a blind write would delete the rest).
+            let Some(current) = state.func_settings.by_resource.get(&edit.resource_id) else {
+                edit.error = Some("settings not loaded — can't safely write".into());
+                state.env_var_edit = Some(edit);
+                return;
+            };
+            let mut settings = current.clone();
+            upsert_env(&mut settings, &name, &value);
+            EnvWrite::FunctionApp { settings }
+        }
+        ResourceKind::ContainerApp => {
+            let Some(container) = edit.container.clone() else {
+                edit.error = Some("no target container resolved".into());
+                state.env_var_edit = Some(edit);
+                return;
+            };
+            EnvWrite::ContainerApp {
+                target: crate::azure::container_app_env_update::EnvTarget {
+                    container,
+                    is_init: edit.is_init,
+                    name: name.clone(),
+                },
+                value: value.clone(),
+            }
+        }
+        _ => {
+            edit.error = Some("this resource kind has no editable env vars".into());
+            state.env_var_edit = Some(edit);
+            return;
+        }
+    };
+
+    edit.in_flight = true;
+    edit.error = None;
+    state.env_var_edit = Some(edit);
+    spawn_env_var_write(auth.clone(), tx.clone(), applied, write);
+}
+
+/// Run the env-var write off the UI thread. In the demo tenant there's nothing
+/// to call, so we report success immediately and let the optimistic cache
+/// update stand (no refetch, which would wipe the simulated edit).
+fn spawn_env_var_write(
+    auth: AzureAuth,
+    tx: UnboundedSender<AppEvent>,
+    applied: AppliedEnvEdit,
+    write: EnvWrite,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::EnvVarWriteCompleted {
+            applied,
+            is_demo: true,
+            result: Ok(()),
+        });
+        return;
+    }
+    let resource_id = applied.resource_id.clone();
+    tokio::spawn(async move {
+        let result = match write {
+            EnvWrite::FunctionApp { settings } => {
+                crate::azure::function_app_settings::update(&auth, &resource_id, &settings).await
+            }
+            EnvWrite::ContainerApp { target, value } => {
+                crate::azure::container_app_env_update::update(&auth, &resource_id, &target, &value)
+                    .await
+            }
+        }
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::EnvVarWriteCompleted {
+            applied,
+            is_demo: false,
+            result,
+        });
+    });
+}
+
+/// Upsert `name=value` into an env-var list (used for both the Function App
+/// write payload and the optimistic cache update). New entries keep the list
+/// name-sorted to match the fetch path's ordering.
+fn upsert_env(vars: &mut Vec<crate::azure::env_vars::EnvVar>, name: &str, value: &str) {
+    if let Some(v) = vars.iter_mut().find(|v| v.name == name) {
+        v.value = value.to_string();
+    } else {
+        vars.push(crate::azure::env_vars::EnvVar {
+            name: name.to_string(),
+            value: value.to_string(),
+            ..Default::default()
+        });
+        vars.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+}
+
+/// Apply a just-confirmed edit to the in-memory cache so the env-vars page shows
+/// the new value immediately, before the confirming refetch lands.
+fn apply_env_edit_to_cache(state: &mut AppState, applied: &AppliedEnvEdit) {
+    use crate::azure::resources::ResourceKind;
+    match applied.kind {
+        ResourceKind::FunctionApp => {
+            let vars = state
+                .func_settings
+                .by_resource
+                .entry(applied.resource_id.clone())
+                .or_default();
+            upsert_env(vars, &applied.name, &applied.value);
+        }
+        ResourceKind::ContainerApp => {
+            if let Some(ov) = state
+                .container_app_overview
+                .by_resource
+                .get_mut(&applied.resource_id)
+            {
+                let existing = ov.env_vars.iter_mut().find(|v| {
+                    v.name == applied.name
+                        && v.container == applied.container
+                        && v.is_init == applied.is_init
+                });
+                if let Some(v) = existing {
+                    v.value = applied.value.clone();
+                } else {
+                    ov.env_vars.push(crate::azure::env_vars::EnvVar {
+                        name: applied.name.clone(),
+                        value: applied.value.clone(),
+                        is_secret: false,
+                        attribution: applied.attribution.clone(),
+                        container: applied.container.clone(),
+                        is_init: applied.is_init,
+                    });
+                    // Match explode_container_env's name-then-container ordering.
+                    ov.env_vars.sort_by(|a, b| {
+                        a.name
+                            .cmp(&b.name)
+                            .then_with(|| a.attribution.cmp(&b.attribution))
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Re-pull the selected resource's env vars after a successful write to confirm
+/// the server-side state (and pick up any normalization). Non-destructive: the
+/// optimistic value stays visible until the fresh data overwrites it.
+fn refetch_env_after_write(
+    state: &mut AppState,
+    applied: &AppliedEnvEdit,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::azure::resources::ResourceKind;
+    match applied.kind {
+        ResourceKind::FunctionApp
+            if state
+                .func_settings
+                .pending
+                .insert(applied.resource_id.clone()) =>
+        {
+            spawn_load_function_app_settings(auth.clone(), applied.resource_id.clone(), tx.clone());
+        }
+        ResourceKind::ContainerApp
+            if state
+                .container_app_overview
+                .pending
+                .insert(applied.resource_id.clone()) =>
+        {
+            spawn_load_container_app_overview(
+                auth.clone(),
+                applied.resource_id.clone(),
+                tx.clone(),
+            );
+        }
+        _ => {}
     }
 }
 
@@ -4501,6 +4874,82 @@ mod tests {
         // `j` after a stale `g` should be MoveDown, not GotoTop.
         assert_eq!(a, Action::MoveDown);
         assert!(input.pending_chord.is_none());
+    }
+
+    #[test]
+    fn demo_edit_flow_commits_and_updates_cache() {
+        use crate::azure::env_vars::EnvVar;
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/fn".into(),
+            name: "func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        state.func_settings.by_resource.insert(
+            "/r/fn".into(),
+            vec![EnvVar {
+                name: "API_KEY".into(),
+                value: "old".into(),
+                ..Default::default()
+            }],
+        );
+
+        // Ctrl+E opens the editor seeded with the selected var.
+        assert!(crate::ui::views::env_vars::handle(
+            Action::EditEnvVar,
+            &mut state
+        ));
+        // Type a new value into the (focused) value field.
+        state.env_var_edit.as_mut().unwrap().value =
+            tui_input::Input::default().with_value("new".into());
+
+        // Enter advances Editing -> Confirming (guarded, no write yet).
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        handle_env_var_edit_key(&mut state, enter, &auth, &tx);
+        assert_eq!(
+            state.env_var_edit.as_ref().unwrap().phase,
+            EnvVarEditPhase::Confirming
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no write should fire before confirm"
+        );
+
+        // `y` confirms; the demo spawn reports success synchronously.
+        handle_env_var_edit_key(&mut state, k('y'), &auth, &tx);
+        match rx.try_recv().expect("completion event") {
+            AppEvent::EnvVarWriteCompleted {
+                applied,
+                is_demo,
+                result,
+            } => {
+                assert!(is_demo);
+                assert!(result.is_ok());
+                assert_eq!(applied.name, "API_KEY");
+                assert_eq!(applied.value, "new");
+                apply_env_edit_to_cache(&mut state, &applied);
+            }
+            _ => panic!("expected EnvVarWriteCompleted"),
+        }
+        let vars = &state.func_settings.by_resource["/r/fn"];
+        assert_eq!(
+            vars.iter().find(|v| v.name == "API_KEY").unwrap().value,
+            "new"
+        );
     }
 
     #[test]

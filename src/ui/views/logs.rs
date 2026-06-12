@@ -20,7 +20,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  e errors-only  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  e errors-only  s source  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -101,6 +101,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             header_spans.push(Span::styled(
                 "· filter: errors only ✓ ",
                 Style::default().fg(theme.degraded),
+            ));
+        }
+        if let Some(src) = state.logs.source_filter.as_deref() {
+            header_spans.push(Span::styled(
+                format!("· source: {src} "),
+                Style::default().fg(theme.accent),
             ));
         }
         if state.logs.search_active || !state.logs.search_input.value().is_empty() {
@@ -203,14 +209,25 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
 
-    let lines = lines.map(|v| v.as_slice()).unwrap_or(&[]);
-    if lines.is_empty() {
+    if lines.map(|v| v.is_empty()).unwrap_or(true) {
         center_message(frame, body, "no log lines in window.", theme.muted);
         render_footer(frame, chunks[2], theme, footer_text);
         return;
     }
 
-    render_table(frame, body, lines, state, theme);
+    // The table renders the source-filtered view of the cache; an active
+    // filter that matches nothing gets its own message (distinct from "the
+    // window is empty") so the user knows `s` is what hid the rows.
+    let visible = state.visible_log_lines(&resource.id);
+    if visible.is_empty() {
+        let src = state.logs.source_filter.as_deref().unwrap_or_default();
+        let msg = format!("no cached lines from source '{src}' — press s to cycle.");
+        center_message(frame, body, &msg, theme.muted);
+        render_footer(frame, chunks[2], theme, footer_text);
+        return;
+    }
+
+    render_table(frame, body, &visible, state, theme);
     render_footer(frame, chunks[2], theme, footer_text);
 }
 
@@ -222,7 +239,13 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
     frame.render_widget(p, area);
 }
 
-fn render_table(frame: &mut Frame, area: Rect, lines: &[LogLine], state: &AppState, theme: &Theme) {
+fn render_table(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[&LogLine],
+    state: &AppState,
+    theme: &Theme,
+) {
     let wrap = state.logs.wrap;
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
     let query = state.logs.search_input.value();
@@ -557,7 +580,7 @@ fn line_height(l: &LogLine, wrap: bool, source_w: usize, msg_w: usize) -> usize 
 /// persists it for the next frame. Rows can exceed one cell in wrap mode, so
 /// "fits" is measured in accumulated cell heights, not row counts.
 fn visible_range(
-    lines: &[LogLine],
+    lines: &[&LogLine],
     view_top: usize,
     cursor: usize,
     data_height: usize,
@@ -604,17 +627,17 @@ fn visible_range(
 /// Walk forward from `top`, accumulating row heights until the viewport is
 /// full, returning the last row that fits (at minimum `top` itself).
 fn forward_end(
-    lines: &[LogLine],
+    lines: &[&LogLine],
     top: usize,
     data_height: usize,
     wrap: bool,
     source_w: usize,
     msg_w: usize,
 ) -> usize {
-    let mut used = line_height(&lines[top], wrap, source_w, msg_w);
+    let mut used = line_height(lines[top], wrap, source_w, msg_w);
     let mut end = top;
     while end + 1 < lines.len() {
-        let h = line_height(&lines[end + 1], wrap, source_w, msg_w);
+        let h = line_height(lines[end + 1], wrap, source_w, msg_w);
         if used + h > data_height {
             break;
         }
@@ -627,17 +650,17 @@ fn forward_end(
 /// Walk backward from `bottom` so that `bottom` is the last visible row,
 /// returning the resulting viewport top.
 fn backward_start(
-    lines: &[LogLine],
+    lines: &[&LogLine],
     bottom: usize,
     data_height: usize,
     wrap: bool,
     source_w: usize,
     msg_w: usize,
 ) -> usize {
-    let mut used = line_height(&lines[bottom], wrap, source_w, msg_w);
+    let mut used = line_height(lines[bottom], wrap, source_w, msg_w);
     let mut start = bottom;
     while start > 0 {
-        let h = line_height(&lines[start - 1], wrap, source_w, msg_w);
+        let h = line_height(lines[start - 1], wrap, source_w, msg_w);
         if used + h > data_height {
             break;
         }
@@ -831,10 +854,11 @@ fn deepest_error(err: &serde_json::Value) -> (Option<String>, Option<String>) {
 }
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // Navigation bounds run over the *visible* lines — the source-filtered
+    // view of the cache — since that's what `logs.scroll` indexes into.
     let lines_len = state
         .selected_resource()
-        .and_then(|r| state.logs.by_resource.get(&r.id))
-        .map(|v| v.len())
+        .map(|r| state.visible_log_lines(&r.id).len())
         .unwrap_or(0);
 
     // Search-input focus: only a small set of actions reach this handler — the
@@ -875,6 +899,10 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             state.logs.scroll = 0;
             state.logs.view_top.set(0);
+            true
+        }
+        Action::CycleSourceFilter => {
+            cycle_source_filter(state);
             true
         }
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
@@ -983,6 +1011,35 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
 }
 
+/// Advance the source filter: all → first source → … → last source → all,
+/// over the distinct `LogLine::source` values in the cached buffer, sorted so
+/// the cycle order is stable while pages stream in. A current filter that no
+/// longer matches any cached source (e.g. after a window change refetched the
+/// buffer) drops back to "all". The cursor resets — row indexes mean something
+/// different under the new filter.
+fn cycle_source_filter(state: &mut AppState) {
+    let Some(id) = state.selected_resource().map(|r| r.id.clone()) else {
+        return;
+    };
+    let mut sources: Vec<String> = state
+        .logs
+        .by_resource
+        .get(&id)
+        .map(|lines| lines.iter().map(|l| l.source.clone()).collect())
+        .unwrap_or_default();
+    sources.sort();
+    sources.dedup();
+    state.logs.source_filter = match state.logs.source_filter.as_deref() {
+        None => sources.first().cloned(),
+        Some(cur) => sources
+            .iter()
+            .position(|s| s == cur)
+            .and_then(|i| sources.get(i + 1).cloned()),
+    };
+    state.logs.scroll = 0;
+    state.logs.view_top.set(0);
+}
+
 /// True iff the log line's source or message contains `query` (case-insensitive
 /// ASCII). Empty query never matches — callers should short-circuit so `n`
 /// isn't a hidden GotoBottom alias.
@@ -1006,14 +1063,12 @@ fn jump_to_match(state: &mut AppState, direction: i32) {
     let Some(resource_id) = state.selected_resource().map(|r| r.id.clone()) else {
         return;
     };
-    let Some(lines) = state.logs.by_resource.get(&resource_id) else {
-        return;
-    };
+    let lines = state.visible_log_lines(&resource_id);
     if lines.is_empty() {
         return;
     }
     let cursor = state.logs.scroll.min(lines.len() - 1);
-    let next = find_next_match(lines, cursor, &query, direction);
+    let next = find_next_match(&lines, cursor, &query, direction);
     if let Some(idx) = next {
         state.logs.scroll = idx;
     }
@@ -1021,7 +1076,12 @@ fn jump_to_match(state: &mut AppState, direction: i32) {
 
 /// Find the next/previous matching line index, starting *after* (or *before*)
 /// `cursor` and wrapping around once.
-fn find_next_match(lines: &[LogLine], cursor: usize, query: &str, direction: i32) -> Option<usize> {
+fn find_next_match(
+    lines: &[&LogLine],
+    cursor: usize,
+    query: &str,
+    direction: i32,
+) -> Option<usize> {
     if lines.is_empty() {
         return None;
     }
@@ -1035,12 +1095,12 @@ fn find_next_match(lines: &[LogLine], cursor: usize, query: &str, direction: i32
         } else if idx >= n as isize {
             idx = 0;
         }
-        if line_matches(&lines[idx as usize], query) {
+        if line_matches(lines[idx as usize], query) {
             return Some(idx as usize);
         }
     }
     // No other match — if the current line itself matches, stay put.
-    if line_matches(&lines[cursor], query) {
+    if line_matches(lines[cursor], query) {
         Some(cursor)
     } else {
         None
@@ -1118,6 +1178,73 @@ mod tests {
         s.list_cursor = 0;
         s.view = View::Logs;
         s
+    }
+
+    #[test]
+    fn source_filter_cycles_through_sorted_sources_and_back_to_all() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![
+                line(1, LogLevel::Info, "reports", "from the app"),
+                line(2, LogLevel::Info, "http-auth", "from the middleware"),
+                line(3, LogLevel::Info, "reports", "more app output"),
+            ],
+        );
+        state.logs.scroll = 2;
+
+        // all → http-auth → reports → all (alphabetical), cursor reset each step.
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter.as_deref(), Some("http-auth"));
+        assert_eq!(state.logs.scroll, 0);
+        assert_eq!(state.visible_log_lines(&id).len(), 1);
+
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter.as_deref(), Some("reports"));
+        assert_eq!(state.visible_log_lines(&id).len(), 2);
+
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter, None);
+        assert_eq!(state.visible_log_lines(&id).len(), 3);
+    }
+
+    #[test]
+    fn stale_source_filter_drops_back_to_all() {
+        // A filter naming a source that's gone from the buffer (e.g. the
+        // window changed and the refetch brought different rows) must clear
+        // on the next cycle rather than walking a phantom list.
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state
+            .logs
+            .by_resource
+            .insert(id.clone(), vec![line(1, LogLevel::Info, "reports", "x")]);
+        state.logs.source_filter = Some("gone".into());
+        assert!(state.visible_log_lines(&id).is_empty());
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter, None);
+    }
+
+    #[test]
+    fn render_shows_source_filter_chip_and_filtered_rows() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "reports", "from the app"),
+                line(2, LogLevel::Info, "http-auth", "from the middleware"),
+            ],
+        );
+        state.logs.source_filter = Some("http-auth".into());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("source: http-auth"), "header chip in {s}");
+        assert!(s.contains("from the middleware"));
+        assert!(!s.contains("from the app"), "filtered row leaked: {s}");
     }
 
     #[test]
@@ -1439,13 +1566,15 @@ mod tests {
         // Three lines: a, big, c. With wrap and a small viewport, the cursor
         // row (the 4-cell middle one) must stay visible even though it fills the
         // whole area on its own.
-        let lines = vec![
+        //
+        let lines = [
             line(1, LogLevel::Info, "s", "a"),
             line(2, LogLevel::Info, "s", &"x".repeat(80)),
             line(3, LogLevel::Info, "s", "c"),
         ];
         // 20-wide message column → middle row is 4 cells tall; data_height 4
         // forces it to be the only row.
+        let lines: Vec<&LogLine> = lines.iter().collect();
         let (start, end) = visible_range(&lines, 1, 1, 4, true, 32, 20);
         assert_eq!((start, end), (1, 1));
     }
@@ -1456,6 +1585,7 @@ mod tests {
         let lines: Vec<LogLine> = (0..10)
             .map(|i| line(i, LogLevel::Info, "s", &format!("line {i}")))
             .collect();
+        let lines: Vec<&LogLine> = lines.iter().collect();
         let vr = |top, cur| visible_range(&lines, top, cur, 3, false, 32, 40);
 
         // Cursor moving down *within* the window leaves it anchored…
@@ -1475,6 +1605,7 @@ mod tests {
         // Buffer smaller than the viewport: a stale high `view_top` must not
         // leave blank space — the window snaps back so row 0 is visible.
         let lines: Vec<LogLine> = (0..3).map(|i| line(i, LogLevel::Info, "s", "x")).collect();
+        let lines: Vec<&LogLine> = lines.iter().collect();
         assert_eq!(visible_range(&lines, 2, 2, 10, false, 32, 40), (0, 2));
     }
 

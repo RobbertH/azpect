@@ -487,24 +487,30 @@ pub fn container_app_overview(resource_id: &str) -> ContainerAppOverview {
             name: "ASPNETCORE_ENVIRONMENT".to_string(),
             value: "Production".to_string(),
             is_secret: false,
-            attribution: None,
-            diverges: false,
+            ..Default::default()
         },
         EnvVar {
             name: "ORDERS_DB_CONNECTION".to_string(),
             value: "secretref:orders-db-connection".to_string(),
             is_secret: true,
-            attribution: None,
-            diverges: false,
+            ..Default::default()
         },
         EnvVar {
             name: "SERVICEBUS_NAMESPACE".to_string(),
             value: "sb-contoso-prod.servicebus.windows.net".to_string(),
             is_secret: false,
-            attribution: None,
-            diverges: false,
+            ..Default::default()
         },
     ];
+    let containers = vec![ContainerSpec {
+        name: app.to_string(),
+        image: Some(format!("crcontosoprod.azurecr.io/{app}:1.7.3")),
+        cpu_millicores: 500,
+        memory_bytes: 1024 * 1024 * 1024,
+        ephemeral_storage: Some("2Gi".to_string()),
+        env_vars,
+        is_init: false,
+    }];
     ContainerAppOverview {
         cpu_millicores: 500,
         memory_bytes: 1024 * 1024 * 1024,
@@ -515,16 +521,8 @@ pub fn container_app_overview(resource_id: &str) -> ContainerAppOverview {
         access_restricted: false,
         managed_environment: Some("cae-contoso-prod".to_string()),
         managed_identity: Some("SystemAssigned".to_string()),
-        env_vars: env_vars.clone(),
-        containers: vec![ContainerSpec {
-            name: app.to_string(),
-            image: Some(format!("crcontosoprod.azurecr.io/{app}:1.7.3")),
-            cpu_millicores: 500,
-            memory_bytes: 1024 * 1024 * 1024,
-            ephemeral_storage: Some("2Gi".to_string()),
-            env_vars,
-            is_init: false,
-        }],
+        env_vars: crate::azure::container_app_overview::explode_container_env(&containers),
+        containers,
     }
 }
 
@@ -568,8 +566,7 @@ pub fn function_app_settings(_resource_id: &str) -> Vec<EnvVar> {
         name: name.to_string(),
         value: value.to_string(),
         is_secret: secret,
-        attribution: None,
-        diverges: false,
+        ..Default::default()
     };
     vec![
         var("FUNCTIONS_EXTENSION_VERSION", "~4", false),
@@ -1356,10 +1353,14 @@ fn container_app_log_lines(app: &str, range: TimeRange) -> Vec<LogLine> {
             line(
                 ts,
                 level,
-                "ContainerAppConsoleLogs",
+                // Real rows surface the emitting container as the source (see
+                // `logs::parse_container_app_row`); the demo app runs a single
+                // container named after the app (matching `demo::replicas`).
+                app,
                 msg,
                 vec![
                     ("ContainerAppName", app.to_string()),
+                    ("ContainerName", app.to_string()),
                     ("RevisionName", format!("{app}--v42")),
                 ],
             )

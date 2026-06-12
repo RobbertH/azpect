@@ -4,8 +4,9 @@
 //! the environment variables merged across all containers. CPU/memory are summed
 //! across containers in the template — that's the spec a user pays for, even on
 //! apps with a sidecar. (Ephemeral storage is kept per container, not summed,
-//! since it's a per-container `resources` setting; env vars are merged with
-//! per-container attribution rather than summed.)
+//! since it's a per-container `resources` setting; env vars are exploded one row
+//! per `(container, var)` rather than summed, so each maps 1:1 to a template
+//! entry for write-back.)
 //!
 //! (The struct keeps the historical `ContainerAppOverview` name; it now carries
 //! more than limits, all read from the one GET so there's no extra round trip.)
@@ -43,9 +44,10 @@ pub struct ContainerAppOverview {
     /// One-line managed-identity summary (see [`summarize_identity`]). `None`
     /// when the app has no managed identity configured.
     pub managed_identity: Option<String>,
-    /// Environment variables merged across ALL containers in the template (see
-    /// [`merge_container_env`]), each carrying per-container attribution. Masked
-    /// in the UI by default; see [`crate::azure::env_vars`].
+    /// Environment variables exploded one row per `(container, var)` across ALL
+    /// containers in the template (see [`explode_container_env`]), each carrying
+    /// its owning-container label + raw write-target identity. Masked in the UI
+    /// by default; see [`crate::azure::env_vars`].
     pub env_vars: Vec<EnvVar>,
     /// Per-container specs from the template, in declaration order. A revision
     /// can define multiple containers (main app + sidecars); they all run in
@@ -77,9 +79,9 @@ pub struct ContainerSpec {
     pub ephemeral_storage: Option<String>,
     /// This container's own environment variables (its `env` array). Each
     /// container in a revision carries its own — sidecars and init containers
-    /// can define different vars from the main app. Folded into the app-level
-    /// [`ContainerAppOverview::env_vars`] by [`merge_container_env`]; the
-    /// `attribution`/`diverges` fields are left unset here (per-container view).
+    /// can define different vars from the main app. Exploded into the app-level
+    /// [`ContainerAppOverview::env_vars`] by [`explode_container_env`]; the
+    /// `attribution`/`container` fields are left unset here (per-container view).
     pub env_vars: Vec<EnvVar>,
     /// `true` when this entry came from `template.initContainers` rather than
     /// `template.containers`. Init containers run before the main containers
@@ -175,9 +177,10 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
     for c in init_containers {
         total.containers.push(extract_container_spec(c, true));
     }
-    // Env vars are the union across ALL containers (with per-container
-    // attribution), not just the primary one — a sidecar's config is real.
-    total.env_vars = merge_container_env(&total.containers);
+    // Env vars are exploded one row per (container, var) across ALL containers —
+    // a sidecar's config is real, and keeping rows 1:1 with template entries is
+    // what lets the edit path write a change back unambiguously.
+    total.env_vars = explode_container_env(&total.containers);
     total
 }
 
@@ -235,32 +238,23 @@ fn extract_container_spec(c: &serde_json::Value, is_init: bool) -> ContainerSpec
     }
 }
 
-/// Fold every container's env vars into a single attributed display list for the
-/// env-vars page. Groups by name, then by `(value, is_secret)`:
-/// - same `(name, value)` across containers ⇒ ONE row, attributed to the
-///   containers that hold it (`"all (N)"` when every container does, else a
-///   capped name list);
-/// - same `name` with DIFFERING values ⇒ one row per distinct value, each marked
-///   `diverges` so the env page can flag the config drift instead of silently
-///   showing just the first container's value.
+/// Flatten every container's env vars into one row *per container per variable*,
+/// staying faithful to the Azure data model: each row maps back to exactly one
+/// `template.containers[i].env[j]` entry, which is what makes a safe write-back
+/// possible (no merge to reverse). Every row carries:
+/// - `attribution` — the owning container's display label (its name, with an
+///   `(init)` suffix for init containers) — always set for Container Apps so the
+///   env-vars page shows the container column even for single-container apps;
+/// - `container` + `is_init` — the raw target identity used to locate the exact
+///   template entry on write.
 ///
-/// Attribution is suppressed (`None`) when there's ≤1 container — there's
-/// nothing to attribute, so the env page hides the column and reads as before.
-/// Init containers participate like any other; their names are tagged `(init)`
-/// so a startup-only var isn't mistaken for a long-running one.
-pub fn merge_container_env(containers: &[ContainerSpec]) -> Vec<EnvVar> {
-    use std::collections::BTreeMap;
-
-    let total = containers.len();
-    // name -> (value, is_secret) -> owning container display-names.
-    let mut by_name: BTreeMap<&str, BTreeMap<(&str, bool), Vec<String>>> = BTreeMap::new();
+/// Rows are sorted by name, then by container label, for stable rendering.
+/// Unnamed containers (shouldn't happen on Azure payloads) fall back to a
+/// positional `#idx` label so two of them stay distinguishable.
+pub fn explode_container_env(containers: &[ContainerSpec]) -> Vec<EnvVar> {
+    let mut out: Vec<EnvVar> = Vec::new();
     for (idx, c) in containers.iter().enumerate() {
-        // Owner labels must be UNIQUE per container so that `owners.dedup()`
-        // below only collapses a container listing the same var twice — not two
-        // distinct containers. An empty name (shouldn't happen on Azure payloads)
-        // therefore falls back to a positional `#idx`, not a shared `?`, so
-        // multiple unnamed containers still count toward `all (N)`.
-        let owner = if c.name.is_empty() {
+        let label = if c.name.is_empty() {
             format!("#{idx}")
         } else if c.is_init {
             format!("{} (init)", c.name)
@@ -268,59 +262,22 @@ pub fn merge_container_env(containers: &[ContainerSpec]) -> Vec<EnvVar> {
             c.name.clone()
         };
         for ev in &c.env_vars {
-            by_name
-                .entry(ev.name.as_str())
-                .or_default()
-                .entry((ev.value.as_str(), ev.is_secret))
-                .or_default()
-                .push(owner.clone());
-        }
-    }
-
-    let mut out: Vec<EnvVar> = Vec::new();
-    for (name, values) in &by_name {
-        let diverges = values.len() > 1;
-        for ((value, is_secret), owners) in values {
-            let mut owners = owners.clone();
-            owners.sort();
-            owners.dedup();
-            let attribution = if total <= 1 {
-                None
-            } else if owners.len() == total {
-                Some(format!("all ({total})"))
-            } else {
-                Some(cap_owner_list(&owners))
-            };
             out.push(EnvVar {
-                name: (*name).to_string(),
-                value: (*value).to_string(),
-                is_secret: *is_secret,
-                attribution,
-                diverges,
+                name: ev.name.clone(),
+                value: ev.value.clone(),
+                is_secret: ev.is_secret,
+                attribution: Some(label.clone()),
+                container: Some(c.name.clone()),
+                is_init: c.is_init,
             });
         }
     }
-    // Name-major, then value, then is_secret — a total order so the output is
-    // deterministic even when a name has the same value as both a literal and a
-    // secretRef across containers.
     out.sort_by(|a, b| {
         a.name
             .cmp(&b.name)
-            .then_with(|| a.value.cmp(&b.value))
-            .then_with(|| a.is_secret.cmp(&b.is_secret))
+            .then_with(|| a.attribution.cmp(&b.attribution))
     });
     out
-}
-
-/// Comma-join container names, capping at 3 with a ` +N` overflow suffix so a
-/// var shared by many containers doesn't blow out the attribution column.
-fn cap_owner_list(names: &[String]) -> String {
-    const CAP: usize = 3;
-    if names.len() <= CAP {
-        names.join(", ")
-    } else {
-        format!("{}, +{}", names[..CAP].join(", "), names.len() - CAP)
-    }
 }
 
 /// Summarize an ARM `identity` object into one display line. Returns `None`
@@ -622,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn single_container_env_vars_have_no_attribution() {
+    fn single_container_env_vars_carry_their_container_label() {
         let v = json!({
             "properties": {
                 "template": {
@@ -642,13 +599,20 @@ mod tests {
         // Sorted by name: LOG_LEVEL, TOKEN.
         assert_eq!(l.env_vars[0].name, "LOG_LEVEL");
         assert!(l.env_vars[1].is_secret);
-        // One container ⇒ attribution is meaningless and suppressed; no drift.
-        assert!(l.env_vars.iter().all(|e| e.attribution.is_none()));
-        assert!(l.env_vars.iter().all(|e| !e.diverges));
+        // Always-explode: even a single container labels every row (and carries
+        // the raw target identity for write-back).
+        assert!(l
+            .env_vars
+            .iter()
+            .all(|e| e.attribution.as_deref() == Some("app")));
+        assert!(l
+            .env_vars
+            .iter()
+            .all(|e| e.container.as_deref() == Some("app") && !e.is_init));
     }
 
     #[test]
-    fn env_vars_merge_across_containers_with_attribution_and_divergence() {
+    fn env_vars_explode_one_row_per_container_and_var() {
         let v = json!({
             "properties": {
                 "template": {
@@ -676,28 +640,27 @@ mod tests {
         });
         let l = extract(&v);
 
-        // SHARED: same value in both ⇒ one row, "all (2)", no divergence.
+        // SHARED: one row PER container now (no merge), each tagged to its owner.
         let shared: Vec<_> = l.env_vars.iter().filter(|e| e.name == "SHARED").collect();
-        assert_eq!(shared.len(), 1);
-        assert_eq!(shared[0].attribution.as_deref(), Some("all (2)"));
-        assert!(!shared[0].diverges);
+        assert_eq!(shared.len(), 2);
+        // Sorted by name then container label: files before http-auth.
+        assert_eq!(shared[0].attribution.as_deref(), Some("files"));
+        assert_eq!(shared[0].container.as_deref(), Some("files"));
+        assert_eq!(shared[1].attribution.as_deref(), Some("http-auth"));
 
-        // LOG_LEVEL: differing values ⇒ two rows, each attributed to its single
-        // owning container, both flagged as diverging.
+        // LOG_LEVEL: each container keeps its own value verbatim, no `diverges`.
         let log: Vec<_> = l
             .env_vars
             .iter()
             .filter(|e| e.name == "LOG_LEVEL")
             .collect();
         assert_eq!(log.len(), 2);
-        assert!(log.iter().all(|e| e.diverges));
-        // Value-minor sort: "debug" (http-auth) precedes "info" (files).
-        assert_eq!(log[0].value, "debug");
-        assert_eq!(log[0].attribution.as_deref(), Some("http-auth"));
-        assert_eq!(log[1].value, "info");
-        assert_eq!(log[1].attribution.as_deref(), Some("files"));
+        assert_eq!(log[0].attribution.as_deref(), Some("files"));
+        assert_eq!(log[0].value, "info");
+        assert_eq!(log[1].attribution.as_deref(), Some("http-auth"));
+        assert_eq!(log[1].value, "debug");
 
-        // FILES_ONLY: present in one container only ⇒ that container's name.
+        // FILES_ONLY: present in one container only ⇒ that single row.
         let only: Vec<_> = l
             .env_vars
             .iter()
@@ -705,14 +668,43 @@ mod tests {
             .collect();
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].attribution.as_deref(), Some("files"));
-        assert!(!only[0].diverges);
     }
 
     #[test]
-    fn merge_counts_unnamed_containers_distinctly() {
-        // Two (theoretically) unnamed containers both define the same var. Each
-        // gets a positional fallback owner, so they're NOT collapsed by dedup and
-        // the var correctly reads as shared by all of them.
+    fn explode_tags_init_containers_and_carries_target_identity() {
+        let mkvar = |name: &str, value: &str| EnvVar {
+            name: name.into(),
+            value: value.into(),
+            ..Default::default()
+        };
+        let containers = vec![
+            ContainerSpec {
+                name: "app".into(),
+                env_vars: vec![mkvar("PORT", "8080")],
+                ..Default::default()
+            },
+            ContainerSpec {
+                name: "migrate".into(),
+                is_init: true,
+                env_vars: vec![mkvar("PORT", "5432")],
+                ..Default::default()
+            },
+        ];
+        let rows = explode_container_env(&containers);
+        assert_eq!(rows.len(), 2);
+        // Same name in two containers ⇒ two rows; the init one is labelled and
+        // flagged so write-back can target the right template array.
+        let init = rows.iter().find(|e| e.is_init).unwrap();
+        assert_eq!(init.attribution.as_deref(), Some("migrate (init)"));
+        assert_eq!(init.container.as_deref(), Some("migrate"));
+        assert_eq!(init.value, "5432");
+        let main = rows.iter().find(|e| !e.is_init).unwrap();
+        assert_eq!(main.container.as_deref(), Some("app"));
+        assert_eq!(main.value, "8080");
+    }
+
+    #[test]
+    fn explode_distinguishes_unnamed_containers() {
         let mkvar = |name: &str, value: &str| EnvVar {
             name: name.into(),
             value: value.into(),
@@ -728,39 +720,11 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let merged = merge_container_env(&containers);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].attribution.as_deref(), Some("all (2)"));
-        assert!(!merged[0].diverges);
-    }
-
-    #[test]
-    fn merge_dedups_a_single_containers_duplicate_var() {
-        // A container that lists the same (name,value) twice must not inflate its
-        // owner count — otherwise a 2-container app could mislabel as `all`.
-        let mkvar = |name: &str, value: &str| EnvVar {
-            name: name.into(),
-            value: value.into(),
-            ..Default::default()
-        };
-        let containers = vec![
-            ContainerSpec {
-                name: "a".into(),
-                env_vars: vec![mkvar("X", "1"), mkvar("X", "1")],
-                ..Default::default()
-            },
-            ContainerSpec {
-                name: "b".into(),
-                env_vars: vec![mkvar("Y", "2")],
-                ..Default::default()
-            },
-        ];
-        let merged = merge_container_env(&containers);
-        let x: Vec<_> = merged.iter().filter(|e| e.name == "X").collect();
-        // X exists only in `a` (listed twice) ⇒ one row attributed to `a` alone,
-        // never "all (2)".
-        assert_eq!(x.len(), 1);
-        assert_eq!(x[0].attribution.as_deref(), Some("a"));
+        let rows = explode_container_env(&containers);
+        // Two unnamed containers ⇒ two distinct rows with positional labels.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].attribution.as_deref(), Some("#0"));
+        assert_eq!(rows[1].attribution.as_deref(), Some("#1"));
     }
 
     #[test]

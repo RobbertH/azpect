@@ -862,9 +862,9 @@ fn push_template_container_rows(
     }
 }
 
-/// Emit a block of rows per live replica: a header row carrying the replica's
-/// trailing random suffix (the long prefix repeats across every replica of the
-/// same revision, so only the suffix is shown) plus its aggregate `runningState`
+/// Emit a block of rows per live replica: a header row carrying the replica
+/// name minus its app-name prefix (which repeats on every replica and is
+/// already the page title) plus its aggregate `runningState`
 /// in parens, followed by one indented sub-row per container with its readiness
 /// glyph and restart count. This mirrors the `container config:` block above so
 /// the live runtime reads the same way as the configured template. Sorted
@@ -973,13 +973,14 @@ fn replica_status_lines(
     Vec::new()
 }
 
-/// Trim a full replica name (`<app>--<revsuffix>-<random>`) to its trailing
-/// random component. The full prefix is identical across every replica of the
-/// same revision, so showing only the suffix loses nothing and saves ~40 cols.
-/// Falls back to the full name if there's no `-` to split on.
+/// Trim a full replica name (`<app>--<revsuffix>-<hash>-<random>`) to the part
+/// after the `--` separator. The app-name prefix repeats on every replica and
+/// is already the page title, so dropping it loses nothing — while the kept
+/// `<revsuffix>-<hash>-<random>` still says which revision the replica belongs
+/// to and needs no ellipsis. Falls back to the full name if there's no `--`.
 fn short_replica_name(full: &str) -> String {
-    match full.rsplit_once('-') {
-        Some((_, tail)) if !tail.is_empty() => format!("\u{2026}{tail}"),
+    match full.split_once("--") {
+        Some((_, tail)) if !tail.is_empty() => tail.to_string(),
         _ => full.to_string(),
     }
 }
@@ -1516,9 +1517,19 @@ fn summary_for(
             let total = s.sum();
             format!("total: {}{}", format_count(total), unit_suffix(s))
         }
+        // CPU / Memory read `latest / highest / max`: the most recent sample,
+        // the window peak (what the tallest sparkline bar represents — without
+        // it the chart has no readable scale), and the configured limit.
         MetricKind::Cpu => {
             let latest = s.latest().unwrap_or(0.0);
-            let base = format!("latest: {}{}", format_value(latest), unit_suffix(s));
+            // Window peak; the `.max(0.0)` turns an empty series' -inf into 0.
+            let highest = s.max().max(0.0);
+            let suffix = unit_suffix(s);
+            let base = format!(
+                "latest: {}{suffix} / highest: {}{suffix}",
+                format_value(latest),
+                format_value(highest),
+            );
             match limits.map(|l| l.cpu_millicores).filter(|m| *m > 0) {
                 Some(max_mc) => format!("{base} / max {max_mc} mCores"),
                 None => base,
@@ -1526,7 +1537,13 @@ fn summary_for(
         }
         MetricKind::Memory => {
             let latest = s.latest().unwrap_or(0.0);
-            let base = format!("latest: {}{}", format_bytes(latest), unit_suffix(s));
+            let highest = s.max().max(0.0);
+            let suffix = unit_suffix(s);
+            let base = format!(
+                "latest: {}{suffix} / highest: {}{suffix}",
+                format_bytes(latest),
+                format_bytes(highest),
+            );
             match limits.map(|l| l.memory_bytes).filter(|b| *b > 0) {
                 Some(max_b) => format!("{base} / max {}", format_bytes(max_b as f64)),
                 None => base,
@@ -2795,9 +2812,11 @@ mod tests {
         // One header row (the replica suffix) + one sub-row per container.
         assert_eq!(lines.len(), 4);
         assert_eq!(lines[0].0, "instances:");
-        // Header carries the suffix with its leading ellipsis and the replica's
-        // aggregate running state in parens.
-        assert!(lines[0].1.contains("\u{2026}r58pz"));
+        // Header carries everything after the app-name prefix (revision suffix
+        // included, no ellipsis) and the replica's aggregate running state in
+        // parens.
+        assert!(lines[0].1.contains("rev-suffix-r58pz"));
+        assert!(!lines[0].1.contains('\u{2026}'));
         assert!(lines[0].1.contains("(Running)"));
         // Container sub-rows are blank-label continuations, each with its own
         // readiness glyph (✓ for Ready=true) and restart count.
@@ -2871,7 +2890,7 @@ mod tests {
         let lines = replica_status_lines(Some(&replicas), false, None);
         // Header carries the suffix but no `(state)` parens when Azure didn't
         // report a replica-level runningState (avoids an empty `()`).
-        assert!(lines[0].1.contains("\u{2026}abc12"));
+        assert!(lines[0].1.contains("rev-suffix-abc12"));
         assert!(
             !lines[0].1.contains('('),
             "no empty parens: {:?}",
@@ -3137,10 +3156,16 @@ mod tests {
             kind: MetricKind::Cpu,
             label: String::new(),
             unit: "mCores".into(),
-            points: vec![MetricPoint {
-                ts: Utc::now(),
-                value: 12.5,
-            }],
+            points: vec![
+                MetricPoint {
+                    ts: Utc::now(),
+                    value: 86.4,
+                },
+                MetricPoint {
+                    ts: Utc::now(),
+                    value: 12.5,
+                },
+            ],
         };
         let limits = ContainerAppOverview {
             cpu_millicores: 500,
@@ -3149,7 +3174,9 @@ mod tests {
             ..Default::default()
         };
         let out = summary_for(MetricKind::Cpu, &series, Some(&limits));
-        assert!(out.contains("12.5"));
+        // `latest / highest / max`: last sample, window peak, configured limit.
+        assert!(out.contains("latest: 12.5"));
+        assert!(out.contains("/ highest: 86.4"), "got {out:?}");
         assert!(out.contains("/ max 500 mCores"), "got {out:?}");
     }
 

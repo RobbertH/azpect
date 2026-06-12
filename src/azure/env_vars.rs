@@ -20,16 +20,21 @@ pub struct EnvVar {
     /// ARM never returns the resolved value for those.
     pub value: String,
     pub is_secret: bool,
-    /// Container attribution for the env-vars page, pre-rendered: `"all (3)"`,
-    /// `"files, http-auth"`, or a single container name. `None` for resources
-    /// without a container dimension (Function Apps) and for single-container
-    /// Container Apps, where attribution is meaningless and the column is hidden.
-    /// Populated only by [`merge_container_env`]; the raw parsers leave it `None`.
+    /// Display label for the owning container on the env-vars page (Container
+    /// Apps): the container name, with an `(init)` suffix for init containers
+    /// (e.g. `"files"`, `"migrate (init)"`). `None` for flat sources without a
+    /// container dimension (Function Apps), where the column is hidden. Set by
+    /// [`crate::azure::container_app_overview::explode_container_env`]; the raw
+    /// per-container parser leaves it `None`.
     pub attribution: Option<String>,
-    /// `true` when this row is one of several sharing a name whose values differ
-    /// across containers (the name was *exploded* into one row per distinct
-    /// value). Drives the `⚠` divergence marker. `false` for the common case.
-    pub diverges: bool,
+    /// Raw owning container name (no `(init)` suffix) used to target the exact
+    /// template entry when *writing* an edit back. `None` for flat sources.
+    /// Paired with [`EnvVar::is_init`] to disambiguate a name that exists in
+    /// both `containers` and `initContainers`.
+    pub container: Option<String>,
+    /// `true` when the owning container is an init container — needed alongside
+    /// [`EnvVar::container`] to locate the right entry for write-back.
+    pub is_init: bool,
 }
 
 /// Parse a Container App revision/template `env` array

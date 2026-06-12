@@ -38,6 +38,42 @@ pub fn extract(resp: &serde_json::Value) -> Vec<EnvVar> {
     }
 }
 
+/// Overwrite a Function App's application settings with `settings`.
+///
+/// `config/appsettings` is a *full-replace* collection — a `PUT` sets the entire
+/// map, so `settings` MUST contain every existing key (not just the changed one)
+/// or untouched settings would be dropped. Callers build it from the cached
+/// list (which already holds real values) with one entry edited/added.
+///
+/// Needs write permission (`Microsoft.Web/sites/config/write`); a Reader gets
+/// 403, surfaced verbatim to the confirmation modal.
+pub async fn update(
+    auth: &AzureAuth,
+    function_app_id: &str,
+    settings: &[EnvVar],
+) -> anyhow::Result<()> {
+    let client = ArmClient::new(auth.clone())?;
+    let props = build_properties(settings);
+    let body = serde_json::json!({ "properties": props });
+    let path = format!("{function_app_id}/config/appsettings?api-version={API_VERSION}");
+    client
+        .put(&path, &body)
+        .await
+        .with_context(|| format!("updating app settings for {function_app_id}"))?;
+    Ok(())
+}
+
+/// Flatten the env-var list back into the `{ "KEY": "value", ... }` object the
+/// `config/appsettings` endpoint expects. The display value IS the real value
+/// for app settings (including `@Microsoft.KeyVault(...)` references), so this
+/// round-trips losslessly.
+fn build_properties(settings: &[EnvVar]) -> serde_json::Map<String, serde_json::Value> {
+    settings
+        .iter()
+        .map(|ev| (ev.name.clone(), serde_json::Value::String(ev.value.clone())))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +100,31 @@ mod tests {
     #[test]
     fn missing_properties_is_empty() {
         assert!(extract(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn build_properties_round_trips_every_key() {
+        let settings = vec![
+            EnvVar {
+                name: "A".into(),
+                value: "1".into(),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "Conn".into(),
+                value: "@Microsoft.KeyVault(SecretUri=https://v/secrets/c/)".into(),
+                is_secret: true,
+                ..Default::default()
+            },
+        ];
+        let props = build_properties(&settings);
+        // Full map is reproduced verbatim — the PUT replaces the whole collection,
+        // so dropping any key here would delete it server-side.
+        assert_eq!(props.len(), 2);
+        assert_eq!(props["A"], json!("1"));
+        assert_eq!(
+            props["Conn"],
+            json!("@Microsoft.KeyVault(SecretUri=https://v/secrets/c/)")
+        );
     }
 }

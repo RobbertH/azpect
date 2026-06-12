@@ -13,13 +13,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::azure::resources::ResourceKind;
+use tui_input::Input;
+
+use crate::azure::resources::{Resource, ResourceKind};
 use crate::ui::events::Action;
-use crate::ui::state::AppState;
+use crate::ui::state::{AppState, EnvVarEdit, EnvVarEditMode, EnvVarEditPhase, EnvVarField};
 use crate::ui::theme::Theme;
 use crate::ui::views::detail::env_vars_for;
 
-const FOOTER: &str = "x reveal/hide  h/l scroll  y yank  j/k move  Esc back  q quit";
+const FOOTER: &str =
+    "x reveal/hide  ^E edit  ^N add  h/l scroll  y yank  j/k move  Esc back  q quit";
 const HALF_PAGE: usize = 10;
 /// Characters scrolled per `h`/`l` press for long revealed values.
 const H_SCROLL_STEP: usize = 8;
@@ -27,9 +30,9 @@ const H_SCROLL_STEP: usize = 8;
 const MASK: &str = "••••••••";
 /// Name column width; longer names are ellipsized.
 const NAME_COL: usize = 36;
-/// Width of the per-container attribution (`in`) column, rendered between the
-/// name and the value for multi-container Container Apps. Longer lists are
-/// ellipsized. Hidden entirely when no row carries attribution.
+/// Width of the owning-container column, rendered between the name and the
+/// value for Container Apps (one exploded row per container). Longer names are
+/// ellipsized. Hidden entirely when no row carries a container label.
 const ATTR_COL: usize = 18;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -125,9 +128,9 @@ fn render_body(
     let visible = area.height as usize;
     let scroll = scroll_for(cursor, vars.len(), visible);
 
-    // The attribution (`in`) column only exists for multi-container Container
-    // Apps; when no row carries it (Function Apps, single-container apps) the
-    // column is omitted so the page reads exactly as before.
+    // The owning-container column exists for Container Apps (every exploded row
+    // carries its container label); Function App settings are flat and carry
+    // none, so the column is omitted there and the page reads as a simple list.
     let show_attr = vars.iter().any(|v| v.attribution.is_some());
 
     let lines: Vec<Line> = vars
@@ -164,19 +167,15 @@ fn render_body(
                 Span::styled(name, Style::default().fg(theme.fg)),
             ];
             if show_attr {
-                // Pinned LEFT of the value so it's always visible regardless of
-                // horizontal value-scroll. `⚠` flags a name whose value differs
-                // across containers (the row was exploded per distinct value).
+                // The owning-container column, pinned LEFT of the value so it's
+                // always visible regardless of horizontal value-scroll. Each row
+                // is one container's entry (env vars are exploded per container).
                 let attr = format!(
                     "{:<width$}",
                     truncate_right(v.attribution.as_deref().unwrap_or(""), ATTR_COL),
                     width = ATTR_COL
                 );
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    if v.diverges { "⚠ " } else { "  " },
-                    Style::default().fg(theme.degraded),
-                ));
+                spans.push(Span::raw("  "));
                 spans.push(Span::styled(attr, Style::default().fg(theme.muted)));
             }
             spans.push(Span::styled(" = ", Style::default().fg(theme.muted)));
@@ -243,9 +242,113 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.env_vars_view.h_offset = 0;
             true
         }
+        Action::EditEnvVar => open_edit(state),
+        Action::AddEnvVar => open_add(state),
         // Back / Yank fall through to the global handler.
         _ => false,
     }
+}
+
+/// Open the guarded editor on the selected env var (`Ctrl+E`). Refuses
+/// secret-backed rows — for a `secretRef` / Key Vault reference the shown value
+/// is a marker, not the literal, so editing it here would be meaningless.
+fn open_edit(state: &mut AppState) -> bool {
+    let Some(resource) = state.selected_resource().cloned() else {
+        return true;
+    };
+    let cursor = state.env_vars_view.cursor;
+    let selected = env_vars_for(state, &resource.id, resource.kind)
+        .and_then(|vars| vars.get(cursor.min(vars.len().saturating_sub(1))).cloned());
+    let Some(v) = selected else {
+        state.set_status("no env var selected to edit");
+        return true;
+    };
+    if v.is_secret {
+        state.set_status(
+            "secret-backed values can't be edited here — manage them in the secret store",
+        );
+        return true;
+    }
+    state.env_var_edit = Some(EnvVarEdit {
+        phase: EnvVarEditPhase::Editing,
+        mode: EnvVarEditMode::Edit {
+            original_value: v.value.clone(),
+        },
+        resource_id: resource.id.clone(),
+        resource_kind: resource.kind,
+        container: v.container.clone(),
+        is_init: v.is_init,
+        attribution: v.attribution.clone(),
+        name: Input::default().with_value(v.name.clone()),
+        value: Input::default().with_value(v.value.clone()),
+        focus: EnvVarField::Value,
+        confirm_yes: false,
+        in_flight: false,
+        error: None,
+    });
+    true
+}
+
+/// Open the guarded editor to add a new env var (`Ctrl+N`). For Container Apps
+/// the new var is targeted at the container of the currently-selected row (or
+/// the first container when the list is empty); a Container App with no known
+/// container is refused rather than writing into the void.
+fn open_add(state: &mut AppState) -> bool {
+    let Some(resource) = state.selected_resource().cloned() else {
+        return true;
+    };
+    let (container, is_init, attribution) = add_target_container(state, &resource);
+    if resource.kind == ResourceKind::ContainerApp && container.is_none() {
+        state.set_status("container template not loaded yet — try again in a moment");
+        return true;
+    }
+    state.env_var_edit = Some(EnvVarEdit {
+        phase: EnvVarEditPhase::Editing,
+        mode: EnvVarEditMode::Add,
+        resource_id: resource.id.clone(),
+        resource_kind: resource.kind,
+        container,
+        is_init,
+        attribution,
+        name: Input::default(),
+        value: Input::default(),
+        focus: EnvVarField::Name,
+        confirm_yes: false,
+        in_flight: false,
+        error: None,
+    });
+    true
+}
+
+/// Pick the container a freshly-added var should land in. Function Apps are flat
+/// (`None`). Container Apps prefer the selected row's container, falling back to
+/// the first container in the template.
+fn add_target_container(
+    state: &AppState,
+    resource: &Resource,
+) -> (Option<String>, bool, Option<String>) {
+    if resource.kind != ResourceKind::ContainerApp {
+        return (None, false, None);
+    }
+    let cursor = state.env_vars_view.cursor;
+    if let Some(vars) = env_vars_for(state, &resource.id, resource.kind) {
+        if let Some(v) = vars.get(cursor.min(vars.len().saturating_sub(1))) {
+            if v.container.is_some() {
+                return (v.container.clone(), v.is_init, v.attribution.clone());
+            }
+        }
+    }
+    if let Some(ov) = state.container_app_overview.by_resource.get(&resource.id) {
+        if let Some(c) = ov.containers.first() {
+            let label = if c.is_init {
+                format!("{} (init)", c.name)
+            } else {
+                c.name.clone()
+            };
+            return (Some(c.name.clone()), c.is_init, Some(label));
+        }
+    }
+    (None, false, None)
 }
 
 /// `NAME=value` of the currently-selected entry, for the global yank handler.
@@ -444,22 +547,24 @@ mod tests {
     }
 
     #[test]
-    fn renders_container_attribution_column_when_present() {
+    fn renders_container_column_when_present() {
         let theme = Theme::catppuccin_mocha();
         let vars = vec![
-            EnvVar {
-                name: "SHARED".into(),
-                value: "yes".into(),
-                is_secret: false,
-                attribution: Some("all (2)".into()),
-                diverges: false,
-            },
             EnvVar {
                 name: "LOG_LEVEL".into(),
                 value: "info".into(),
                 is_secret: false,
                 attribution: Some("files".into()),
-                diverges: true,
+                container: Some("files".into()),
+                is_init: false,
+            },
+            EnvVar {
+                name: "LOG_LEVEL".into(),
+                value: "debug".into(),
+                is_secret: false,
+                attribution: Some("http-auth".into()),
+                container: Some("http-auth".into()),
+                is_init: false,
             },
         ];
         let mut state = state_with(ResourceKind::ContainerApp, vars);
@@ -468,17 +573,18 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
-        // Attribution column is rendered between name and value.
-        assert!(s.contains("all (2)"), "missing 'all (N)' attribution");
-        assert!(s.contains("files"), "missing single-container attribution");
-        // The divergent row carries the warning marker.
-        assert!(s.contains('⚠'), "missing divergence marker");
+        // Each exploded row shows its owning container between name and value.
+        assert!(s.contains("files"), "missing 'files' container column");
+        assert!(
+            s.contains("http-auth"),
+            "missing 'http-auth' container column"
+        );
     }
 
     #[test]
-    fn no_attribution_column_for_flat_env_vars() {
-        // Function App vars carry no attribution, so the column is suppressed and
-        // the page reads exactly as before (no stray 'all (' / '⚠').
+    fn no_container_column_for_flat_env_vars() {
+        // Function App vars carry no container label, so the column is suppressed
+        // and the page reads as a simple list.
         let theme = Theme::catppuccin_mocha();
         let mut state = state_with(
             ResourceKind::FunctionApp,
@@ -490,8 +596,66 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("API_KEY"));
-        assert!(!s.contains('⚠'), "divergence marker leaked into flat list");
-        assert!(!s.contains("all ("), "attribution leaked into flat list");
+    }
+
+    #[test]
+    fn ctrl_e_opens_editor_seeded_with_selected_value() {
+        let mut state = state_with(
+            ResourceKind::FunctionApp,
+            vec![ev("API_KEY", "old", false), ev("PORT", "8080", false)],
+        );
+        state.env_vars_view.cursor = 1; // PORT
+        assert!(handle(Action::EditEnvVar, &mut state));
+        let edit = state.env_var_edit.expect("editor should be open");
+        assert!(matches!(edit.mode, EnvVarEditMode::Edit { .. }));
+        assert_eq!(edit.name.value(), "PORT");
+        assert_eq!(edit.value.value(), "8080");
+        // Edit mode lands on the value field (the name is locked).
+        assert_eq!(edit.focus, EnvVarField::Value);
+        assert_eq!(edit.phase, EnvVarEditPhase::Editing);
+    }
+
+    #[test]
+    fn ctrl_e_refuses_secret_backed_rows() {
+        let mut state = state_with(
+            ResourceKind::FunctionApp,
+            vec![ev("CONN", "@Microsoft.KeyVault(...)", true)],
+        );
+        assert!(handle(Action::EditEnvVar, &mut state));
+        // No editor opened; a status hint is shown instead.
+        assert!(state.env_var_edit.is_none());
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn ctrl_n_opens_blank_add_editor() {
+        let mut state = state_with(ResourceKind::FunctionApp, vec![ev("A", "1", false)]);
+        assert!(handle(Action::AddEnvVar, &mut state));
+        let edit = state.env_var_edit.expect("add editor should be open");
+        assert!(matches!(edit.mode, EnvVarEditMode::Add));
+        assert_eq!(edit.name.value(), "");
+        assert_eq!(edit.value.value(), "");
+        // Add starts on the name field; Function Apps carry no container target.
+        assert_eq!(edit.focus, EnvVarField::Name);
+        assert!(edit.container.is_none());
+    }
+
+    #[test]
+    fn add_on_container_app_targets_selected_rows_container() {
+        let mut state = state_with(
+            ResourceKind::ContainerApp,
+            vec![EnvVar {
+                name: "LOG_LEVEL".into(),
+                value: "info".into(),
+                attribution: Some("files".into()),
+                container: Some("files".into()),
+                ..Default::default()
+            }],
+        );
+        assert!(handle(Action::AddEnvVar, &mut state));
+        let edit = state.env_var_edit.expect("add editor should be open");
+        assert_eq!(edit.container.as_deref(), Some("files"));
+        assert_eq!(edit.attribution.as_deref(), Some("files"));
     }
 
     #[test]

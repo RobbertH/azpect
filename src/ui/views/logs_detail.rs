@@ -82,15 +82,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     frame.render_widget(footer, chunks[2]);
 }
 
-/// Resolve the currently-selected log line from `state.logs.scroll`.
+/// Resolve the currently-selected log line from `state.logs.scroll`. Goes
+/// through `visible_log_lines` because the scroll index is relative to the
+/// source-filtered view of the cache, not the raw buffer.
 pub fn selected_line(state: &AppState) -> Option<&LogLine> {
     let resource = state.selected_resource()?;
-    let lines = state.logs.by_resource.get(&resource.id)?;
+    let lines = state.visible_log_lines(&resource.id);
     if lines.is_empty() {
         return None;
     }
     let idx = state.logs.scroll.min(lines.len() - 1);
-    lines.get(idx)
+    lines.get(idx).copied()
 }
 
 fn build_body(line: &LogLine, theme: &Theme) -> Vec<Line<'static>> {

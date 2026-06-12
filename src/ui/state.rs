@@ -462,6 +462,80 @@ pub struct EnvVarsView {
     pub h_offset: usize,
 }
 
+/// Which field the env-var editor's cursor is in. Add mode uses both; Edit mode
+/// locks the name (you can't rename a setting — that's a delete + add) and keeps
+/// focus on the value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvVarField {
+    Name,
+    Value,
+}
+
+/// Whether the guarded editor is changing an existing var or creating one.
+#[derive(Clone, PartialEq, Eq)]
+pub enum EnvVarEditMode {
+    /// Editing an existing var; carries the original value so the confirm step
+    /// can show an `old → new` diff and suppress a no-op write.
+    Edit { original_value: String },
+    /// Adding a brand-new var.
+    Add,
+}
+
+/// Two-step gate for the env-var editor. `Editing` = typing into the fields;
+/// `Confirming` = the final yes/no, with the diff shown and focus defaulting to
+/// Cancel so an accidental Enter never commits a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvVarEditPhase {
+    Editing,
+    Confirming,
+}
+
+/// Live state of the guarded add/edit-env-var flow. Present (`Some`) only while
+/// the modal is open; entering it is deliberately gated behind `Ctrl+E` /
+/// `Ctrl+N` so a stray keypress can't drop the user into write mode. The actual
+/// Azure write fires only on explicit confirm in the `Confirming` phase.
+#[derive(Clone)]
+pub struct EnvVarEdit {
+    pub phase: EnvVarEditPhase,
+    pub mode: EnvVarEditMode,
+    /// Resource the edit targets — snapshotted so a background refresh that
+    /// shuffles the selection can't retarget an in-flight edit.
+    pub resource_id: String,
+    pub resource_kind: crate::azure::resources::ResourceKind,
+    /// Owning container (Container Apps only); `None` for flat Function Apps.
+    pub container: Option<String>,
+    pub is_init: bool,
+    /// Display label for the owning container, echoed in the confirm modal and
+    /// reused if the row needs to be inserted optimistically.
+    pub attribution: Option<String>,
+    /// Editable name field. Read-only (display-only) in `Edit` mode.
+    pub name: Input,
+    /// Editable value field.
+    pub value: Input,
+    pub focus: EnvVarField,
+    /// Confirm-button focus. Starts `false` (Cancel) every time the confirm step
+    /// is entered — the write is opt-in, never the default.
+    pub confirm_yes: bool,
+    /// `true` once the write has been spawned; freezes input until the
+    /// completion event lands so a double-Enter can't fire two writes.
+    pub in_flight: bool,
+    /// Last write error, shown in the modal so the user can retry or cancel.
+    pub error: Option<String>,
+}
+
+/// The concrete edit handed to the write spawn and echoed back on completion so
+/// the cache can be updated optimistically before the confirming refetch lands.
+#[derive(Clone, Debug)]
+pub struct AppliedEnvEdit {
+    pub resource_id: String,
+    pub kind: crate::azure::resources::ResourceKind,
+    pub name: String,
+    pub value: String,
+    pub container: Option<String>,
+    pub is_init: bool,
+    pub attribution: Option<String>,
+}
+
 /// UI state for the Detail view's meta-row navigation and Enter modal. The
 /// rows themselves are computed from the various per-resource caches on every
 /// render, so this struct only tracks the cursor position into the selectable
@@ -1138,6 +1212,12 @@ pub struct LogsCache {
     pub fetch_more_requested: bool,
     pub range: TimeRange,
     pub errors_only: bool,
+    /// Client-side filter on `LogLine::source` (for Container Apps the
+    /// emitting container, for Function Apps the table/function). `None`
+    /// shows every cached line. Cycled with `s` through the distinct sources
+    /// present in the buffer; unlike `errors_only` it never refetches —
+    /// it narrows what's already cached.
+    pub source_filter: Option<String>,
     pub loading: bool,
     pub last_error: Option<String>,
     /// Cursor row inside the logs table (index into the cached lines).
@@ -1207,6 +1287,10 @@ pub struct AppState {
     /// State of the dedicated env-vars page (cursor + whether values are
     /// revealed). Reset on entering the page, so values always start masked.
     pub env_vars_view: EnvVarsView,
+
+    /// Active add/edit-env-var flow, or `None` when no editor is open. Gated
+    /// behind `Ctrl+E` / `Ctrl+N` and a confirm step before any write.
+    pub env_var_edit: Option<EnvVarEdit>,
 
     /// Detail-view cursor (over the meta rows) plus the optional Enter modal
     /// payload. Reset on entering Detail from a different view.
@@ -1302,6 +1386,7 @@ impl AppState {
             favorites_only: false,
             loading_resources: false,
             env_vars_view: EnvVarsView::default(),
+            env_var_edit: None,
             detail_view: DetailView::default(),
             metrics: MetricsCache {
                 range,
@@ -1348,6 +1433,20 @@ impl AppState {
     pub fn selected_resource(&self) -> Option<&Resource> {
         // Lane 3/4 will likely want a filtered iterator helper; this naive impl is a placeholder.
         self.filtered_resources().get(self.list_cursor).copied()
+    }
+
+    /// Cached log lines for `resource_id` after applying `logs.source_filter`.
+    /// This is what the logs table renders and what `logs.scroll` indexes into,
+    /// so every consumer of "the selected log line" (log detail, yank, search
+    /// jumps) must resolve through this same view of the cache.
+    pub fn visible_log_lines(&self, resource_id: &str) -> Vec<&crate::azure::logs::LogLine> {
+        let Some(lines) = self.logs.by_resource.get(resource_id) else {
+            return Vec::new();
+        };
+        match self.logs.source_filter.as_deref() {
+            Some(src) => lines.iter().filter(|l| l.source == src).collect(),
+            None => lines.iter().collect(),
+        }
     }
 
     /// Set the bottom-row status hint with the standard auto-clear window.

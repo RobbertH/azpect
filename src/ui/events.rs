@@ -248,6 +248,16 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::service_bus::ServiceBusSubscription>, String>,
     },
+    /// Completion of a guarded env-var write (add or edit). On `Ok` the cache is
+    /// updated optimistically from `applied` and a confirming refetch is kicked
+    /// off; on `Err` the message is shown in the still-open editor so the user
+    /// can retry or cancel. `is_demo` suppresses the (pointless) refetch in the
+    /// mock tenant so the simulated edit sticks.
+    EnvVarWriteCompleted {
+        applied: crate::ui::state::AppliedEnvEdit,
+        is_demo: bool,
+        result: Result<(), String>,
+    },
 }
 
 /// Logical actions produced by the input handler. Lane 3 maps `KeyEvent` →
@@ -279,6 +289,11 @@ pub enum Action {
     NextMatch,
     PrevMatch,
     SwitchSubscription,
+    /// Cycle the logs view's client-side source filter through the distinct
+    /// `LogLine::source` values in the cached buffer (all → A → B → … → all).
+    /// Bound to `s` inside the logs view only; elsewhere `s` keeps its
+    /// switch-subscription meaning.
+    CycleSourceFilter,
     /// Open the top-level Storage mode (blob accounts list). Bound to `S`
     /// (capital so it doesn't collide with `s` = switch subscription).
     OpenStorage,
@@ -299,6 +314,13 @@ pub enum Action {
     /// Reveal / re-mask (k9s-style "decode") env-var values in the env-vars
     /// page. Bound to `x`.
     DecodeSecret,
+    /// Open the guarded editor on the selected env var. Bound to `Ctrl+E` in the
+    /// env-vars page only — the Ctrl modifier keeps write-mode deliberately hard
+    /// to enter by accident.
+    EditEnvVar,
+    /// Open the guarded editor to add a new env var. Bound to `Ctrl+N` in the
+    /// env-vars page only.
+    AddEnvVar,
     Help,
     /// Open the vim/k9s-style command palette (`:`).
     StartCommand,
@@ -356,6 +378,12 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
     match key.code {
         KeyCode::Esc => Action::Back,
 
+        // Guarded env-var write entry. Ctrl-gated and scoped to the env-vars
+        // page so it can never collide with `e` (errors-only) / `n` (next match)
+        // elsewhere, and so write mode takes a deliberate chord to enter.
+        KeyCode::Char('e') if ctrl && view == View::EnvVars => Action::EditEnvVar,
+        KeyCode::Char('n') if ctrl && view == View::EnvVars => Action::AddEnvVar,
+
         // Navigation
         KeyCode::Char('h') if !ctrl => Action::MoveLeft,
         KeyCode::Char('j') if !ctrl => Action::MoveDown,
@@ -409,7 +437,12 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('f') => Action::ToggleFavorite,
         KeyCode::Char('F') => Action::ToggleFavoritesOnly,
         KeyCode::Char('/') => Action::StartSearch,
-        KeyCode::Char('s') => Action::SwitchSubscription,
+        // `s` filters by source inside the logs view (mirrors how `l` / `e`
+        // are context-aware there); everywhere else it switches subscription.
+        KeyCode::Char('s') => match view {
+            View::Logs => Action::CycleSourceFilter,
+            _ => Action::SwitchSubscription,
+        },
         KeyCode::Char('S') => Action::OpenStorage,
         KeyCode::Char('R') => Action::OpenRegistries,
         KeyCode::Char('r') => Action::Refresh,
@@ -595,6 +628,20 @@ mod tests {
     }
 
     #[test]
+    fn s_cycles_source_filter_inside_logs() {
+        assert_eq!(
+            key_to_action(key('s'), View::Logs, false),
+            Action::CycleSourceFilter
+        );
+        // Only the logs table repurposes `s`; everywhere else (including the
+        // per-line detail) it keeps the switch-subscription meaning.
+        assert_eq!(
+            key_to_action(key('s'), View::LogDetail, false),
+            Action::SwitchSubscription
+        );
+    }
+
+    #[test]
     fn tab_cycles_panels() {
         let v = View::List;
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
@@ -607,5 +654,38 @@ mod tests {
     fn help_view_dismisses_on_any_key() {
         assert_eq!(key_to_action(key('x'), View::Help, false), Action::Back);
         assert_eq!(key_to_action(key('?'), View::Help, false), Action::Back);
+    }
+
+    #[test]
+    fn ctrl_e_n_enter_write_mode_only_inside_env_vars() {
+        // Ctrl-gated + view-scoped so write mode is deliberate and never steals
+        // `e` (errors-only) / `n` (next match) elsewhere.
+        assert_eq!(
+            key_to_action(key_ctrl('e'), View::EnvVars, false),
+            Action::EditEnvVar
+        );
+        assert_eq!(
+            key_to_action(key_ctrl('n'), View::EnvVars, false),
+            Action::AddEnvVar
+        );
+        // Outside the env-vars page the chords fall through to their normal
+        // (non-write) meanings.
+        assert_eq!(
+            key_to_action(key_ctrl('e'), View::Detail, false),
+            Action::OpenEnvVars
+        );
+        assert_ne!(
+            key_to_action(key_ctrl('n'), View::List, false),
+            Action::AddEnvVar
+        );
+        // Plain (un-modified) e/n in the env-vars page must NOT enter write mode.
+        assert_ne!(
+            key_to_action(key('e'), View::EnvVars, false),
+            Action::EditEnvVar
+        );
+        assert_ne!(
+            key_to_action(key('n'), View::EnvVars, false),
+            Action::AddEnvVar
+        );
     }
 }

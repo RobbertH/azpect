@@ -5,6 +5,7 @@ pub mod appgw_backends;
 pub mod auth;
 pub mod az_login;
 pub mod client;
+pub mod container_app_env_update;
 pub mod container_app_overview;
 pub mod container_app_replicas;
 pub mod container_app_revisions;

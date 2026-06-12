@@ -210,6 +210,41 @@ impl ArmClient {
         })
         .await
     }
+
+    /// `PUT https://management.azure.com{path}` with `body` as the JSON payload.
+    /// Used for full-replace writes (e.g. a Function App's `config/appsettings`).
+    /// Same retry/redaction discipline as the read path.
+    pub async fn put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{ARM_BASE}{path}");
+        send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
+            http.request(Method::PUT, &url)
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+        })
+        .await
+    }
+
+    /// `PATCH https://management.azure.com{path}` with `body` as the JSON
+    /// payload. Used for partial-update writes (e.g. a Container App resource,
+    /// where we send only `{properties:{template}}` to avoid replaying read-only
+    /// fields; ARM applies it as a merge and spins a new revision).
+    pub async fn patch(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{ARM_BASE}{path}");
+        send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
+            http.request(Method::PATCH, &url)
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+        })
+        .await
+    }
 }
 
 /// Client for Microsoft Graph (`graph.microsoft.com`). Same retry/redaction

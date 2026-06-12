@@ -21,10 +21,12 @@ const FOOTER_HINT: &str =
 
 const HALF_PAGE: usize = 10;
 
-/// Fixed column widths for the resource list. Hard-coded so that columns
-/// don't jump when the visible window changes which long names are on screen.
-/// Names longer than this get truncated with an ellipsis; shorter names are
-/// space-padded.
+/// Minimum column widths for the resource list. Fixed bases so that columns
+/// don't jump when the visible window changes which long names are on screen;
+/// when the terminal is wider than the base layout needs, the truncating
+/// columns grow toward their longest content (see `flex_widths`).
+/// Names longer than the resolved width get truncated with an ellipsis;
+/// shorter names are space-padded.
 const NAME_COL_WIDTH: usize = 36;
 /// Width of the `KIND` column. Sized for the longest tag (`FuncApp` / `ContApp`,
 /// 7 chars); shorter tags (`APIM`, `AppGW`) are space-padded.
@@ -135,10 +137,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             (None, list_area)
         };
 
-        let max_name = NAME_COL_WIDTH;
-        let max_rg = RG_COL_WIDTH;
         // Only worth a subscription column when viewing across all of them.
         let show_sub = state.selected_subscription.is_none();
+        let (max_name, max_version, max_rg, max_sub, max_network) =
+            flex_widths(state, theme, show_sub, list_area.width as usize);
 
         if let Some(ha) = header_area {
             let hdr = |text: &str, width: usize| {
@@ -159,16 +161,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 // Extra padding spans the 5xx-flag slot (" " + 3 + "  ") that
                 // each row renders after the badge, keeping VERSION aligned.
                 Span::raw("      "),
-                hdr("VERSION", VERSION_COL_WIDTH),
+                hdr("VERSION", max_version),
                 Span::raw("  "),
                 hdr("RESOURCE GROUP", max_rg),
             ];
             if show_sub {
                 header_spans.push(Span::raw("  "));
-                header_spans.push(hdr("SUBSCRIPTION", SUB_COL_WIDTH));
+                header_spans.push(hdr("SUBSCRIPTION", max_sub));
             }
             header_spans.push(Span::raw("  "));
-            header_spans.push(hdr("NETWORK", NETWORK_COL_WIDTH));
+            header_spans.push(hdr("NETWORK", max_network));
             header_spans.push(Span::raw("  "));
             header_spans.push(hdr("CREATED", DATE_COL_WIDTH));
             let header_spans = clip_spans_to_width(header_spans, ha.width as usize, theme);
@@ -208,17 +210,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     _ => "",
                 };
 
-                // Deployed image tag (the version/hash). Dots while the backing
-                // fetch is in flight; blank when there's no image to show.
-                let version_text = match deployed_image(r, state) {
-                    Some(image) => image_tag(&image).to_string(),
-                    None if image_pending(r, state) => "…".to_string(),
-                    None => String::new(),
-                };
                 let version = format!(
                     "{:<width$}",
-                    truncate_right(&version_text, VERSION_COL_WIDTH),
-                    width = VERSION_COL_WIDTH
+                    truncate_right(&version_text(r, state), max_version),
+                    width = max_version
                 );
 
                 let rg = format!(
@@ -260,11 +255,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     // subscription list arrives.
                     let sub = subscription_display_name(state, &r.subscription_id)
                         .unwrap_or(&r.subscription_id);
-                    let sub = format!(
-                        "{:<width$}",
-                        truncate_right(sub, SUB_COL_WIDTH),
-                        width = SUB_COL_WIDTH
-                    );
+                    let sub = format!("{:<width$}", truncate_right(sub, max_sub), width = max_sub);
                     spans.push(Span::raw("  "));
                     spans.push(Span::styled(sub, Style::default().fg(theme.muted)));
                 }
@@ -275,8 +266,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 let (net_text, net_color) = network_cell(r, state, theme);
                 let network = format!(
                     "{:<width$}",
-                    truncate_right(&net_text, NETWORK_COL_WIDTH),
-                    width = NETWORK_COL_WIDTH
+                    truncate_right(&net_text, max_network),
+                    width = max_network
                 );
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(network, Style::default().fg(net_color)));
@@ -463,6 +454,75 @@ fn image_tag(image: &str) -> &str {
         Some((_, tag)) => tag,
         None => "",
     }
+}
+
+/// The VERSION cell's text: the deployed image tag (the version/hash), `…`
+/// while the backing fetch is in flight, blank when there's no image to show.
+fn version_text(r: &Resource, state: &AppState) -> String {
+    match deployed_image(r, state) {
+        Some(image) => image_tag(&image).to_string(),
+        None if image_pending(r, state) => "…".to_string(),
+        None => String::new(),
+    }
+}
+
+/// Resolve the widths of the five truncating columns — NAME, VERSION,
+/// RESOURCE GROUP, SUBSCRIPTION, NETWORK — for a list area `width` columns
+/// wide. Each starts at its base `*_COL_WIDTH`; when the terminal leaves
+/// slack beyond the base layout, columns grow toward their longest content,
+/// most-important column first, so wide terminals show fewer ellipses.
+/// Content is measured over *all* resources (not the visible window or the
+/// filtered set), so widths stay put while scrolling and filtering.
+fn flex_widths(
+    state: &AppState,
+    theme: &Theme,
+    show_sub: bool,
+    width: usize,
+) -> (usize, usize, usize, usize, usize) {
+    let mut want_name = 0usize;
+    let mut want_version = 0usize;
+    let mut want_rg = 0usize;
+    let mut want_sub = 0usize;
+    let mut want_network = 0usize;
+    for r in &state.resources {
+        want_name = want_name.max(r.name.chars().count());
+        want_version = want_version.max(version_text(r, state).chars().count());
+        want_rg = want_rg.max(r.resource_group.chars().count());
+        if show_sub {
+            let sub =
+                subscription_display_name(state, &r.subscription_id).unwrap_or(&r.subscription_id);
+            want_sub = want_sub.max(sub.chars().count());
+        }
+        want_network = want_network.max(network_cell(r, state, theme).0.chars().count());
+    }
+
+    let mut name = NAME_COL_WIDTH;
+    let mut version = VERSION_COL_WIDTH;
+    let mut rg = RG_COL_WIDTH;
+    let mut sub = SUB_COL_WIDTH;
+    let mut network = NETWORK_COL_WIDTH;
+
+    // Everything in a row besides the five flexible columns: the selection /
+    // favorite prefix (4), the gap after NAME, KIND with its trailing gap,
+    // the badge + STATUS + 5xx block including its trailing gap (16), the
+    // gaps after VERSION / RESOURCE GROUP / NETWORK, the extra gap before
+    // SUBSCRIPTION when shown, and the trailing CREATED column.
+    let fixed =
+        4 + 2 + KIND_COL_WIDTH + 2 + 16 + 2 + 2 + if show_sub { 2 } else { 0 } + 2 + DATE_COL_WIDTH;
+    let base = fixed + name + version + rg + network + if show_sub { sub } else { 0 };
+    let mut slack = width.saturating_sub(base);
+    for (col, want) in [
+        (&mut name, want_name),
+        (&mut version, want_version),
+        (&mut network, want_network),
+        (&mut sub, if show_sub { want_sub } else { 0 }),
+        (&mut rg, want_rg),
+    ] {
+        let grow = want.saturating_sub(*col).min(slack);
+        *col += grow;
+        slack -= grow;
+    }
+    (name, version, rg, sub, network)
 }
 
 fn truncate_right(s: &str, max: usize) -> String {
@@ -1089,6 +1149,77 @@ mod tests {
         let t = text(&out);
         assert_eq!(t, "hello wor\u{2026}");
         assert_eq!(t.chars().count(), 10);
+    }
+
+    #[test]
+    fn flex_widths_grow_into_slack() {
+        let theme = Theme::catppuccin_mocha();
+        let mut state = AppState::new(Config::default());
+        let mut long = r("/r/long", &"n".repeat(50), ResourceKind::ContainerApp);
+        long.resource_group = "x".repeat(30);
+        state.resources = vec![long];
+
+        // Narrower than the base layout → every column stays at its minimum.
+        let widths = flex_widths(&state, &theme, true, 80);
+        assert_eq!(
+            widths,
+            (
+                NAME_COL_WIDTH,
+                VERSION_COL_WIDTH,
+                RG_COL_WIDTH,
+                SUB_COL_WIDTH,
+                NETWORK_COL_WIDTH
+            )
+        );
+
+        // Plenty of slack → NAME and RESOURCE GROUP stretch to their longest
+        // content; columns whose content already fits keep their base width.
+        let (name, version, rg, sub, network) = flex_widths(&state, &theme, true, 400);
+        assert_eq!(name, 50);
+        assert_eq!(rg, 30);
+        assert_eq!(
+            (version, sub, network),
+            (VERSION_COL_WIDTH, SUB_COL_WIDTH, NETWORK_COL_WIDTH)
+        );
+
+        // Slack covers only part of the deficit → NAME (highest priority)
+        // absorbs all of it; RESOURCE GROUP waits its turn.
+        let base = 49 // fixed overhead with SUBSCRIPTION shown, see `flex_widths`
+            + NAME_COL_WIDTH
+            + VERSION_COL_WIDTH
+            + RG_COL_WIDTH
+            + SUB_COL_WIDTH
+            + NETWORK_COL_WIDTH;
+        let (name, _, rg, _, _) = flex_widths(&state, &theme, true, base + 5);
+        assert_eq!(name, NAME_COL_WIDTH + 5);
+        assert_eq!(rg, RG_COL_WIDTH);
+    }
+
+    /// Pins `flex_widths`' fixed-overhead constant to the real row layout: at
+    /// a width that *exactly* fits the grown NAME column, the full name and
+    /// the full CREATED date must both render. If the constant overcounts,
+    /// NAME comes up short and keeps its ellipsis; if it undercounts, the row
+    /// overflows and CREATED gets clipped.
+    #[test]
+    fn flex_widths_fixed_overhead_matches_row_layout() {
+        use chrono::TimeZone;
+        let theme = Theme::catppuccin_mocha();
+        let mut state = AppState::new(Config::default());
+        let mut res = r("/r/long", &"n".repeat(50), ResourceKind::ContainerApp);
+        res.created_at = Some(Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap());
+        state.resources = vec![res];
+        // Inner width exactly fits NAME grown to 50: base layout with the
+        // SUBSCRIPTION column (49 fixed + 112 base columns) + NAME's 14-char
+        // deficit = 175, plus 2 for the block borders.
+        let backend = TestBackend::new(177, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains(&"n".repeat(50)), "expected full name in {s}");
+        assert!(
+            s.contains("2024-01-15"),
+            "expected full CREATED date in {s}"
+        );
     }
 
     #[test]

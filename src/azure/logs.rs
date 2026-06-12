@@ -588,13 +588,22 @@ fn parse_container_app_row(
         LogLevel::Info
     };
 
-    // Log Analytics injects the originating table name into the `Type` column
-    // for every row, so the source label tracks which schema we're reading.
-    let source = cell(columns, cells, "Type")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ContainerAppConsoleLogs")
-        .to_string();
+    // Source is the *emitting container's* name (`ContainerName_s` legacy /
+    // `ContainerName` modern): in a multi-container replica it's the only
+    // per-row signal separating the app's own container from a sidecar such as
+    // the auth middleware — the table name is identical on every row and says
+    // nothing. Rows without a container name fall back to the originating
+    // table name that Log Analytics injects into the `Type` column.
+    let container = first_non_empty(columns, cells, &["ContainerName_s", "ContainerName"]);
+    let source = if container.is_empty() {
+        cell(columns, cells, "Type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("ContainerAppConsoleLogs")
+            .to_string()
+    } else {
+        container
+    };
     (level, source, log)
 }
 
@@ -1094,10 +1103,40 @@ mod tests {
         });
         let lines = parse_logs_response(&payload, ResourceKind::ContainerApp).unwrap();
         assert_eq!(lines.len(), 2);
+        // No ContainerName column → source falls back to the table name.
         assert_eq!(lines[0].source, "ContainerAppConsoleLogs");
         assert_eq!(lines[0].message, "startup ok");
         assert_eq!(lines[1].level, LogLevel::Error);
         assert!(lines[1].message.contains("panic"));
+    }
+
+    #[test]
+    fn container_app_source_is_the_emitting_container() {
+        // Multi-container replica (app container + auth-middleware sidecar):
+        // the per-row `ContainerName_s` is what tells the user *which*
+        // container a line came from, so it becomes the source label.
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Log_s", "type": "string" },
+                    { "name": "ContainerName_s", "type": "string" },
+                    { "name": "Type", "type": "string" }
+                ],
+                "rows": [
+                    [ "2026-01-01T00:00:00Z", "Unclosed client session", "reports", "ContainerAppConsoleLogs_CL" ],
+                    [ "2026-01-01T00:00:01Z", "MiddlewareConsoleLogs[0] ...", "http-auth", "ContainerAppConsoleLogs_CL" ],
+                    [ "2026-01-01T00:00:02Z", "no container name on this row", "", "ContainerAppConsoleLogs_CL" ]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::ContainerApp).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].source, "reports");
+        assert_eq!(lines[1].source, "http-auth");
+        // Blank container name → table-name fallback.
+        assert_eq!(lines[2].source, "ContainerAppConsoleLogs_CL");
     }
 
     #[test]
