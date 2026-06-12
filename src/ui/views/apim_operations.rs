@@ -23,7 +23,7 @@ const NAME_COL_WIDTH: usize = 30;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
@@ -34,18 +34,36 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .and_then(|id| display_name_for(state, id))
         .unwrap_or_else(|| "(no API)".to_string());
 
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " operations ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            api_display,
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    // Second header line: the API's static backend (`properties.serviceUrl`).
+    // `None` means APIM has no static backend set — typically routing is done
+    // in policy via `set-backend-service`, so say so rather than show nothing.
+    let backend = api_id.and_then(|id| service_url_for(state, id));
+    let backend_line = match backend {
+        Some(url) => Line::from(vec![
+            Span::styled(" backend  ", Style::default().fg(theme.muted)),
+            Span::styled(url, Style::default().fg(theme.accent)),
+        ]),
+        None => Line::from(vec![
+            Span::styled(" backend  ", Style::default().fg(theme.muted)),
+            Span::styled("— (set in policy)", Style::default().fg(theme.muted)),
+        ]),
+    };
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(
+                " operations ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                api_display,
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        backend_line,
+    ]);
     frame.render_widget(header, chunks[0]);
 
     let block = Block::default()
@@ -179,6 +197,19 @@ fn display_name_for(state: &AppState, api_id: &str) -> Option<String> {
         })
 }
 
+/// The static backend (`serviceUrl`) of the API we're drilling into, looked up
+/// from the cached APIs list. `None` when the API isn't cached or has no static
+/// backend configured.
+fn service_url_for(state: &AppState, api_id: &str) -> Option<String> {
+    state
+        .apim
+        .apis
+        .values()
+        .flat_map(|v| v.iter())
+        .find(|a| a.id == api_id)
+        .and_then(|a| a.service_url.clone())
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
     let p = Paragraph::new(Line::from(Span::styled(
         FOOTER_HINT,
@@ -308,6 +339,49 @@ mod tests {
         assert!(buf.contains("GET"));
         assert!(buf.contains("/resource"));
         assert!(buf.contains("Retrieve resource"));
+    }
+
+    #[test]
+    fn renders_backend_service_url() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.apim.apis.insert(
+            "/svc/myapim".into(),
+            vec![crate::azure::apim::Api {
+                id: "/svc/myapim/apis/echo".into(),
+                name: "echo".into(),
+                display_name: "Echo API".into(),
+                path: "echo".into(),
+                service_url: Some("https://echo.internal.example.com".into()),
+            }],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("backend"));
+        assert!(buf.contains("https://echo.internal.example.com"));
+    }
+
+    #[test]
+    fn renders_policy_backend_placeholder_when_no_service_url() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.apim.apis.insert(
+            "/svc/myapim".into(),
+            vec![crate::azure::apim::Api {
+                id: "/svc/myapim/apis/echo".into(),
+                name: "echo".into(),
+                display_name: "Echo API".into(),
+                path: "echo".into(),
+                service_url: None,
+            }],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("set in policy"));
     }
 
     #[test]

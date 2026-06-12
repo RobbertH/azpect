@@ -617,17 +617,34 @@ pub fn principal_display_name(_object_id: &str) -> Option<String> {
 
 pub fn apim_apis(service_id: &str) -> Vec<Api> {
     [
-        ("orders-api", "Orders API", "orders"),
-        ("payments-api", "Payments API", "payments"),
-        ("catalog-api", "Catalog API", "catalog"),
-        ("echo-api", "Echo API", "echo"),
+        (
+            "orders-api",
+            "Orders API",
+            "orders",
+            Some("https://orders.internal.demo.local"),
+        ),
+        (
+            "payments-api",
+            "Payments API",
+            "payments",
+            Some("https://payments.internal.demo.local"),
+        ),
+        (
+            "catalog-api",
+            "Catalog API",
+            "catalog",
+            Some("https://catalog.internal.demo.local"),
+        ),
+        // No static backend — routed in policy via set-backend-service.
+        ("echo-api", "Echo API", "echo", None),
     ]
     .iter()
-    .map(|(name, display, path)| Api {
+    .map(|(name, display, path, service_url)| Api {
         id: format!("{service_id}/apis/{name}"),
         name: name.to_string(),
         display_name: display.to_string(),
         path: path.to_string(),
+        service_url: service_url.map(|s| s.to_string()),
     })
     .collect()
 }

@@ -49,6 +49,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl-e / Ctrl-n", "edit / add env var (env vars)"),
             ("/", "search (logs)"),
             ("n / N", "next / prev match (logs)"),
+            ("V", "visual-line select for yank (logs)"),
             ("l", "open logs (detail)"),
         ],
     ),

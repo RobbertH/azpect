@@ -25,6 +25,10 @@ pub struct Api {
     pub name: String,
     pub display_name: String,
     pub path: String,
+    /// Backend the API forwards to (`properties.serviceUrl`). `None` when the
+    /// API has no static backend set — common when routing is done in policy
+    /// via `set-backend-service`.
+    pub service_url: Option<String>,
 }
 
 /// A single operation (route) on an API.
@@ -135,11 +139,17 @@ fn parse_one_api(v: &serde_json::Value) -> Option<Api> {
         .and_then(|d| d.as_str())
         .unwrap_or("")
         .to_string();
+    let service_url = props
+        .and_then(|p| p.get("serviceUrl"))
+        .and_then(|d| d.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     Some(Api {
         id,
         name,
         display_name,
         path,
+        service_url,
     })
 }
 
@@ -199,6 +209,7 @@ mod tests {
                     "properties": {
                         "displayName": "Echo API",
                         "path": "echo",
+                        "serviceUrl": "https://echo.internal.example.com",
                         "protocols": ["https"]
                     }
                 }
@@ -209,6 +220,10 @@ mod tests {
         assert_eq!(apis[0].name, "echo-api");
         assert_eq!(apis[0].display_name, "Echo API");
         assert_eq!(apis[0].path, "echo");
+        assert_eq!(
+            apis[0].service_url.as_deref(),
+            Some("https://echo.internal.example.com")
+        );
     }
 
     #[test]

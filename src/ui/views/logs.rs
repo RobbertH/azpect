@@ -20,7 +20,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  e errors-only  s source  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only  s source  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -113,6 +113,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             header_spans.push(Span::styled(
                 format!("· /{} ", state.logs.search_input.value()),
                 Style::default().fg(theme.fg),
+            ));
+        }
+        if let Some(anchor) = state.logs.visual_anchor {
+            // Inclusive span between the anchor and the live cursor.
+            let n = anchor.abs_diff(state.logs.scroll) + 1;
+            header_spans.push(Span::styled(
+                format!("· VISUAL {n} lines "),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
             ));
         }
         // Reload-in-flight indicator: only useful when we already have lines
@@ -248,6 +258,12 @@ fn render_table(
 ) {
     let wrap = state.logs.wrap;
     let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
+    // Visual-line selection span (inclusive), if `V` is active. Every row in it
+    // gets the selection highlight so the user sees exactly what `y` will copy.
+    let visual = state.logs.visual_anchor.map(|a| {
+        let a = a.min(lines.len().saturating_sub(1));
+        (a.min(cursor), a.max(cursor))
+    });
     let query = state.logs.search_input.value();
     let hi_style = Style::default()
         .bg(theme.favorite)
@@ -283,7 +299,7 @@ fn render_table(
         .enumerate()
         .map(|(off, l)| {
             let i = start + off;
-            let selected = i == cursor;
+            let selected = i == cursor || visual.is_some_and(|(lo, hi)| i >= lo && i <= hi);
             let ts =
                 l.ts.with_timezone(&chrono::Local)
                     .format("%Y-%m-%d %H:%M:%S")
@@ -891,7 +907,27 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
     }
 
+    // Visual-line mode: `Esc` cancels the selection (and is consumed here so it
+    // doesn't pop the view stack), mirroring vim. Only when a selection is
+    // active — otherwise `Back` must fall through to the global breadcrumb
+    // handler (see `back_is_not_consumed_by_view`).
+    if state.logs.visual_anchor.is_some() && action == Action::Back {
+        state.logs.visual_anchor = None;
+        return true;
+    }
+
     match action {
+        Action::ToggleVisualLine => {
+            // Toggle: anchor at the current cursor, or clear if already active.
+            if lines_len == 0 {
+                return true;
+            }
+            state.logs.visual_anchor = match state.logs.visual_anchor {
+                Some(_) => None,
+                None => Some(state.logs.scroll.min(lines_len - 1)),
+            };
+            true
+        }
         Action::ToggleErrorsOnly => {
             state.logs.errors_only = !state.logs.errors_only;
             if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
@@ -899,6 +935,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             state.logs.scroll = 0;
             state.logs.view_top.set(0);
+            state.logs.visual_anchor = None;
             true
         }
         Action::CycleSourceFilter => {
@@ -962,6 +999,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.view_stack.push(crate::ui::state::View::Logs);
                 state.view = crate::ui::state::View::LogDetail;
                 state.logs.detail_scroll = 0;
+                state.logs.visual_anchor = None;
             }
             true
         }
@@ -1038,6 +1076,7 @@ fn cycle_source_filter(state: &mut AppState) {
     };
     state.logs.scroll = 0;
     state.logs.view_top.set(0);
+    state.logs.visual_anchor = None;
 }
 
 /// True iff the log line's source or message contains `query` (case-insensitive
@@ -1134,6 +1173,7 @@ fn set_window(state: &mut AppState, range: TimeRange) -> bool {
     }
     state.logs.scroll = 0;
     state.logs.view_top.set(0);
+    state.logs.visual_anchor = None;
     true
 }
 
@@ -1424,6 +1464,60 @@ mod tests {
         assert_eq!(state.logs.scroll, 1);
         assert!(handle(Action::MoveDown, &mut state));
         assert_eq!(state.logs.scroll, 1);
+    }
+
+    #[test]
+    fn visual_line_toggle_anchors_and_clears() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![
+                line(1, LogLevel::Info, "x", "a"),
+                line(2, LogLevel::Info, "x", "b"),
+                line(3, LogLevel::Info, "x", "c"),
+            ],
+        );
+        state.logs.scroll = 1;
+        // First V anchors at the current cursor; movement extends, anchor stays.
+        assert!(handle(Action::ToggleVisualLine, &mut state));
+        assert_eq!(state.logs.visual_anchor, Some(1));
+        assert!(handle(Action::MoveDown, &mut state));
+        assert_eq!(state.logs.scroll, 2);
+        assert_eq!(state.logs.visual_anchor, Some(1));
+        // Second V cancels.
+        assert!(handle(Action::ToggleVisualLine, &mut state));
+        assert_eq!(state.logs.visual_anchor, None);
+    }
+
+    #[test]
+    fn esc_cancels_visual_selection_without_popping_view() {
+        // While a selection is live, Back is consumed (cancels). With no
+        // selection it must NOT be consumed — see `back_is_not_consumed_by_view`.
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state
+            .logs
+            .by_resource
+            .insert("/r/one".into(), vec![line(1, LogLevel::Info, "x", "a")]);
+        assert!(handle(Action::ToggleVisualLine, &mut state));
+        assert_eq!(state.logs.visual_anchor, Some(0));
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.logs.visual_anchor, None);
+        // Now that it's cleared, Back falls through to the global handler again.
+        assert!(!handle(Action::Back, &mut state));
+    }
+
+    #[test]
+    fn changing_window_clears_visual_selection() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state
+            .logs
+            .by_resource
+            .insert("/r/one".into(), vec![line(1, LogLevel::Info, "x", "a")]);
+        assert!(handle(Action::ToggleVisualLine, &mut state));
+        assert!(state.logs.visual_anchor.is_some());
+        // A window change refetches the buffer, so the anchored index is stale.
+        assert!(handle(Action::SetWindowWeek, &mut state));
+        assert_eq!(state.logs.visual_anchor, None);
     }
 
     #[test]

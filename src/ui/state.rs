@@ -597,6 +597,10 @@ pub struct ApimCache {
     pub apis_pending: HashSet<String>,
     pub apis_error: HashMap<String, String>,
     pub apis_cursor: usize,
+    /// `/`-search over the APIs list. `/` focuses, Enter commits (value
+    /// persists), Esc cancels and clears. Mirrors the storage/registry filters.
+    pub apis_filter: Input,
+    pub apis_filter_active: bool,
 
     /// Keyed by API resource id (`{service}/apis/{apiName}`).
     pub operations: HashMap<String, Vec<crate::azure::apim::Operation>>,
@@ -615,6 +619,27 @@ pub struct ApimCache {
     pub policy_error: HashMap<String, String>,
     pub policy_scroll: u16,
     pub selected_operation_id: Option<String>,
+}
+
+impl ApimCache {
+    /// Apply `apis_filter` to the APIs under `service_id`. Case-insensitive
+    /// substring match over display name, gateway path, and slug; empty filter
+    /// returns everything. Mirrors `StorageCache::filtered_blobs`.
+    pub fn filtered_apis(&self, service_id: &str) -> Vec<&crate::azure::apim::Api> {
+        let needle = self.apis_filter.value().to_lowercase();
+        match self.apis.get(service_id) {
+            Some(rows) => rows
+                .iter()
+                .filter(|a| {
+                    needle.is_empty()
+                        || a.display_name.to_lowercase().contains(&needle)
+                        || a.path.to_lowercase().contains(&needle)
+                        || a.name.to_lowercase().contains(&needle)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// State for the Application Gateway backends drill-in view: a single map of
@@ -1251,6 +1276,13 @@ pub struct LogsCache {
     /// columns. Reset on Esc; persists across Enter-commits so the user can
     /// keep `n`/`N`-navigating without re-typing.
     pub search_input: Input,
+    /// Vim visual-line mode anchor. `Some(row)` means a multi-line selection is
+    /// active, anchored at `row` (the cursor at the time `V` was pressed); the
+    /// live selection spans `min(anchor, scroll)..=max(anchor, scroll)`. `j`/`k`
+    /// extend it, `y` yanks the whole span, and `V`/`Esc` cancel. `None` is the
+    /// normal single-line mode. Reset whenever the buffer is refetched or
+    /// refiltered, since the anchored index would otherwise point at a stale row.
+    pub visual_anchor: Option<usize>,
 }
 
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.

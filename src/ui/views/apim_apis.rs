@@ -15,7 +15,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Enter operations  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str =
+    "j/k move  Enter operations  / filter  Esc back  r refresh  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 const NAME_COL_WIDTH: usize = 36;
@@ -56,19 +57,63 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     ]));
     frame.render_widget(header, chunks[0]);
 
+    let svc_id_opt = service_id(state);
+    let filter_value = state.apim.apis_filter.value();
+    let filter_active = state.apim.apis_filter_active;
+
+    // Title: total count, switching to `N of M` while a filter narrows the
+    // list, plus a `/{filter}` chip. Mirrors the storage / registry views.
+    let (total, filtered_len) = match svc_id_opt.as_deref() {
+        Some(id) => (
+            state.apim.apis.get(id).map(|v| v.len()),
+            state.apim.filtered_apis(id).len(),
+        ),
+        None => (None, 0),
+    };
+    let count_label = match total {
+        Some(t) if !filter_value.is_empty() => format!("· {filtered_len} of {t} "),
+        Some(t) => format!("· {t} "),
+        None => String::new(),
+    };
+    let mut title_spans: Vec<Span> = vec![
+        Span::styled(" apis ", Style::default().fg(theme.fg)),
+        Span::styled(count_label, Style::default().fg(theme.muted)),
+    ];
+    if filter_active || !filter_value.is_empty() {
+        title_spans.push(Span::styled(
+            format!("/{filter_value} "),
+            Style::default().fg(theme.accent),
+        ));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" apis ", Style::default().fg(theme.fg)));
+        .title(Line::from(title_spans));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
-    let Some(svc_id) = service_id(state) else {
+    // Optional filter input row at the top of the inner area.
+    let (search_area, body_area) = if filter_active {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, inner)
+    };
+    if let Some(sa) = search_area {
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.accent)),
+            Span::styled(filter_value, Style::default().fg(theme.fg)),
+            Span::styled("█", Style::default().fg(theme.accent)),
+        ]));
+        frame.render_widget(p, sa);
+    }
+
+    let Some(svc_id) = svc_id_opt else {
         let p = Paragraph::new(Line::from(Span::styled(
             "no APIM service selected.",
             Style::default().fg(theme.muted),
         )));
-        frame.render_widget(p, inner);
+        frame.render_widget(p, body_area);
         render_footer(frame, chunks[2], theme);
         return;
     };
@@ -78,41 +123,49 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!("error: {err}"),
             Style::default().fg(theme.critical),
         )));
-        frame.render_widget(p, inner);
+        frame.render_widget(p, body_area);
         render_footer(frame, chunks[2], theme);
         return;
     }
 
     let apis = state.apim.apis.get(&svc_id);
     let loading = state.apim.apis_pending.contains(&svc_id);
+    let filtered = state.apim.filtered_apis(&svc_id);
     match apis {
         None if loading => {
             let p = Paragraph::new(Line::from(Span::styled(
                 "loading APIs …",
                 Style::default().fg(theme.muted),
             )));
-            frame.render_widget(p, inner);
+            frame.render_widget(p, body_area);
         }
         None => {
             let p = Paragraph::new(Line::from(Span::styled(
                 "press r to load APIs.",
                 Style::default().fg(theme.muted),
             )));
-            frame.render_widget(p, inner);
+            frame.render_widget(p, body_area);
         }
         Some(rows) if rows.is_empty() => {
             let p = Paragraph::new(Line::from(Span::styled(
                 "no APIs defined on this APIM service.",
                 Style::default().fg(theme.muted),
             )));
-            frame.render_widget(p, inner);
+            frame.render_widget(p, body_area);
         }
-        Some(rows) => {
-            let cursor = state.apim.apis_cursor.min(rows.len() - 1);
-            let visible = inner.height as usize;
-            let scroll = scroll_for(cursor, rows.len(), visible);
+        Some(_) if filtered.is_empty() => {
+            let p = Paragraph::new(Line::from(Span::styled(
+                "no APIs match the current filter.",
+                Style::default().fg(theme.muted),
+            )));
+            frame.render_widget(p, body_area);
+        }
+        Some(_) => {
+            let cursor = state.apim.apis_cursor.min(filtered.len() - 1);
+            let visible = body_area.height as usize;
+            let scroll = scroll_for(cursor, filtered.len(), visible);
 
-            let lines: Vec<Line> = rows
+            let lines: Vec<Line> = filtered
                 .iter()
                 .enumerate()
                 .skip(scroll)
@@ -143,7 +196,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     }
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(Paragraph::new(lines), body_area);
         }
     }
 
@@ -162,7 +215,40 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     let Some(svc_id) = service_id(state) else {
         return false;
     };
-    let len = state.apim.apis.get(&svc_id).map(|v| v.len()).unwrap_or(0);
+    // Navigation operates on the filtered slice so the cursor never points past
+    // the end of what's rendered. Mirrors `storage_blobs::handle`.
+    let len = state.apim.filtered_apis(&svc_id).len();
+
+    // While the filter input has focus, swallow most actions but let the
+    // dispatcher's filter-forwarding gate push raw chars into the buffer.
+    // Esc cancels (deactivates AND clears); Enter commits (deactivates, keeps
+    // the value). Down hands focus back to the filtered list.
+    if state.apim.apis_filter_active {
+        match action {
+            Action::Back => {
+                state.apim.apis_filter_active = false;
+                state.apim.apis_filter.reset();
+                state.apim.apis_cursor = 0;
+                return true;
+            }
+            Action::OpenSelected => {
+                state.apim.apis_filter_active = false;
+                return true;
+            }
+            Action::MoveDown => {
+                state.apim.apis_filter_active = false;
+                // fall through to navigation handling below
+            }
+            Action::MoveUp
+            | Action::HalfPageDown
+            | Action::HalfPageUp
+            | Action::GotoTop
+            | Action::GotoBottom => {
+                // fall through to navigation handling below
+            }
+            _ => return false,
+        }
+    }
 
     match action {
         Action::MoveDown => {
@@ -195,12 +281,17 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             true
         }
+        Action::StartSearch => {
+            state.apim.apis_filter_active = true;
+            true
+        }
         Action::OpenSelected => {
+            // Resolve via the filtered slice so the cursor's row matches what
+            // the user actually sees on screen.
             let api_id = state
                 .apim
-                .apis
-                .get(&svc_id)
-                .and_then(|rows| rows.get(state.apim.apis_cursor))
+                .filtered_apis(&svc_id)
+                .get(state.apim.apis_cursor)
                 .map(|api| api.id.clone());
             if let Some(api_id) = api_id {
                 state.apim.selected_api_id = Some(api_id);
@@ -290,6 +381,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo API".into(),
                 path: "echo".into(),
+                service_url: Some("https://echo.example.com".into()),
             }],
         );
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -308,6 +400,7 @@ mod tests {
                 name: "echo".into(),
                 display_name: "Echo API".into(),
                 path: "echo".into(),
+                service_url: Some("https://echo.example.com".into()),
             }],
         );
         assert!(handle(Action::OpenSelected, &mut state));
@@ -315,6 +408,124 @@ mod tests {
         assert_eq!(
             state.apim.selected_api_id.as_deref(),
             Some("/svc/myapim/apis/echo")
+        );
+    }
+
+    fn three_apis() -> AppState {
+        let mut state = fixture();
+        state.apim.apis.insert(
+            "/svc/myapim".into(),
+            vec![
+                Api {
+                    id: "/svc/myapim/apis/orders".into(),
+                    name: "orders-api".into(),
+                    display_name: "Orders API".into(),
+                    path: "orders".into(),
+                    service_url: None,
+                },
+                Api {
+                    id: "/svc/myapim/apis/payments".into(),
+                    name: "payments-api".into(),
+                    display_name: "Payments API".into(),
+                    path: "payments".into(),
+                    service_url: None,
+                },
+                Api {
+                    id: "/svc/myapim/apis/catalog".into(),
+                    name: "catalog-api".into(),
+                    display_name: "Catalog API".into(),
+                    path: "catalog".into(),
+                    service_url: None,
+                },
+            ],
+        );
+        state
+    }
+
+    #[test]
+    fn slash_opens_filter_input() {
+        let mut state = three_apis();
+        assert!(handle(Action::StartSearch, &mut state));
+        assert!(state.apim.apis_filter_active);
+    }
+
+    #[test]
+    fn esc_in_filter_clears_buffer() {
+        let mut state = three_apis();
+        state.apim.apis_filter_active = true;
+        state.apim.apis_filter = tui_input::Input::default().with_value("pay".to_string());
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.apim.apis_filter_active);
+        assert_eq!(state.apim.apis_filter.value(), "");
+    }
+
+    #[test]
+    fn enter_in_filter_keeps_value_and_deactivates() {
+        let mut state = three_apis();
+        state.apim.apis_filter_active = true;
+        state.apim.apis_filter = tui_input::Input::default().with_value("pay".to_string());
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(!state.apim.apis_filter_active);
+        assert_eq!(state.apim.apis_filter.value(), "pay");
+        assert_eq!(state.view, View::ApimApis);
+    }
+
+    #[test]
+    fn filter_matches_display_name_path_and_slug() {
+        let mut state = three_apis();
+        // path match
+        state.apim.apis_filter = tui_input::Input::default().with_value("catalog".to_string());
+        let names: Vec<&str> = state
+            .apim
+            .filtered_apis("/svc/myapim")
+            .iter()
+            .map(|a| a.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Catalog API"]);
+        // case-insensitive display-name match
+        state.apim.apis_filter = tui_input::Input::default().with_value("ORDER".to_string());
+        let names: Vec<&str> = state
+            .apim
+            .filtered_apis("/svc/myapim")
+            .iter()
+            .map(|a| a.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Orders API"]);
+    }
+
+    #[test]
+    fn navigation_and_open_use_filtered_slice() {
+        let mut state = three_apis();
+        state.apim.apis_filter = tui_input::Input::default().with_value("pay".to_string());
+        state.apim.apis_cursor = 0;
+        // Only one match -> GotoBottom clamps to filtered len-1 == 0.
+        assert!(handle(Action::GotoBottom, &mut state));
+        assert_eq!(state.apim.apis_cursor, 0);
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert_eq!(state.view, View::ApimOperations);
+        assert_eq!(
+            state.apim.selected_api_id.as_deref(),
+            Some("/svc/myapim/apis/payments"),
+            "drills into the filtered row, not the same index in the raw list",
+        );
+    }
+
+    #[test]
+    fn renders_filter_chip_in_title() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = three_apis();
+        state.apim.apis_filter = tui_input::Input::default().with_value("pay".to_string());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(
+            buf.contains("/pay"),
+            "title chip should show /pay, got: {buf}"
+        );
+        assert!(
+            buf.contains("1 of 3"),
+            "count should switch to `N of M` when filtering, got: {buf}",
         );
     }
 
@@ -329,12 +540,14 @@ mod tests {
                     name: "a".into(),
                     display_name: "A".into(),
                     path: "a".into(),
+                    service_url: None,
                 },
                 Api {
                     id: "a2".into(),
                     name: "b".into(),
                     display_name: "B".into(),
                     path: "b".into(),
+                    service_url: None,
                 },
             ],
         );

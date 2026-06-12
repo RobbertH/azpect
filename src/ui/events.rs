@@ -327,6 +327,10 @@ pub enum Action {
     /// Vim-style yank: copy something contextual (selected log line, displayed
     /// error, selected resource id, …) to the system clipboard via OSC52.
     Yank,
+    /// Vim-style visual-line mode toggle (`V`). In the logs view this anchors a
+    /// multi-line selection at the current row; `j`/`k` extend it and `y` yanks
+    /// the whole span. Pressing `V` again (or `Esc`) cancels. No-op elsewhere.
+    ToggleVisualLine,
     /// Open the contextual target (selected resource / subscription) in the
     /// Azure Portal in the system default browser.
     OpenInBrowser,
@@ -455,6 +459,9 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char(':') => Action::StartCommand,
         KeyCode::Char('y') => Action::Yank,
+        // Visual-line mode (k9s/vim `V`). Only the logs view acts on it; other
+        // views let it fall through to the global handler as a no-op.
+        KeyCode::Char('V') => Action::ToggleVisualLine,
         KeyCode::Char('o') => Action::OpenInBrowser,
         KeyCode::Char('q') => Action::Back,
 
@@ -587,6 +594,20 @@ mod tests {
         // action now that `w` is repurposed for wrap.
         assert_eq!(key_to_action(key('d'), v, false), Action::Noop);
         assert_eq!(key_to_action(key('1'), v, false), Action::SetWindowDay);
+    }
+
+    #[test]
+    fn capital_v_toggles_visual_line() {
+        // `V` maps to the visual-line toggle; only the logs view acts on it,
+        // but the keymap itself is view-independent.
+        assert_eq!(
+            key_to_action(key_shift('V'), View::Logs, false),
+            Action::ToggleVisualLine
+        );
+        assert_eq!(
+            key_to_action(key_shift('V'), View::List, false),
+            Action::ToggleVisualLine
+        );
     }
 
     #[test]

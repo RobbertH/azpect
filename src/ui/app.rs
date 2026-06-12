@@ -466,6 +466,14 @@ async fn event_loop(
                     state.subscription_cursor = 0;
                     continue;
                 }
+                // APIM APIs name filter shares the same carve-out shape.
+                // Reset the cursor so a shrinking match list never points past
+                // the end of `filtered_apis()`.
+                if should_forward_to_apim_apis_filter(state, key) {
+                    state.apim.apis_filter.handle_event(&CtEvent::Key(key));
+                    state.apim.apis_cursor = 0;
+                    continue;
+                }
                 let action = decide_action(&mut input, key, state);
                 if action != Action::Noop {
                     apply_action(action, state, auth, tx);
@@ -1237,6 +1245,23 @@ fn should_forward_to_subscriptions_filter(
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the APIM APIs name filter. Only
+/// forwards while the apim-apis view has its filter box focused; same Esc /
+/// Enter / arrow carve-outs so cancel / commit / nav still reach the dispatcher.
+fn should_forward_to_apim_apis_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::ApimApis
+        && state.apim.apis_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Mirror of `should_forward_to_filter` for the logs view's less-style search
 /// box. Same carve-outs: arrows / page nav drive the underlying table so the
 /// user can scroll context around the live highlights while still typing.
@@ -1698,7 +1723,8 @@ fn decide_action(
         || (state.view == View::ServiceBusNamespaces && state.service_bus.namespaces_filter_active)
         || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
         || (state.view == View::ServiceBusSubscriptions
-            && state.service_bus.subscriptions_filter_active);
+            && state.service_bus.subscriptions_filter_active)
+        || (state.view == View::ApimApis && state.apim.apis_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1861,6 +1887,10 @@ fn do_yank(state: &mut AppState) {
         Err(e) => {
             state.set_status(format!("clipboard write failed: {e}"));
         }
+    }
+    // A visual-line yank ends the selection, vim-style — the copy is done.
+    if state.view == View::Logs {
+        state.logs.visual_anchor = None;
     }
 }
 
@@ -2120,11 +2150,11 @@ fn yank_target(state: &AppState) -> Option<String> {
         View::EnvVars => crate::ui::views::env_vars::yank_text(state),
         View::List | View::Detail => state.selected_resource().map(|r| r.id.clone()),
         View::ApimApis => state.selected_resource().and_then(|r| {
+            // Resolve via the filtered slice so `y` matches the row on screen.
             state
                 .apim
-                .apis
-                .get(&r.id)
-                .and_then(|rows| rows.get(state.apim.apis_cursor))
+                .filtered_apis(&r.id)
+                .get(state.apim.apis_cursor)
                 .map(|api| api.id.clone())
         }),
         View::ApimOperations => state.apim.selected_api_id.as_deref().and_then(|api_id| {
@@ -2271,15 +2301,38 @@ fn yank_from_logs(state: &AppState) -> Option<String> {
     }
     // The cursor indexes the source-filtered view, same as the table render.
     let lines = state.visible_log_lines(&resource.id);
-    let cursor = state.logs.scroll.min(lines.len().saturating_sub(1));
-    let line = lines.get(cursor)?;
-    Some(format!(
+    if lines.is_empty() {
+        return None;
+    }
+    let cursor = state.logs.scroll.min(lines.len() - 1);
+
+    // Visual-line mode: yank every row in the anchored span, one per line.
+    // Otherwise just the line under the cursor.
+    let (lo, hi) = match state.logs.visual_anchor {
+        Some(anchor) => {
+            let anchor = anchor.min(lines.len() - 1);
+            (anchor.min(cursor), anchor.max(cursor))
+        }
+        None => (cursor, cursor),
+    };
+    let text = lines[lo..=hi]
+        .iter()
+        .map(|line| format_log_line_for_yank(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(text)
+}
+
+/// One log line as the single-line yank payload: timestamp, level, source,
+/// and message on one row so multi-line selections paste cleanly.
+fn format_log_line_for_yank(line: &crate::azure::logs::LogLine) -> String {
+    format!(
         "{}  {:?}  {}  {}",
         line.ts.format("%Y-%m-%dT%H:%M:%SZ"),
         line.level,
         line.source,
         line.message
-    ))
+    )
 }
 
 /// Pure navigation/quit subset of `global_handle`. Touches only `state`, so it
@@ -5569,6 +5622,57 @@ mod tests {
         assert!(yanked.contains("AppExceptions"));
         assert!(yanked.contains("kaboom"));
         assert!(yanked.contains("2026-05-10T12:00:00Z"));
+    }
+
+    #[test]
+    fn yank_in_logs_visual_mode_returns_every_selected_line() {
+        use crate::azure::logs::{LogLevel, LogLine};
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{TimeZone, Utc};
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/one".into(),
+            name: "alpha-func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "westeurope".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        let ts = Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .unwrap();
+        let mk = |msg: &str| LogLine {
+            ts,
+            level: LogLevel::Info,
+            source: "AppTraces".into(),
+            message: msg.into(),
+            fields: Vec::new(),
+        };
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![mk("first"), mk("second"), mk("third")],
+        );
+
+        // Anchor at row 0, cursor at row 2 → all three lines, one per row.
+        state.logs.visual_anchor = Some(0);
+        state.logs.scroll = 2;
+        let yanked = yank_target(&state).expect("visual span should yield text");
+        assert_eq!(yanked.lines().count(), 3);
+        assert!(yanked.contains("first"));
+        assert!(yanked.contains("second"));
+        assert!(yanked.contains("third"));
+
+        // A live yank clears the selection (vim-style) — exercised via do_yank.
+        do_yank(&mut state);
+        assert_eq!(state.logs.visual_anchor, None);
     }
 
     #[test]
