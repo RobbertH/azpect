@@ -57,12 +57,27 @@ fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
     format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
 }
 
-const ROW_KINDS: [(MetricKind, &str); 4] = [
-    (MetricKind::Traffic, "Requests"),
-    (MetricKind::Errors, "Http 5xx"),
-    (MetricKind::Cpu, "CPU"),
-    (MetricKind::Memory, "Memory"),
+const ROW_KINDS: [MetricKind; 4] = [
+    MetricKind::Traffic,
+    MetricKind::Errors,
+    MetricKind::Cpu,
+    MetricKind::Memory,
 ];
+
+/// Row label for a metric. Container App CPU/Memory are tagged `avg/replica`
+/// because the plotted series is the average across replicas (not a sum) — see
+/// [`crate::azure::metrics::MetricSeries::peak_replica`] for the busiest-replica
+/// counterpart shown in the summary.
+fn metric_row_label(kind: MetricKind, resource_kind: ResourceKind) -> &'static str {
+    match (kind, resource_kind) {
+        (MetricKind::Cpu, ResourceKind::ContainerApp) => "CPU (avg/replica)",
+        (MetricKind::Memory, ResourceKind::ContainerApp) => "Memory (avg/replica)",
+        (MetricKind::Traffic, _) => "Requests",
+        (MetricKind::Errors, _) => "Http 5xx",
+        (MetricKind::Cpu, _) => "CPU",
+        (MetricKind::Memory, _) => "Memory",
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let chunks = Layout::vertical([
@@ -461,12 +476,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let missing_for_resource = state.metrics.missing.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
-    for (i, (kind, label)) in ROW_KINDS.iter().enumerate() {
+    for (i, kind) in ROW_KINDS.iter().enumerate() {
         let area = metric_rows[i];
         if area.height == 0 {
             continue;
         }
         let missing_reason = missing_for_resource.and_then(|m| m.get(kind));
+        let label = metric_row_label(*kind, resource.kind);
         render_metric_row(
             frame,
             area,
@@ -937,14 +953,19 @@ fn replica_status_lines(
             out.push((row_label, name, plain));
 
             // One indented sub-row per container: padded name, readiness glyph,
-            // and its own restart count (more precise than the old max-across).
+            // its own restart count, and — when a container is stuck — a short
+            // reason (e.g. `image pull failed`) so the "why" is visible without
+            // opening the portal.
             for c in &r.containers {
                 let cname = container_display_name(c);
                 let glyph = ready_glyph(c.ready);
-                let value = format!(
+                let mut value = format!(
                     "  {cname:<name_width$}  {glyph}  restarts {}",
                     c.restart_count
                 );
+                if let Some(reason) = container_blocked_reason(c) {
+                    value.push_str(&format!("  \u{00b7} {reason}"));
+                }
                 let plain = format!("{blank_label} {value}");
                 out.push((blank_label.clone(), value, plain));
             }
@@ -992,6 +1013,57 @@ fn ready_glyph(ready: Option<bool>) -> char {
         Some(true) => '\u{2713}',  // ✓
         Some(false) => '\u{2717}', // ✗
         None => '?',
+    }
+}
+
+/// Short, human reason a container isn't up — distilled from its
+/// `runningStateDetails`. `None` for a `Running` container or when Azure
+/// reported no detail. Used to annotate the inline instances rows so a stuck
+/// replica explains itself (most usefully: an image-pull failure) instead of
+/// just showing `✗ restarts 0`.
+fn container_blocked_reason(
+    c: &crate::azure::container_app_replicas::ReplicaContainer,
+) -> Option<String> {
+    if c.running_state
+        .as_deref()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("Running")
+    {
+        return None;
+    }
+    let details = c.running_state_details.as_deref()?.trim();
+    if details.is_empty() {
+        return None;
+    }
+    Some(summarize_container_state_details(details))
+}
+
+/// Map a raw `runningStateDetails` string to a short tag, falling back to a
+/// truncated snippet of the original when it doesn't match a known failure
+/// shape. Kept conservative: only collapses the well-known kubelet phrasings.
+fn summarize_container_state_details(details: &str) -> String {
+    let lower = details.to_lowercase();
+    let image_pull = lower.contains("imagepull")
+        || lower.contains("errimagepull")
+        || lower.contains("pulling image")
+        || lower.contains("manifest")
+        || (lower.contains("image")
+            && (lower.contains("not found") || lower.contains("access denied")));
+    if image_pull {
+        return "image pull failed".to_string();
+    }
+    if lower.contains("crashloop") {
+        return "crash loop".to_string();
+    }
+    if lower.contains("oomkill") || lower.contains("out of memory") {
+        return "out of memory".to_string();
+    }
+    // Unknown shape: show a trimmed snippet so the user still sees *something*.
+    let snippet: String = details.chars().take(60).collect();
+    if details.chars().count() > 60 {
+        format!("{snippet}\u{2026}")
+    } else {
+        snippet
     }
 }
 
@@ -1525,11 +1597,17 @@ fn summary_for(
             // Window peak; the `.max(0.0)` turns an empty series' -inf into 0.
             let highest = s.max().max(0.0);
             let suffix = unit_suffix(s);
-            let base = format!(
+            let mut base = format!(
                 "latest: {}{suffix} / highest: {}{suffix}",
                 format_value(latest),
                 format_value(highest),
             );
+            // Busiest single replica over the window — only meaningful when it
+            // exceeds the across-replica average peak (a 1-replica app has them
+            // equal, so it's omitted there).
+            if let Some(peak) = s.peak_replica.filter(|p| *p > highest) {
+                base = format!("{base} / peak-replica: {}{suffix}", format_value(peak));
+            }
             match limits.map(|l| l.cpu_millicores).filter(|m| *m > 0) {
                 Some(max_mc) => format!("{base} / max {max_mc} mCores"),
                 None => base,
@@ -1539,11 +1617,14 @@ fn summary_for(
             let latest = s.latest().unwrap_or(0.0);
             let highest = s.max().max(0.0);
             let suffix = unit_suffix(s);
-            let base = format!(
+            let mut base = format!(
                 "latest: {}{suffix} / highest: {}{suffix}",
                 format_bytes(latest),
                 format_bytes(highest),
             );
+            if let Some(peak) = s.peak_replica.filter(|p| *p > highest) {
+                base = format!("{base} / peak-replica: {}", format_bytes(peak));
+            }
             match limits.map(|l| l.memory_bytes).filter(|b| *b > 0) {
                 Some(max_b) => format!("{base} / max {}", format_bytes(max_b as f64)),
                 None => base,
@@ -2010,6 +2091,13 @@ fn replica_modal_lines(
                 "  {name} {glyph}  restarts {}  ({running})",
                 c.restart_count
             ));
+            // Full reason (not the inline short tag) so the modal explains a
+            // stuck container — e.g. the exact image that failed to pull.
+            if !running.eq_ignore_ascii_case("Running") {
+                if let Some(details) = c.running_state_details.as_deref() {
+                    lines.push(format!("      \u{21b3} {details}"));
+                }
+            }
         }
     }
     lines
@@ -2141,6 +2229,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .map(|r| supports_logs(r.kind))
                 .unwrap_or(false);
             if supports {
+                // Drop the previous resource's source/search filters so the new
+                // app's logs aren't hidden behind a stale container-name filter.
+                state.logs.reset_view_filters();
                 state.view_stack.push(state.view);
                 state.view = View::Logs;
             } else {
@@ -2791,6 +2882,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 0,
                     running_state: Some("Running".into()),
+                    running_state_details: None,
                 },
                 ReplicaContainer {
                     name: "files-api".into(),
@@ -2798,6 +2890,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 0,
                     running_state: Some("Running".into()),
+                    running_state_details: None,
                 },
                 ReplicaContainer {
                     name: "http-auth".into(),
@@ -2805,6 +2898,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 0,
                     running_state: Some("Running".into()),
+                    running_state_details: None,
                 },
             ],
         }];
@@ -2863,6 +2957,7 @@ mod tests {
                 started: Some(true),
                 restart_count: 0,
                 running_state: None,
+                running_state_details: None,
             }],
         };
         let replicas: Vec<_> = (0..15).map(make).collect();
@@ -2885,6 +2980,7 @@ mod tests {
                 started: Some(true),
                 restart_count: 0,
                 running_state: None,
+                running_state_details: None,
             }],
         }];
         let lines = replica_status_lines(Some(&replicas), false, None);
@@ -2896,6 +2992,68 @@ mod tests {
             "no empty parens: {:?}",
             lines[0].1
         );
+    }
+
+    #[test]
+    fn container_blocked_reason_classifies_image_pull_and_skips_running() {
+        use crate::azure::container_app_replicas::ReplicaContainer;
+        let waiting = ReplicaContainer {
+            name: "maintenance".into(),
+            ready: Some(false),
+            started: Some(false),
+            restart_count: 0,
+            running_state: Some("Waiting".into()),
+            running_state_details: Some(
+                "Back-off pulling image \"acr.io/api:bad\" — manifest not found".into(),
+            ),
+        };
+        assert_eq!(
+            container_blocked_reason(&waiting).as_deref(),
+            Some("image pull failed")
+        );
+
+        // A Running container never reports a blocked reason, even if a stale
+        // detail lingers.
+        let running = ReplicaContainer {
+            running_state: Some("Running".into()),
+            running_state_details: Some("whatever".into()),
+            ..waiting.clone()
+        };
+        assert_eq!(container_blocked_reason(&running), None);
+
+        // Unknown detail falls back to a trimmed snippet rather than a tag.
+        let other = ReplicaContainer {
+            running_state: Some("Waiting".into()),
+            running_state_details: Some("something unfamiliar happened".into()),
+            ..waiting.clone()
+        };
+        assert_eq!(
+            container_blocked_reason(&other).as_deref(),
+            Some("something unfamiliar happened")
+        );
+    }
+
+    #[test]
+    fn replica_status_lines_annotates_stuck_container_with_reason() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        let replicas = vec![ReplicaInstance {
+            name: "ca--rev-d4f9k".into(),
+            created_at: None,
+            running_state: Some("NotRunning".into()),
+            containers: vec![ReplicaContainer {
+                name: "maintenance".into(),
+                ready: Some(false),
+                started: Some(false),
+                restart_count: 0,
+                running_state: Some("Waiting".into()),
+                running_state_details: Some("Back-off pulling image \"acr.io/api:bad\"".into()),
+            }],
+        }];
+        let lines = replica_status_lines(Some(&replicas), false, None);
+        // The container sub-row spells out why it's stuck.
+        let sub = &lines[1].1;
+        assert!(sub.contains("restarts 0"), "got {sub:?}");
+        assert!(sub.contains("image pull failed"), "got {sub:?}");
     }
 
     #[test]
@@ -2917,6 +3075,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 2,
                     running_state: Some("Running".into()),
+                    running_state_details: None,
                 },
                 ReplicaContainer {
                     name: "http-auth".into(),
@@ -2924,6 +3083,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 0,
                     running_state: Some("Waiting".into()),
+                    running_state_details: None,
                 },
             ],
         };
@@ -3010,6 +3170,7 @@ mod tests {
                     started: Some(true),
                     restart_count: 0,
                     running_state: Some("Running".into()),
+                    running_state_details: None,
                 }],
             }],
         );
@@ -3106,6 +3267,7 @@ mod tests {
                         started: Some(true),
                         restart_count: 0,
                         running_state: Some("Running".into()),
+                        running_state_details: None,
                     },
                     ReplicaContainer {
                         name: "http-auth".into(),
@@ -3113,6 +3275,7 @@ mod tests {
                         started: Some(true),
                         restart_count: 0,
                         running_state: Some("Running".into()),
+                        running_state_details: None,
                     },
                 ],
             }],
@@ -3166,6 +3329,7 @@ mod tests {
                     value: 12.5,
                 },
             ],
+            peak_replica: None,
         };
         let limits = ContainerAppOverview {
             cpu_millicores: 500,
@@ -3178,6 +3342,69 @@ mod tests {
         assert!(out.contains("latest: 12.5"));
         assert!(out.contains("/ highest: 86.4"), "got {out:?}");
         assert!(out.contains("/ max 500 mCores"), "got {out:?}");
+    }
+
+    #[test]
+    fn summary_for_cpu_shows_peak_replica_when_above_highest() {
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        use chrono::Utc;
+
+        let series = MetricSeries {
+            kind: MetricKind::Cpu,
+            label: String::new(),
+            unit: "mCores".into(),
+            points: vec![
+                MetricPoint {
+                    ts: Utc::now(),
+                    value: 86.4,
+                },
+                MetricPoint {
+                    ts: Utc::now(),
+                    value: 42.3,
+                },
+            ],
+            // Busiest replica well above the across-replica peak (86.4).
+            peak_replica: Some(210.0),
+        };
+        let out = summary_for(MetricKind::Cpu, &series, None);
+        assert!(out.contains("/ peak-replica: 210"), "got {out:?}");
+    }
+
+    #[test]
+    fn summary_for_cpu_omits_peak_replica_when_not_above_highest() {
+        use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
+        use chrono::Utc;
+
+        // Single-replica app: peak == highest, so the redundant line is dropped.
+        let series = MetricSeries {
+            kind: MetricKind::Cpu,
+            label: String::new(),
+            unit: "mCores".into(),
+            points: vec![MetricPoint {
+                ts: Utc::now(),
+                value: 86.4,
+            }],
+            peak_replica: Some(86.4),
+        };
+        let out = summary_for(MetricKind::Cpu, &series, None);
+        assert!(!out.contains("peak-replica"), "got {out:?}");
+    }
+
+    #[test]
+    fn container_app_cpu_memory_labels_flag_per_replica_average() {
+        assert_eq!(
+            metric_row_label(MetricKind::Cpu, ResourceKind::ContainerApp),
+            "CPU (avg/replica)"
+        );
+        assert_eq!(
+            metric_row_label(MetricKind::Memory, ResourceKind::ContainerApp),
+            "Memory (avg/replica)"
+        );
+        // Other resource kinds keep the plain labels.
+        assert_eq!(
+            metric_row_label(MetricKind::Cpu, ResourceKind::FunctionApp),
+            "CPU"
+        );
     }
 
     #[test]
@@ -3194,6 +3421,7 @@ mod tests {
                 ts: Utc::now(),
                 value: 4.7,
             }],
+            peak_replica: None,
         };
         let limits = ContainerAppOverview {
             cpu_millicores: 0,
@@ -3251,6 +3479,7 @@ mod tests {
                     value: *v,
                 })
                 .collect(),
+            peak_replica: None,
         }
     }
 
@@ -3318,6 +3547,25 @@ mod tests {
         let mut state = fixture_no_metrics();
         assert!(handle(Action::OpenLogs, &mut state));
         assert_eq!(state.view, View::Logs);
+    }
+
+    #[test]
+    fn open_logs_resets_stale_source_and_search_filters() {
+        // Regression: a source filter set on a previous app (e.g. a container
+        // name) carried into another app's logs and hid every line. Opening
+        // Logs must clear the resource-specific filters.
+        let mut state = fixture_no_metrics();
+        state.logs.source_filter = Some("maintenance".into());
+        state.logs.search_active = true;
+        state.logs.search_input = tui_input::Input::default().with_value("boom".into());
+        state.logs.visual_anchor = Some(3);
+
+        assert!(handle(Action::OpenLogs, &mut state));
+        assert_eq!(state.view, View::Logs);
+        assert_eq!(state.logs.source_filter, None);
+        assert!(!state.logs.search_active);
+        assert_eq!(state.logs.search_input.value(), "");
+        assert_eq!(state.logs.visual_anchor, None);
     }
 
     #[test]

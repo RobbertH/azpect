@@ -305,6 +305,7 @@ fn series(
         label: label.to_string(),
         unit: unit.to_string(),
         points,
+        peak_replica: None,
     }
 }
 
@@ -368,22 +369,28 @@ pub fn metrics(resource: &Resource, range: TimeRange) -> MetricsResult {
             ));
         }
         ResourceKind::ContainerApp => {
-            out.series.push(series(
+            // The plotted series is the across-replica average; stamp a busier
+            // single-replica peak so the demo exercises the `peak-replica` line.
+            let mut cpu = series(
                 MetricKind::Cpu,
                 "CPU",
                 "mCores",
                 range,
                 seed.wrapping_add(2),
                 |_i, wave, nz| 60.0 + 180.0 * wave + 40.0 * nz,
-            ));
-            out.series.push(series(
+            );
+            cpu.peak_replica = Some(cpu.max().max(0.0) * 1.35);
+            out.series.push(cpu);
+            let mut mem = series(
                 MetricKind::Memory,
                 "Memory",
                 "bytes",
                 range,
                 seed.wrapping_add(3),
                 |_i, wave, nz| 3.1e8 + 1.2e8 * wave + 2.0e7 * nz,
-            ));
+            );
+            mem.peak_replica = Some(mem.max().max(0.0) * 1.25);
+            out.series.push(mem);
         }
         ResourceKind::Apim => {
             out.series.push(series(
@@ -491,7 +498,9 @@ pub fn container_app_overview(resource_id: &str) -> ContainerAppOverview {
         },
         EnvVar {
             name: "ORDERS_DB_CONNECTION".to_string(),
-            value: "secretref:orders-db-connection".to_string(),
+            // Same display shape `from_container_env` produces, so Enter on this
+            // row resolves through `secrets` below to the Key Vault and decodes.
+            value: "(secret: orders-db-connection)".to_string(),
             is_secret: true,
             ..Default::default()
         },
@@ -523,12 +532,43 @@ pub fn container_app_overview(resource_id: &str) -> ContainerAppOverview {
         managed_identity: Some("SystemAssigned".to_string()),
         env_vars: crate::azure::container_app_overview::explode_container_env(&containers),
         containers,
+        // `ORDERS_DB_CONNECTION`'s `secretRef` resolves here: a Key Vault-backed
+        // app secret pointing at `kv-contoso-prod` (see `key_vaults`).
+        secrets: vec![crate::azure::container_app_overview::ContainerAppSecret {
+            name: "orders-db-connection".to_string(),
+            key_vault_url: Some(
+                "https://kv-contoso-prod.vault.azure.net/secrets/orders-db-connection".to_string(),
+            ),
+        }],
     }
 }
 
 pub fn replicas(resource_id: &str, revision_name: &str) -> Vec<ReplicaInstance> {
     let app = resource_id.rsplit('/').next().unwrap_or("app");
     let now = Utc::now();
+
+    // `ca-search-api` demos a stuck rollout: a fresh replica whose container
+    // can't pull its image (ImagePullBackOff), so the instances block shows the
+    // reason inline instead of a bare `✗ restarts 0`.
+    if app == "ca-search-api" {
+        return vec![ReplicaInstance {
+            name: format!("{revision_name}-d4f9k"),
+            created_at: Some(now - Duration::minutes(6)),
+            running_state: Some("NotRunning".to_string()),
+            containers: vec![ReplicaContainer {
+                name: app.to_string(),
+                ready: Some(false),
+                started: Some(false),
+                restart_count: 0,
+                running_state: Some("Waiting".to_string()),
+                running_state_details: Some(format!(
+                    "Back-off pulling image \"crcontosoprod.azurecr.io/{app}:2.4.0-rc1\" \
+                     — manifest tagged \"2.4.0-rc1\" not found in registry"
+                )),
+            }],
+        }];
+    }
+
     (0..3)
         .map(|i| ReplicaInstance {
             name: format!("{revision_name}-{}", ["fl9k2", "x7m4p", "q2v8c"][i]),
@@ -540,6 +580,7 @@ pub fn replicas(resource_id: &str, revision_name: &str) -> Vec<ReplicaInstance> 
                 started: Some(true),
                 restart_count: if i == 2 { 1 } else { 0 },
                 running_state: Some("Running".to_string()),
+                running_state_details: None,
             }],
         })
         .collect()

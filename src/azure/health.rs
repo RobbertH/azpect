@@ -252,6 +252,7 @@ mod tests {
             label: String::new(),
             unit: String::new(),
             points,
+            peak_replica: None,
         }
     }
 

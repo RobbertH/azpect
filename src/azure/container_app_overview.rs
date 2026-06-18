@@ -54,6 +54,35 @@ pub struct ContainerAppOverview {
     /// every replica. Used by the Detail view to list each container by name
     /// alongside its image and reservations.
     pub containers: Vec<ContainerSpec>,
+    /// App-level secrets from `properties.configuration.secrets`, in declaration
+    /// order. A `secretRef` env var points at one of these by name. ARM redacts
+    /// the plaintext `value` in GET responses, but Key Vault-backed secrets still
+    /// carry their `keyVaultUrl` — which is what lets the env-vars page follow
+    /// such a `secretRef` to its vault. See [`Self::secret_key_vault_url`].
+    pub secrets: Vec<ContainerAppSecret>,
+}
+
+/// One entry of a Container App's `configuration.secrets`. Either a plain
+/// in-app value (whose plaintext ARM does not return on GET) or a reference to
+/// a Key Vault secret (`key_vault_url` set).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContainerAppSecret {
+    pub name: String,
+    /// `keyVaultUrl` when this secret resolves from Key Vault, e.g.
+    /// `https://v.vault.azure.net/secrets/kafka-bootstrap-servers`. `None` for a
+    /// plain in-app value.
+    pub key_vault_url: Option<String>,
+}
+
+impl ContainerAppOverview {
+    /// The `keyVaultUrl` of the named app secret, when that secret is Key
+    /// Vault-backed. `None` if the secret is unknown or holds a plain value.
+    pub fn secret_key_vault_url(&self, name: &str) -> Option<&str> {
+        self.secrets
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.key_vault_url.as_deref())
+    }
 }
 
 /// One container in a revision's template. Per-container reservations are
@@ -155,12 +184,22 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
 
     let managed_identity = summarize_identity(value.get("identity"));
 
+    // App-level secrets. ARM redacts the `value` on GET, but Key Vault-backed
+    // entries keep their `keyVaultUrl`, which is what makes a `secretRef`
+    // followable to its vault from the env-vars page.
+    let secrets = value
+        .pointer("/properties/configuration/secrets")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(parse_secret).collect())
+        .unwrap_or_default();
+
     let mut total = ContainerAppOverview {
         fqdn,
         ingress_external,
         access_restricted,
         managed_environment,
         managed_identity,
+        secrets,
         ..ContainerAppOverview::default()
     };
     for c in containers {
@@ -182,6 +221,26 @@ pub fn extract(value: &serde_json::Value) -> ContainerAppOverview {
     // what lets the edit path write a change back unambiguously.
     total.env_vars = explode_container_env(&total.containers);
     total
+}
+
+/// Parse one `configuration.secrets` entry. Skips nameless entries; keeps the
+/// `keyVaultUrl` when present (the plain `value` is intentionally ignored — ARM
+/// redacts it on GET and we never surface secret material from listing).
+fn parse_secret(v: &serde_json::Value) -> Option<ContainerAppSecret> {
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let key_vault_url = v
+        .get("keyVaultUrl")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Some(ContainerAppSecret {
+        name,
+        key_vault_url,
+    })
 }
 
 /// Pull one container spec out of a `template.containers` / `initContainers`
@@ -444,6 +503,40 @@ mod tests {
         let l = extract(&v);
         assert_eq!(l.cpu_millicores, 250);
         assert_eq!(l.memory_bytes, 0);
+    }
+
+    #[test]
+    fn parses_secrets_and_resolves_key_vault_backed_ones() {
+        let v = json!({
+            "properties": {
+                "configuration": {
+                    "secrets": [
+                        // Plain in-app secret: ARM redacts the value on GET.
+                        { "name": "smtp-password" },
+                        // Key Vault-backed secret keeps its keyVaultUrl.
+                        {
+                            "name": "orders-db-connection",
+                            "keyVaultUrl": "https://kv-contoso-prod.vault.azure.net/secrets/orders-db-connection",
+                            "identity": "system"
+                        },
+                        // Nameless entries are skipped.
+                        { "keyVaultUrl": "https://v.vault.azure.net/secrets/x" }
+                    ]
+                },
+                "template": { "containers": [] }
+            }
+        });
+        let l = extract(&v);
+        assert_eq!(l.secrets.len(), 2);
+        // Plain secret → no vault to follow.
+        assert_eq!(l.secret_key_vault_url("smtp-password"), None);
+        // KV-backed secret → its keyVaultUrl is exposed for the follow.
+        assert_eq!(
+            l.secret_key_vault_url("orders-db-connection"),
+            Some("https://kv-contoso-prod.vault.azure.net/secrets/orders-db-connection")
+        );
+        // Unknown name → None.
+        assert_eq!(l.secret_key_vault_url("nope"), None);
     }
 
     #[test]

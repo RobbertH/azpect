@@ -20,7 +20,7 @@ use crate::ui::state::View;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only  s source  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -34,14 +34,36 @@ const SOURCE_COL: u16 = 32;
 const COLUMN_SPACING: u16 = 2;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
     let selected = state.selected_resource();
+
+    // A source tab-bar gets its own row, but only when there's more than one
+    // source to choose between — a single-source buffer (or none yet) has
+    // nothing to cycle, so the row would just be noise.
+    let sources = selected
+        .map(|r| distinct_sources(state, &r.id))
+        .unwrap_or_default();
+    let show_tabs = sources.len() >= 2;
+
+    let layout = if show_tabs {
+        Layout::vertical([
+            Constraint::Length(1), // header
+            Constraint::Length(1), // source tabs
+            Constraint::Min(0),    // body
+            Constraint::Length(1), // footer
+        ])
+        .split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area)
+    };
+    let header_area = layout[0];
+    let tabs_area = if show_tabs { Some(layout[1]) } else { None };
+    let body_chunk = if show_tabs { layout[2] } else { layout[1] };
+    let footer_chunk = if show_tabs { layout[3] } else { layout[2] };
 
     // Header
     let mut header_spans = vec![Span::styled(
@@ -103,11 +125,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.degraded),
             ));
         }
-        if let Some(src) = state.logs.source_filter.as_deref() {
-            header_spans.push(Span::styled(
-                format!("· source: {src} "),
-                Style::default().fg(theme.accent),
-            ));
+        // Active source is normally shown by the dedicated tab-bar row; only
+        // fall back to a header chip when that row is suppressed (≤1 source).
+        if !show_tabs {
+            if let Some(src) = state.logs.source_filter.as_deref() {
+                header_spans.push(Span::styled(
+                    format!("· source: {src} "),
+                    Style::default().fg(theme.accent),
+                ));
+            }
         }
         if state.logs.search_active || !state.logs.search_input.value().is_empty() {
             header_spans.push(Span::styled(
@@ -145,7 +171,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), header_area);
+
+    if let Some(ta) = tabs_area {
+        render_source_tabs(
+            frame,
+            ta,
+            &sources,
+            state.logs.source_filter.as_deref(),
+            theme,
+        );
+    }
 
     let title = if state.logs.search_active {
         " recent (search) "
@@ -156,8 +192,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(Span::styled(title, Style::default().fg(theme.fg)));
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
+    let inner = block.inner(body_chunk);
+    frame.render_widget(block, body_chunk);
 
     // When the search input has focus, peel a single row off the top of the
     // bordered area for the live query — the table renders below it. The box
@@ -188,7 +224,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let Some(resource) = selected else {
         center_message(frame, body, "no resource selected.", theme.muted);
-        render_footer(frame, chunks[2], theme, footer_text);
+        render_footer(frame, footer_chunk, theme, footer_text);
         return;
     };
 
@@ -198,7 +234,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             resource.kind.short_tag()
         );
         center_message(frame, body, &msg, theme.muted);
-        render_footer(frame, chunks[2], theme, footer_text);
+        render_footer(frame, footer_chunk, theme, footer_text);
         return;
     }
 
@@ -206,7 +242,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if state.logs.loading && lines.map(|l| l.is_empty()).unwrap_or(true) {
         center_message(frame, body, "Loading logs…", theme.muted);
-        render_footer(frame, chunks[2], theme, footer_text);
+        render_footer(frame, footer_chunk, theme, footer_text);
         return;
     }
 
@@ -214,14 +250,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         if lines.map(|l| l.is_empty()).unwrap_or(true) {
             let msg = friendly_log_error(err);
             render_error_message(frame, body, &msg, theme.degraded);
-            render_footer(frame, chunks[2], theme, footer_text);
+            render_footer(frame, footer_chunk, theme, footer_text);
             return;
         }
     }
 
     if lines.map(|v| v.is_empty()).unwrap_or(true) {
         center_message(frame, body, "no log lines in window.", theme.muted);
-        render_footer(frame, chunks[2], theme, footer_text);
+        render_footer(frame, footer_chunk, theme, footer_text);
         return;
     }
 
@@ -233,12 +269,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let src = state.logs.source_filter.as_deref().unwrap_or_default();
         let msg = format!("no cached lines from source '{src}' — press s to cycle.");
         center_message(frame, body, &msg, theme.muted);
-        render_footer(frame, chunks[2], theme, footer_text);
+        render_footer(frame, footer_chunk, theme, footer_text);
         return;
     }
 
     render_table(frame, body, &visible, state, theme);
-    render_footer(frame, chunks[2], theme, footer_text);
+    render_footer(frame, footer_chunk, theme, footer_text);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
@@ -247,6 +283,41 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(p, area);
+}
+
+/// One-row source tab-bar: `source: [all] auth · console …  (Tab)`. The active
+/// tab (the current `source_filter`, or `all` when unfiltered) is highlighted;
+/// the rest are muted. Makes it obvious that `Tab` cycles a filter — the prompt
+/// behind moving source-cycling off `s` onto a visible control.
+fn render_source_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    sources: &[String],
+    active: Option<&str>,
+    theme: &Theme,
+) {
+    let active_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let idle_style = Style::default().fg(theme.muted);
+    let tab = |label: &str, selected: bool| {
+        Span::styled(
+            label.to_string(),
+            if selected { active_style } else { idle_style },
+        )
+    };
+
+    let mut spans = vec![Span::styled("source ", Style::default().fg(theme.muted))];
+    spans.push(tab("all", active.is_none()));
+    for s in sources {
+        spans.push(Span::styled(" · ", Style::default().fg(theme.border)));
+        spans.push(tab(s, active == Some(s.as_str())));
+    }
+    spans.push(Span::styled(
+        "   (Tab to cycle)",
+        Style::default().fg(theme.muted),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_table(
@@ -938,8 +1009,13 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.logs.visual_anchor = None;
             true
         }
+        // Source cycling, bound to Tab / Shift+Tab in this view.
         Action::CycleSourceFilter => {
-            cycle_source_filter(state);
+            cycle_source_filter(state, 1);
+            true
+        }
+        Action::CycleSourceFilterBack => {
+            cycle_source_filter(state, -1);
             true
         }
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
@@ -1049,34 +1125,54 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
 }
 
-/// Advance the source filter: all → first source → … → last source → all,
-/// over the distinct `LogLine::source` values in the cached buffer, sorted so
-/// the cycle order is stable while pages stream in. A current filter that no
-/// longer matches any cached source (e.g. after a window change refetched the
-/// buffer) drops back to "all". The cursor resets — row indexes mean something
-/// different under the new filter.
-fn cycle_source_filter(state: &mut AppState) {
+/// Step the source filter through `[all] → A → B → … → last → [all]` over the
+/// distinct `LogLine::source` values in the cached buffer, sorted so the cycle
+/// order is stable while pages stream in. `direction` is `+1` (Tab) to advance
+/// and `-1` (Shift+Tab) to go back; both wrap through the "all" (None) slot. A
+/// current filter that no longer matches any cached source (e.g. after a window
+/// change refetched the buffer) is treated as the "all" position. The cursor
+/// resets — row indexes mean something different under the new filter.
+fn cycle_source_filter(state: &mut AppState, direction: i32) {
     let Some(id) = state.selected_resource().map(|r| r.id.clone()) else {
         return;
     };
-    let mut sources: Vec<String> = state
-        .logs
-        .by_resource
-        .get(&id)
-        .map(|lines| lines.iter().map(|l| l.source.clone()).collect())
-        .unwrap_or_default();
-    sources.sort();
-    sources.dedup();
-    state.logs.source_filter = match state.logs.source_filter.as_deref() {
-        None => sources.first().cloned(),
-        Some(cur) => sources
+    let sources = distinct_sources(state, &id);
+    if sources.is_empty() {
+        return;
+    }
+
+    // Model the cycle as indices `0..=len` where `len` is the "all" slot, so
+    // forward/back wrap cleanly through "all" with plain modular arithmetic. A
+    // filter that no longer matches any cached source resets straight to "all".
+    let all = sources.len() as i32;
+    let next = match state.logs.source_filter.as_deref() {
+        None => Some((all + direction).rem_euclid(all + 1)),
+        Some(c) => sources
             .iter()
-            .position(|s| s == cur)
-            .and_then(|i| sources.get(i + 1).cloned()),
+            .position(|s| s == c)
+            .map(|i| (i as i32 + direction).rem_euclid(all + 1)),
+    };
+    state.logs.source_filter = match next {
+        Some(n) if n != all => Some(sources[n as usize].clone()),
+        _ => None,
     };
     state.logs.scroll = 0;
     state.logs.view_top.set(0);
     state.logs.visual_anchor = None;
+}
+
+/// Distinct `LogLine::source` values in the cached buffer for `id`, sorted for a
+/// stable cycle/tab order. Shared by the cycle handler and the header tab-bar.
+fn distinct_sources(state: &AppState, id: &str) -> Vec<String> {
+    let mut sources: Vec<String> = state
+        .logs
+        .by_resource
+        .get(id)
+        .map(|lines| lines.iter().map(|l| l.source.clone()).collect())
+        .unwrap_or_default();
+    sources.sort();
+    sources.dedup();
+    sources
 }
 
 /// True iff the log line's source or message contains `query` (case-insensitive
@@ -1267,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_source_filter_chip_and_filtered_rows() {
+    fn render_shows_source_tabs_and_filtered_rows() {
         let theme = Theme::catppuccin_mocha();
         let backend = TestBackend::new(120, 12);
         let mut term = Terminal::new(backend).unwrap();
@@ -1282,9 +1378,36 @@ mod tests {
         state.logs.source_filter = Some("http-auth".into());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
-        assert!(s.contains("source: http-auth"), "header chip in {s}");
+        // Two sources → a tab-bar (with an "all" tab + each source + the cue),
+        // and the active filter still narrows the rows shown.
+        assert!(s.contains("source"), "tab-bar label in {s}");
+        assert!(s.contains("all"));
+        assert!(s.contains("http-auth"));
+        assert!(s.contains("Tab to cycle"));
         assert!(s.contains("from the middleware"));
         assert!(!s.contains("from the app"), "filtered row leaked: {s}");
+    }
+
+    #[test]
+    fn tab_cycles_source_forward_and_shift_tab_back() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = "/r/one".to_string();
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![
+                line(1, LogLevel::Info, "http-auth", "a"),
+                line(2, LogLevel::Info, "reports", "b"),
+            ],
+        );
+        // Forward: all → http-auth → reports → all (sorted order).
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter.as_deref(), Some("http-auth"));
+        // Back from http-auth returns to all.
+        assert!(handle(Action::CycleSourceFilterBack, &mut state));
+        assert_eq!(state.logs.source_filter, None);
+        // Back again wraps to the last source.
+        assert!(handle(Action::CycleSourceFilterBack, &mut state));
+        assert_eq!(state.logs.source_filter.as_deref(), Some("reports"));
     }
 
     #[test]

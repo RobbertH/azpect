@@ -695,6 +695,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 if supports_logs(sel.kind) {
                     let id = sel.id.clone();
                     state.config.last_resource_id = Some(id);
+                    // Drop the previous resource's source/search filters so the
+                    // new app's logs aren't hidden behind a stale filter.
+                    state.logs.reset_view_filters();
                     state.view_stack.push(state.view);
                     state.view = View::Logs;
                 } else {
@@ -799,12 +802,14 @@ mod tests {
                 label: "Http 5xx".into(),
                 unit: "count".into(),
                 points: pts(0.0),
+                peak_replica: None,
             },
             MetricSeries {
                 kind: MetricKind::Traffic,
                 label: "Requests".into(),
                 unit: "count".into(),
                 points: pts(100.0),
+                peak_replica: None,
             },
         ]
     }

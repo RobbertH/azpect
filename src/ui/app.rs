@@ -15,6 +15,8 @@
 #![allow(dead_code, unused_variables)]
 
 use std::io::{stdout, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEventKind};
@@ -30,14 +32,15 @@ use tui_input::backend::crossterm::EventHandler as _;
 use tui_input::Input;
 
 use crate::azure::auth::AzureAuth;
+use crate::azure::az_exec::{self, AzExecOptions};
 use crate::azure::az_login::{self, AzLoginOptions};
 use crate::azure::metrics::TimeRange;
-use crate::azure::resources::Resource;
+use crate::azure::resources::{Resource, ResourceKind};
 use crate::config::Config;
 use crate::ui::events::{is_chord_starter, key_to_action, resolve_chord, Action, AppEvent};
 use crate::ui::state::{
     AppState, AppliedEnvEdit, AuthMenuFocus, AuthPrompt, EnvVarEditMode, EnvVarEditPhase,
-    EnvVarField, PendingLogin, View,
+    EnvVarField, PendingExec, PendingLogin, View,
 };
 use crate::ui::theme::Theme;
 
@@ -136,7 +139,7 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
 
     // Spawn the blocking key reader on its own thread (crossterm::event::read
     // is sync). Lives until the channel is dropped.
-    spawn_input_reader(tx.clone());
+    spawn_input_reader(tx.clone(), state.input_suspended.clone());
 
     // Spawn periodic tick.
     spawn_ticker(tx.clone());
@@ -187,12 +190,25 @@ async fn event_loop(
     kick_off_loads_for_view(state, auth, tx, /* force */ false);
 
     loop {
-        terminal.draw(|f| dispatch_view(f, f.area(), state, theme))?;
-
-        // `recv()` yields `None` only when all senders have dropped, which
-        // shouldn't happen while the input thread is alive. Treat it as an
-        // orderly shutdown anyway.
-        let Some(event) = rx.recv().await else { break };
+        // Drain every already-queued event before redrawing, and only redraw
+        // once the queue is momentarily empty. Terminals translate touchpad
+        // scroll into a *burst* of arrow-key presses (mouse capture is off), and
+        // momentum keeps emitting them after the finger lifts; redrawing once per
+        // event made the backlog drain one slow frame at a time, so scrolling
+        // lingered. Collapsing a burst into a single redraw makes it track — and
+        // stop with — the finger. `recv()` yields `None` only when all senders
+        // have dropped (input thread gone); treat it as an orderly shutdown.
+        let event = match rx.try_recv() {
+            Ok(ev) => ev,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                terminal.draw(|f| dispatch_view(f, f.area(), state, theme))?;
+                match rx.recv().await {
+                    Some(ev) => ev,
+                    None => break,
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        };
 
         match event {
             AppEvent::Tick => {
@@ -508,6 +524,18 @@ async fn event_loop(
                         // the resource list rather than the subscription gate.)
                         if was_empty && state.auth_prompt == AuthPrompt::Hidden {
                             open_auth_prompt(state, None);
+                        } else {
+                            // Subscriptions just (re)loaded — most notably after
+                            // an in-app `az login`, which only re-spawns *this*
+                            // load. Drive the current view's data now that the
+                            // sub list is known: the up-front kick at startup
+                            // ran before this list existed (a no-op for the
+                            // "all subscriptions" case), and the post-login path
+                            // never re-kicks resources on its own, leaving the
+                            // list empty until a manual `r`. The debounce in
+                            // `kick_off_loads_for_view` keeps this a no-op when
+                            // resources are already present or still loading.
+                            kick_off_loads_for_view(state, auth, tx, /* force */ false);
                         }
                     }
                     Err(e) => {
@@ -1141,6 +1169,12 @@ async fn event_loop(
             run_pending_login(terminal, guard, state, auth, tx, req).await;
         }
 
+        // Drain a pending container shell (`s`): same terminal-ownership reason
+        // as login — we suspend the TUI, hand the terminal to `az`, then resume.
+        if let Some(req) = state.pending_exec.take() {
+            run_pending_exec(terminal, guard, state, req).await;
+        }
+
         if state.should_quit {
             break;
         }
@@ -1214,6 +1248,70 @@ async fn run_pending_login(
             state.auth_prompt = AuthPrompt::Menu;
             state.auth_last_error = Some(format!("{e}"));
         }
+    }
+}
+
+/// Suspend the TUI, run `az containerapp exec` for an interactive shell, then
+/// restore the TUI. Mirrors [`run_pending_login`]. Errors are surfaced as a
+/// status hint; az's own stderr is already visible inline since stdio is
+/// inherited during the shell.
+async fn run_pending_exec(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    guard: &mut TerminalGuard,
+    state: &mut AppState,
+    req: PendingExec,
+) {
+    // Park the input-reader thread first so it stops reading the terminal before
+    // we hand it to the child — otherwise it races `az` for keystrokes and, once
+    // the child becomes the foreground process group, would SIGTTIN-stop azpect.
+    // The brief wait lets the reader finish any in-flight `poll` and park.
+    state.input_suspended.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    guard.suspend();
+
+    // Banner on the parent shell so the user knows what's launching and how to
+    // get back (the shell's own `exit` / Ctrl-D returns to the TUI).
+    {
+        use std::io::Write as _;
+        let mut out = stdout();
+        let mut hint = format!("\nazpect: launching shell in {}", req.name);
+        if let Some(c) = req.container.as_deref() {
+            hint.push_str(&format!(" · container {c}"));
+        }
+        if let Some(r) = req.replica.as_deref() {
+            hint.push_str(&format!(" · replica {r}"));
+        }
+        hint.push_str("\n(exit / Ctrl-D to return to azpect)\n\n");
+        let _ = out.write_all(hint.as_bytes());
+        let _ = out.flush();
+    }
+
+    let opts = AzExecOptions {
+        name: req.name,
+        resource_group: req.resource_group,
+        subscription: req.subscription,
+        revision: req.revision,
+        replica: req.replica,
+        container: req.container,
+        command: "/bin/sh".to_string(),
+    };
+    let outcome = az_exec::run(opts).await;
+
+    // Always try to restore the TUI — the user is sitting in a bare shell and
+    // expects the app back regardless of how the session ended.
+    if let Err(e) = guard.resume() {
+        tracing::error!("failed to resume terminal after container shell: {e}");
+        state.should_quit = true;
+        return;
+    }
+    let _ = terminal.clear();
+    // Resume input only after the terminal is ours again.
+    state.input_suspended.store(false, Ordering::SeqCst);
+
+    match outcome {
+        Ok(()) => state.set_status("shell session ended"),
+        Err(e) => state.set_status(format!("shell: {e}")),
     }
 }
 
@@ -1851,6 +1949,20 @@ fn global_handle(
         open_key_vault_secret_modal(state, auth, tx);
         return;
     }
+    // Enter on a Key Vault-backed env var jumps to the referenced vault and
+    // opens the reveal modal on the secret — so a `@Microsoft.KeyVault(...)`
+    // reference can be followed and decoded in place. Routed here for auth/tx.
+    if matches!(action, Action::OpenSelected) && state.view == View::EnvVars {
+        open_key_vault_ref_from_env_var(state, auth, tx);
+        return;
+    }
+    // `s` on a Container App: queue an `az containerapp exec` shell (drained by
+    // the event loop, which owns the terminal). For any other resource it keeps
+    // `s`'s global switch-subscription meaning.
+    if let Action::ShellIntoContainer = action {
+        request_container_shell(state);
+        return;
+    }
     if let Action::StartCommand = action {
         state.command_active = true;
         state.command_input.reset();
@@ -1898,6 +2010,191 @@ fn open_key_vault_secret_modal(
         scroll: 0,
     });
     spawn_load_key_vault_secret_value(auth.clone(), vault, name, tx.clone());
+}
+
+/// Enter on a Key Vault-backed env var: pin the referenced vault, switch to its
+/// secrets list, and open the reveal modal on the referenced secret — fetching +
+/// decoding the value on demand. Two sources resolve to a vault: a Function App
+/// `@Microsoft.KeyVault(...)` reference (the value itself), and a Container App
+/// `secretRef` whose app-level secret carries a `keyVaultUrl`. Plain env vars
+/// are a silent no-op; a `secretRef` to a plain in-app secret just gets a hint
+/// (ARM doesn't expose that value).
+fn open_key_vault_ref_from_env_var(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    use crate::azure::key_vault::{ItemKind, KeyVault};
+    use crate::ui::state::{SecretModal, SecretRevealStatus};
+
+    let Some(resource) = state.selected_resource() else {
+        return;
+    };
+    let (id, kind) = (resource.id.clone(), resource.kind);
+    let cursor = state.env_vars_view.cursor;
+    let selected = crate::ui::views::detail::env_vars_for(state, &id, kind)
+        .and_then(|vars| vars.get(cursor.min(vars.len().saturating_sub(1))).cloned());
+    let Some(v) = selected else {
+        return;
+    };
+    if !v.is_secret {
+        return;
+    }
+
+    // A Function App reference is self-describing (`@Microsoft.KeyVault(...)`).
+    // A Container App `secretRef` is an indirection: the env var names an
+    // app-level secret, whose `keyVaultUrl` (when present) is the actual vault
+    // pointer — so resolve through `configuration.secrets`.
+    let parsed = crate::azure::key_vault::parse_key_vault_ref(&v.value).or_else(|| {
+        if kind != ResourceKind::ContainerApp {
+            return None;
+        }
+        let secret_name = crate::azure::env_vars::secret_ref_name(&v.value)?;
+        let url = state
+            .container_app_overview
+            .by_resource
+            .get(&id)?
+            .secret_key_vault_url(secret_name)?;
+        crate::azure::key_vault::key_vault_ref_from_secret_uri(url)
+    });
+
+    let Some(parsed) = parsed else {
+        // Secret-backed, but nothing to follow: a Container App secret holding a
+        // plain value (ARM redacts it), or any other non-vault reference.
+        state.set_status(if kind == ResourceKind::ContainerApp {
+            "this app secret is a plain value, not a Key Vault reference — \
+             its plaintext isn't returned by ARM"
+        } else {
+            "not a Key Vault reference"
+        });
+        return;
+    };
+
+    // Prefer an already-discovered vault (real ARM id + metadata) so the items
+    // cache and any later KeyVaults drill-in share one entry; otherwise build a
+    // minimal vault from the parsed reference — enough for the data-plane fetch.
+    let vault = state
+        .key_vault
+        .vaults
+        .as_ref()
+        .and_then(|vaults| {
+            vaults.iter().find(|kv| {
+                kv.name.eq_ignore_ascii_case(&parsed.vault_name)
+                    || parsed.vault_uri.as_deref().is_some_and(|u| {
+                        kv.vault_uri_or_default().trim_end_matches('/') == u.trim_end_matches('/')
+                    })
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            let vault_uri = parsed
+                .vault_uri
+                .clone()
+                .unwrap_or_else(|| format!("https://{}.vault.azure.net/", parsed.vault_name));
+            KeyVault {
+                id: vault_uri.trim_end_matches('/').to_string(),
+                name: parsed.vault_name.clone(),
+                resource_group: String::new(),
+                subscription_id: String::new(),
+                location: String::new(),
+                sku: None,
+                vault_uri: Some(vault_uri),
+                rbac_authorization_enabled: None,
+                soft_delete_enabled: None,
+                purge_protection_enabled: None,
+                public_network_access: None,
+            }
+        });
+
+    state.key_vault.selected_vault = Some(vault.clone());
+    state.key_vault.items_kind = ItemKind::Secret;
+    state.key_vault.items_cursor = 0;
+    state.key_vault.items_filter = tui_input::Input::default();
+    state.key_vault.secret_modal = Some(SecretModal {
+        vault_id: vault.id.clone(),
+        name: parsed.secret_name.clone(),
+        status: SecretRevealStatus::Loading,
+        scroll: 0,
+    });
+    state.view_stack.push(state.view);
+    state.view = View::KeyVaultItems;
+    spawn_load_key_vault_secret_value(auth.clone(), vault, parsed.secret_name, tx.clone());
+}
+
+/// `s` handler: queue a container shell for the selected Container App, or fall
+/// back to `s`'s global switch-subscription meaning for anything else. The
+/// actual `az containerapp exec` runs from the event loop (it must own the
+/// terminal to suspend the TUI), so this only records the target.
+fn request_container_shell(state: &mut AppState) {
+    let resolved = match state.selected_resource() {
+        Some(r) if r.kind == ResourceKind::ContainerApp => {
+            let subscription = (!r.subscription_id.is_empty()).then(|| r.subscription_id.clone());
+            Some((
+                r.id.clone(),
+                r.name.clone(),
+                r.resource_group.clone(),
+                subscription,
+            ))
+        }
+        _ => None,
+    };
+    let Some((id, name, resource_group, subscription)) = resolved else {
+        // Not a Container App — `s` keeps switching subscription.
+        apply_navigation_action(Action::SwitchSubscription, state);
+        return;
+    };
+
+    // Target the active revision and the busiest-relevant replica/container so
+    // the shell lands where the instances block points. Any unresolved field is
+    // left `None` and `az` fills in its own default (latest revision, a replica,
+    // first container).
+    let revision = state
+        .revision_meta
+        .by_resource
+        .get(&id)
+        .map(|m| m.name.clone());
+    let (replica, container) = pick_exec_target(state, &id);
+    state.pending_exec = Some(PendingExec {
+        name,
+        resource_group,
+        subscription,
+        revision,
+        replica,
+        container,
+    });
+}
+
+/// Choose which replica + container `az containerapp exec` should target: the
+/// newest *running* replica (falling back to the newest overall), and its first
+/// container — the app container in template order, matching the "first/primary
+/// container" choice. Returns `(None, None)` when no replica is cached, letting
+/// `az` pick its own defaults.
+fn pick_exec_target(state: &AppState, id: &str) -> (Option<String>, Option<String>) {
+    let Some(replicas) = state.replica_instances.by_resource.get(id) else {
+        return (None, None);
+    };
+    let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
+        replicas.iter().collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+    let chosen = sorted
+        .iter()
+        .find(|r| {
+            r.running_state
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("Running"))
+        })
+        .or_else(|| sorted.first())
+        .copied();
+    let Some(rep) = chosen else {
+        return (None, None);
+    };
+    let replica = Some(rep.name.clone()).filter(|n| !n.is_empty());
+    let container = rep
+        .containers
+        .first()
+        .map(|c| c.name.clone())
+        .filter(|n| !n.is_empty());
+    (replica, container)
 }
 
 /// Compute the contextual yank target for the current view, copy it to the
@@ -3950,30 +4247,46 @@ fn render_command_bar(f: &mut ratatui::Frame, area: Rect, state: &AppState, them
 // Background task spawn helpers
 // ---------------------------------------------------------------------------
 
-fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
+fn spawn_input_reader(tx: UnboundedSender<AppEvent>, suspended: Arc<AtomicBool>) {
+    use std::time::Duration;
+    // Poll-with-timeout (rather than a bare blocking `read()`) so the thread can
+    // observe `suspended` and stop touching the terminal while a shell-out child
+    // owns it — otherwise it would steal the user's keystrokes and, once the
+    // child is the foreground process group, get SIGTTIN-stopped on read.
+    const POLL: Duration = Duration::from_millis(100);
     std::thread::spawn(move || {
         loop {
-            // `read()` blocks until an event is available.
-            match crossterm::event::read() {
-                Ok(CtEvent::Key(k)) => {
-                    if tx.send(AppEvent::Key(k)).is_err() {
+            if suspended.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(40));
+                continue;
+            }
+            match crossterm::event::poll(POLL) {
+                Ok(false) => continue, // timed out; re-check `suspended`
+                Ok(true) => match crossterm::event::read() {
+                    Ok(CtEvent::Key(k)) => {
+                        if tx.send(AppEvent::Key(k)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(CtEvent::Resize(w, h)) => {
+                        if tx
+                            .send(AppEvent::Resize {
+                                width: w,
+                                height: h,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(_) => { /* ignore mouse/focus/paste/etc. for now */ }
+                    Err(e) => {
+                        tracing::warn!("crossterm::event::read failed: {e}");
                         break;
                     }
-                }
-                Ok(CtEvent::Resize(w, h)) => {
-                    if tx
-                        .send(AppEvent::Resize {
-                            width: w,
-                            height: h,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Ok(_) => { /* ignore mouse/focus/paste/etc. for now */ }
+                },
                 Err(e) => {
-                    tracing::warn!("crossterm::event::read failed: {e}");
+                    tracing::warn!("crossterm::event::poll failed: {e}");
                     break;
                 }
             }
@@ -5035,6 +5348,323 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_kv_ref_env_var_jumps_to_vault_and_reveals_secret() {
+        use crate::azure::env_vars::EnvVar;
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/fn".into(),
+            name: "func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        state.func_settings.by_resource.insert(
+            "/r/fn".into(),
+            vec![EnvVar {
+                name: "ApiKey".into(),
+                value: "@Microsoft.KeyVault(SecretUri=https://myvault.vault.azure.net/secrets/api-key/)"
+                    .into(),
+                is_secret: true,
+                ..Default::default()
+            }],
+        );
+        state.env_vars_view.cursor = 0;
+
+        open_key_vault_ref_from_env_var(&mut state, &auth, &tx);
+
+        // Navigated to the vault's secrets list with the modal open on the
+        // referenced secret.
+        assert_eq!(state.view, View::KeyVaultItems);
+        let vault = state
+            .key_vault
+            .selected_vault
+            .as_ref()
+            .expect("vault pinned");
+        assert_eq!(vault.name, "myvault");
+        let modal = state.key_vault.secret_modal.as_ref().expect("modal open");
+        assert_eq!(modal.name, "api-key");
+
+        // The demo fetch reports a value synchronously; applying it loads the
+        // modal rather than leaking the secret into the items cache.
+        match rx.try_recv().expect("secret value event") {
+            AppEvent::KeyVaultSecretValueLoaded {
+                vault_id,
+                name,
+                result,
+            } => {
+                assert_eq!(name, "api-key");
+                assert_eq!(vault_id, vault.id);
+                assert!(result.is_ok());
+            }
+            _ => panic!("expected KeyVaultSecretValueLoaded"),
+        }
+    }
+
+    #[test]
+    fn enter_on_container_secret_ref_follows_key_vault_url() {
+        use crate::azure::container_app_overview::{ContainerAppOverview, ContainerAppSecret};
+        use crate::azure::env_vars::EnvVar;
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/ca".into(),
+            name: "app".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        // A `secretRef` env var (display shape from `from_container_env`) whose
+        // app secret is Key Vault-backed.
+        state.container_app_overview.by_resource.insert(
+            "/r/ca".into(),
+            ContainerAppOverview {
+                env_vars: vec![EnvVar {
+                    name: "DB".into(),
+                    value: "(secret: db-conn)".into(),
+                    is_secret: true,
+                    attribution: Some("app".into()),
+                    container: Some("app".into()),
+                    ..Default::default()
+                }],
+                secrets: vec![ContainerAppSecret {
+                    name: "db-conn".into(),
+                    key_vault_url: Some("https://myvault.vault.azure.net/secrets/db-conn".into()),
+                }],
+                ..Default::default()
+            },
+        );
+        state.env_vars_view.cursor = 0;
+
+        open_key_vault_ref_from_env_var(&mut state, &auth, &tx);
+
+        assert_eq!(state.view, View::KeyVaultItems);
+        assert_eq!(
+            state
+                .key_vault
+                .selected_vault
+                .as_ref()
+                .map(|v| v.name.as_str()),
+            Some("myvault")
+        );
+        let modal = state.key_vault.secret_modal.as_ref().expect("modal open");
+        assert_eq!(modal.name, "db-conn");
+        match rx.try_recv().expect("secret value event") {
+            AppEvent::KeyVaultSecretValueLoaded { name, result, .. } => {
+                assert_eq!(name, "db-conn");
+                assert!(result.is_ok());
+            }
+            _ => panic!("expected KeyVaultSecretValueLoaded"),
+        }
+    }
+
+    #[test]
+    fn enter_on_plain_in_app_container_secret_hints_instead_of_navigating() {
+        use crate::azure::container_app_overview::{ContainerAppOverview, ContainerAppSecret};
+        use crate::azure::env_vars::EnvVar;
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let auth = AzureAuth::demo();
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/ca".into(),
+            name: "app".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        state.container_app_overview.by_resource.insert(
+            "/r/ca".into(),
+            ContainerAppOverview {
+                env_vars: vec![EnvVar {
+                    name: "DB".into(),
+                    value: "(secret: db-conn)".into(),
+                    is_secret: true,
+                    ..Default::default()
+                }],
+                // Plain in-app secret: no keyVaultUrl to follow.
+                secrets: vec![ContainerAppSecret {
+                    name: "db-conn".into(),
+                    key_vault_url: None,
+                }],
+                ..Default::default()
+            },
+        );
+        state.env_vars_view.cursor = 0;
+
+        open_key_vault_ref_from_env_var(&mut state, &auth, &tx);
+        // No navigation; a hint is posted instead.
+        assert_eq!(state.view, View::EnvVars);
+        assert!(state.key_vault.secret_modal.is_none());
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn s_on_container_app_queues_shell_targeting_running_replica() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::{Duration, Utc};
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/ca".into(),
+            name: "ca-app".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "we".into(),
+            resource_group: "rg-x".into(),
+            subscription_id: "sub-1".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Detail;
+        state.revision_meta.by_resource.insert(
+            "/r/ca".into(),
+            ActiveRevisionMeta {
+                name: "ca-app--0000004".into(),
+                ..Default::default()
+            },
+        );
+        let now = Utc::now();
+        let container = |name: &str| ReplicaContainer {
+            name: name.into(),
+            ready: Some(true),
+            started: Some(true),
+            restart_count: 0,
+            running_state: Some("Running".into()),
+            running_state_details: None,
+        };
+        state.replica_instances.by_resource.insert(
+            "/r/ca".into(),
+            vec![
+                ReplicaInstance {
+                    name: "ca-app--0000004-old".into(),
+                    created_at: Some(now - Duration::hours(2)),
+                    running_state: Some("Running".into()),
+                    containers: vec![container("maintenance")],
+                },
+                ReplicaInstance {
+                    name: "ca-app--0000004-new".into(),
+                    created_at: Some(now),
+                    running_state: Some("Running".into()),
+                    containers: vec![container("maintenance"), container("http-auth")],
+                },
+            ],
+        );
+
+        request_container_shell(&mut state);
+
+        let exec = state.pending_exec.expect("shell queued");
+        assert_eq!(exec.name, "ca-app");
+        assert_eq!(exec.resource_group, "rg-x");
+        assert_eq!(exec.subscription.as_deref(), Some("sub-1"));
+        assert_eq!(exec.revision.as_deref(), Some("ca-app--0000004"));
+        // Newest replica, first (primary) container.
+        assert_eq!(exec.replica.as_deref(), Some("ca-app--0000004-new"));
+        assert_eq!(exec.container.as_deref(), Some("maintenance"));
+        // View is unchanged — the shell runs from the event loop.
+        assert_eq!(state.view, View::Detail);
+    }
+
+    #[test]
+    fn s_on_non_container_falls_back_to_switch_subscription() {
+        use crate::azure::resources::{Resource, ResourceKind};
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/fn".into(),
+            name: "func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Detail;
+
+        request_container_shell(&mut state);
+        // No shell queued; `s` kept its global switch-subscription meaning.
+        assert!(state.pending_exec.is_none());
+        assert_eq!(state.view, View::Subscriptions);
+    }
+
+    #[test]
+    fn enter_on_plain_env_var_is_a_noop() {
+        use crate::azure::env_vars::EnvVar;
+        use crate::azure::resources::{Resource, ResourceKind};
+
+        let auth = AzureAuth::demo();
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/fn".into(),
+            name: "func".into(),
+            kind: ResourceKind::FunctionApp,
+            location: "we".into(),
+            resource_group: "rg".into(),
+            subscription_id: "s".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::EnvVars;
+        state.func_settings.by_resource.insert(
+            "/r/fn".into(),
+            vec![EnvVar {
+                name: "PORT".into(),
+                value: "8080".into(),
+                ..Default::default()
+            }],
+        );
+
+        open_key_vault_ref_from_env_var(&mut state, &auth, &tx);
+        // Stays put — no vault pinned, no modal, no view change.
+        assert_eq!(state.view, View::EnvVars);
+        assert!(state.key_vault.selected_vault.is_none());
+        assert!(state.key_vault.secret_modal.is_none());
+    }
+
+    #[test]
     fn filter_forwarding_gating() {
         let mut state = fresh_state();
 
@@ -5543,6 +6173,7 @@ mod tests {
                     value: 0.0,
                 })
                 .collect(),
+            peak_replica: None,
         };
         state.health.metrics.insert(
             resource.id.clone(),
@@ -5574,6 +6205,7 @@ mod tests {
                     value: 250.0,
                 })
                 .collect(),
+            peak_replica: None,
         };
         state.health.metrics.insert(
             resource.id.clone(),

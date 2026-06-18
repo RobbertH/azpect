@@ -493,6 +493,77 @@ pub(crate) fn parse_vault(v: &serde_json::Value) -> Option<KeyVault> {
     })
 }
 
+/// A parsed Function App `@Microsoft.KeyVault(...)` app-setting reference.
+/// Both documented shapes are accepted:
+///   `@Microsoft.KeyVault(SecretUri=https://v.vault.azure.net/secrets/name/ver)`
+///   `@Microsoft.KeyVault(VaultName=v;SecretName=name;SecretVersion=ver)`
+/// Only the vault + secret name are kept; any version is dropped (a reveal
+/// always resolves the secret's current version).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyVaultRef {
+    /// Short vault name (e.g. `myvault`) — the first DNS label of the host in
+    /// the `SecretUri` form, or the literal `VaultName` value.
+    pub vault_name: String,
+    /// Full data-plane vault URI when derivable (the `SecretUri` form carries
+    /// it). `None` for the `VaultName=` form, where callers fall back to the
+    /// canonical `https://{vault_name}.vault.azure.net/`.
+    pub vault_uri: Option<String>,
+    /// Secret name to reveal.
+    pub secret_name: String,
+}
+
+/// Parse a Function App Key Vault reference (an app-setting value shaped like
+/// `@Microsoft.KeyVault(...)`). Returns `None` for anything else — including
+/// Container App `secretRef` markers, which point at container-app secrets
+/// rather than a vault. Both the `SecretUri=` and `VaultName=;SecretName=`
+/// shapes are recognized.
+pub fn parse_key_vault_ref(value: &str) -> Option<KeyVaultRef> {
+    let inner = value
+        .trim()
+        .strip_prefix("@Microsoft.KeyVault(")?
+        .strip_suffix(')')?;
+
+    let mut secret_uri = None;
+    let mut vault_name = None;
+    let mut secret_name = None;
+    for part in inner.split(';') {
+        let (k, v) = part.split_once('=')?;
+        match k.trim() {
+            "SecretUri" => secret_uri = Some(v.trim().to_string()),
+            "VaultName" => vault_name = Some(v.trim().to_string()),
+            "SecretName" => secret_name = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    if let Some(uri) = secret_uri {
+        key_vault_ref_from_secret_uri(&uri)
+    } else {
+        Some(KeyVaultRef {
+            vault_name: vault_name?,
+            vault_uri: None,
+            secret_name: secret_name?,
+        })
+    }
+}
+
+/// Parse a bare data-plane secret URL — e.g.
+/// `https://myvault.vault.azure.net/secrets/api-key/abc123` — into a
+/// [`KeyVaultRef`]. This is the `SecretUri=` payload of a Function App
+/// reference, and also the `keyVaultUrl` carried by a Key Vault-backed
+/// Container App secret. Returns `None` if the host or secret name can't be
+/// extracted.
+pub fn key_vault_ref_from_secret_uri(uri: &str) -> Option<KeyVaultRef> {
+    let host = vault_host(uri)?;
+    let name = item_name_from_id(uri)?;
+    let label = host.split('.').next().unwrap_or(&host).to_string();
+    Some(KeyVaultRef {
+        vault_name: label,
+        vault_uri: Some(format!("https://{host}/")),
+        secret_name: name,
+    })
+}
+
 /// Pull the trailing path segment out of a Key Vault data-plane id URL like
 /// `https://myvault.vault.azure.net/secrets/my-secret/abc123`. We want the
 /// secret/cert *name*, which is the second-to-last segment when a version
@@ -704,6 +775,67 @@ mod tests {
             "subscriptionId": "x"
         });
         assert!(parse_vault(&row).is_none());
+    }
+
+    #[test]
+    fn parse_key_vault_ref_secret_uri_form() {
+        let r = parse_key_vault_ref(
+            "@Microsoft.KeyVault(SecretUri=https://myvault.vault.azure.net/secrets/api-key/abc123)",
+        )
+        .expect("should parse SecretUri form");
+        assert_eq!(r.vault_name, "myvault");
+        assert_eq!(
+            r.vault_uri.as_deref(),
+            Some("https://myvault.vault.azure.net/")
+        );
+        assert_eq!(r.secret_name, "api-key");
+    }
+
+    #[test]
+    fn parse_key_vault_ref_secret_uri_without_version() {
+        let r = parse_key_vault_ref(
+            "@Microsoft.KeyVault(SecretUri=https://v.vault.azure.net/secrets/db-pass/)",
+        )
+        .expect("should parse versionless SecretUri form");
+        assert_eq!(r.vault_name, "v");
+        assert_eq!(r.secret_name, "db-pass");
+    }
+
+    #[test]
+    fn parse_key_vault_ref_vault_name_form() {
+        let r = parse_key_vault_ref(
+            "@Microsoft.KeyVault(VaultName=myvault;SecretName=api-key;SecretVersion=abc)",
+        )
+        .expect("should parse VaultName form");
+        assert_eq!(r.vault_name, "myvault");
+        assert_eq!(r.vault_uri, None);
+        assert_eq!(r.secret_name, "api-key");
+    }
+
+    #[test]
+    fn key_vault_ref_from_secret_uri_parses_bare_url() {
+        // The `keyVaultUrl` carried by a Container App secret is a bare
+        // data-plane URL (no `@Microsoft.KeyVault(...)` wrapper).
+        let r = key_vault_ref_from_secret_uri(
+            "https://kv-contoso-prod.vault.azure.net/secrets/orders-db-connection",
+        )
+        .expect("should parse bare secret URL");
+        assert_eq!(r.vault_name, "kv-contoso-prod");
+        assert_eq!(
+            r.vault_uri.as_deref(),
+            Some("https://kv-contoso-prod.vault.azure.net/")
+        );
+        assert_eq!(r.secret_name, "orders-db-connection");
+        assert!(key_vault_ref_from_secret_uri("not-a-url").is_none());
+    }
+
+    #[test]
+    fn parse_key_vault_ref_rejects_non_references() {
+        // Plain literal, Container App secretRef marker, and an empty/garbage
+        // value all fail to parse.
+        assert!(parse_key_vault_ref("plain-value").is_none());
+        assert!(parse_key_vault_ref("(secret: db-password)").is_none());
+        assert!(parse_key_vault_ref("@Microsoft.KeyVault(VaultName=v)").is_none());
     }
 
     #[test]

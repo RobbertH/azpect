@@ -335,6 +335,20 @@ pub struct PendingLogin {
     pub use_device_code: bool,
 }
 
+/// A queued request to shell into a Container App's running container via
+/// `az containerapp exec`. Set by the `s` handler and drained by the event loop
+/// (which owns the terminal and can safely suspend the TUI), mirroring
+/// [`PendingLogin`]. See [`crate::azure::az_exec`].
+#[derive(Clone, Debug, Default)]
+pub struct PendingExec {
+    pub name: String,
+    pub resource_group: String,
+    pub subscription: Option<String>,
+    pub revision: Option<String>,
+    pub replica: Option<String>,
+    pub container: Option<String>,
+}
+
 /// Per-resource cached metrics. The detail view reads these; the loader writes
 /// them when a `MetricsReady` event arrives.
 #[derive(Clone, Default)]
@@ -1308,6 +1322,23 @@ pub struct LogsCache {
     pub visual_anchor: Option<usize>,
 }
 
+impl LogsCache {
+    /// Clear the per-view, resource-specific filters when (re)opening the Logs
+    /// view. The `source_filter` in particular holds a value from whatever
+    /// resource was viewed last (for Container Apps, a container name) — carried
+    /// into a different app it matches nothing, leaving an empty list and a
+    /// "no cached lines from source 'x'" message. The free-text search is
+    /// likewise stale, and a visual-selection anchor would point at a row that
+    /// no longer exists. Fetch-scoping prefs (`errors_only`, `range`, `wrap`)
+    /// are intentionally left alone — they're resource-agnostic.
+    pub fn reset_view_filters(&mut self) {
+        self.source_filter = None;
+        self.search_active = false;
+        self.search_input.reset();
+        self.visual_anchor = None;
+    }
+}
+
 /// Top-level UI state. Lane 3 mutates this in response to events; Lane 4 reads it for rendering.
 pub struct AppState {
     pub config: Config,
@@ -1416,6 +1447,16 @@ pub struct AppState {
     /// The event loop takes ownership, suspends the TUI, runs `az login`,
     /// clears the auth cache, and triggers a subscriptions reload.
     pub pending_login: Option<PendingLogin>,
+    /// Set by the `s` handler on a Container App; the event loop takes ownership,
+    /// suspends the TUI, and runs `az containerapp exec` for an interactive
+    /// shell. Mirrors [`Self::pending_login`].
+    pub pending_exec: Option<PendingExec>,
+    /// When `true`, the input-reader thread parks instead of reading the
+    /// terminal. Set while a shell-out child (`az containerapp exec`) owns the
+    /// terminal so azpect neither competes for the user's keystrokes nor gets
+    /// `SIGTTIN`-stopped once the child becomes the terminal's foreground
+    /// process group. Shared with the reader thread.
+    pub input_suspended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -1480,6 +1521,8 @@ impl AppState {
             auth_tenant_input: Input::default(),
             auth_last_error: None,
             pending_login: None,
+            pending_exec: None,
+            input_suspended: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         }
     }

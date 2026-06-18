@@ -291,9 +291,17 @@ pub enum Action {
     SwitchSubscription,
     /// Cycle the logs view's client-side source filter through the distinct
     /// `LogLine::source` values in the cached buffer (all → A → B → … → all).
-    /// Bound to `s` inside the logs view only; elsewhere `s` keeps its
-    /// switch-subscription meaning.
+    /// Bound to `Tab` / `Shift+Tab` (forward / back) inside the logs view, shown
+    /// as a source tab-bar atop the page. (Previously `s`; freed so `s` can mean
+    /// shell, k9s-style.)
     CycleSourceFilter,
+    /// Reverse of [`Self::CycleSourceFilter`] — bound to `Shift+Tab` in logs.
+    CycleSourceFilterBack,
+    /// Shell into the selected Container App's running container via
+    /// `az containerapp exec` (k9s-style). Bound to `s` in the Detail and Logs
+    /// views; for non-Container-App resources the handler falls back to `s`'s
+    /// global switch-subscription meaning.
+    ShellIntoContainer,
     /// Open the top-level Storage mode (blob accounts list). Bound to `S`
     /// (capital so it doesn't collide with `s` = switch subscription).
     OpenStorage,
@@ -413,9 +421,18 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('n') => Action::NextMatch,
         KeyCode::Char('N') => Action::PrevMatch,
 
-        // Panel cycling
-        KeyCode::Tab => Action::NextPanel,
-        KeyCode::BackTab => Action::PrevPanel,
+        // Panel cycling — except in the logs view, where Tab / Shift+Tab cycle
+        // the source filter (shown as a tab-bar). Routing it to a dedicated
+        // action keeps `after_action` from treating it like a panel switch and
+        // refetching the log buffer on every keystroke.
+        KeyCode::Tab => match view {
+            View::Logs => Action::CycleSourceFilter,
+            _ => Action::NextPanel,
+        },
+        KeyCode::BackTab => match view {
+            View::Logs => Action::CycleSourceFilterBack,
+            _ => Action::PrevPanel,
+        },
 
         KeyCode::Enter => Action::OpenSelected,
 
@@ -441,10 +458,12 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('f') => Action::ToggleFavorite,
         KeyCode::Char('F') => Action::ToggleFavoritesOnly,
         KeyCode::Char('/') => Action::StartSearch,
-        // `s` filters by source inside the logs view (mirrors how `l` / `e`
-        // are context-aware there); everywhere else it switches subscription.
+        // `s` shells into a container (k9s-style) on the Container App Detail /
+        // Logs views; the handler falls back to switch-subscription when the
+        // resource isn't a Container App. Everywhere else it switches
+        // subscription directly. (Log source cycling moved to `Tab`.)
         KeyCode::Char('s') => match view {
-            View::Logs => Action::CycleSourceFilter,
+            View::Detail | View::Logs => Action::ShellIntoContainer,
             _ => Action::SwitchSubscription,
         },
         KeyCode::Char('S') => Action::OpenStorage,
@@ -649,13 +668,18 @@ mod tests {
     }
 
     #[test]
-    fn s_cycles_source_filter_inside_logs() {
+    fn s_shells_into_container_on_detail_and_logs() {
+        // `s` is the k9s shell key on the Detail and Logs views (the handler
+        // decides whether the resource is actually a Container App). Source
+        // cycling moved to Tab; the per-line detail keeps switch-subscription.
+        assert_eq!(
+            key_to_action(key('s'), View::Detail, false),
+            Action::ShellIntoContainer
+        );
         assert_eq!(
             key_to_action(key('s'), View::Logs, false),
-            Action::CycleSourceFilter
+            Action::ShellIntoContainer
         );
-        // Only the logs table repurposes `s`; everywhere else (including the
-        // per-line detail) it keeps the switch-subscription meaning.
         assert_eq!(
             key_to_action(key('s'), View::LogDetail, false),
             Action::SwitchSubscription

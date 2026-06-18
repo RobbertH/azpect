@@ -146,6 +146,7 @@ dependencies = [
  "crossterm",
  "directories",
  "futures",
+ "libc",
  "nucleo-matcher",
  "open",
  "quick-xml",

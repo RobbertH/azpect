@@ -111,6 +111,15 @@ pub struct MetricSeries {
     /// Display unit, e.g. `"count"`, `"%"`, `"bytes"`, `"ms"`.
     pub unit: String,
     pub points: Vec<MetricPoint>,
+    /// Highest single value any one dimension (e.g. a Container App *replica*)
+    /// reached over the window — the window peak of a parallel `Maximum`
+    /// aggregation, in the same scaled unit as [`Self::points`]. `None` unless
+    /// the fetch requested `Maximum` alongside the plotted aggregation (only
+    /// Container App CPU/Memory do, where the plotted series is the average
+    /// across replicas and this surfaces the busiest replica). See
+    /// [`parse_metrics_response`].
+    #[serde(default)]
+    pub peak_replica: Option<f64>,
 }
 
 impl MetricSeries {
@@ -202,17 +211,29 @@ fn normalize_unit(
     points: Vec<MetricPoint>,
 ) -> (String, Vec<MetricPoint>) {
     if physical_name == "UsageNanoCores" {
-        const NANO_PER_MILLI: f64 = 1_000_000.0;
         let scaled = points
             .into_iter()
             .map(|p| MetricPoint {
                 ts: p.ts,
-                value: p.value / NANO_PER_MILLI,
+                value: scale_metric_value(physical_name, p.value),
             })
             .collect();
         return ("mCores".to_string(), scaled);
     }
     (short_unit(raw_unit), points)
+}
+
+/// Apply the same per-metric value scaling [`normalize_unit`] does, for a single
+/// scalar (used to scale the `Maximum`-aggregation peak into the display unit).
+/// Container App `UsageNanoCores` → millicores; everything else is passed
+/// through.
+fn scale_metric_value(physical_name: &str, v: f64) -> f64 {
+    const NANO_PER_MILLI: f64 = 1_000_000.0;
+    if physical_name == "UsageNanoCores" {
+        v / NANO_PER_MILLI
+    } else {
+        v
+    }
 }
 
 /// Pick the data-point field name for the requested aggregation.
@@ -336,12 +357,23 @@ async fn fetch_core(
         let client = client.clone();
 
         handles.push(tokio::spawn(async move {
+            // Container App CPU/Memory are reported per replica; we plot the
+            // average across replicas, but also ask for `Maximum` in the same
+            // call so the summary can surface the busiest single replica (which
+            // the average hides). The plotted aggregation stays `agg`.
+            let agg_param = if resource_kind == ResourceKind::ContainerApp
+                && matches!(kind, MetricKind::Cpu | MetricKind::Memory)
+            {
+                format!("{agg},Maximum")
+            } else {
+                agg.clone()
+            };
             let mut params: Vec<(&str, &str)> = vec![
                 ("api-version", "2023-10-01"),
                 ("timespan", &timespan),
                 ("interval", &interval),
                 ("metricnames", &name),
-                ("aggregation", &agg),
+                ("aggregation", &agg_param),
             ];
             if let Some(f) = filter.as_deref() {
                 params.push(("$filter", f));
@@ -446,13 +478,29 @@ fn parse_metrics_response(
             None => Vec::new(),
         };
 
+        // Window peak of a parallel `Maximum` aggregation, when the call asked
+        // for one (Container App CPU/Memory) — the busiest single replica over
+        // the window. Absent in the response otherwise, so this stays `None`.
+        let peak_raw = timeseries
+            .and_then(|ts| ts.get("data"))
+            .and_then(|d| d.as_array())
+            .and_then(|data| {
+                data.iter()
+                    .filter_map(|d| d.get("maximum").and_then(|x| x.as_f64()))
+                    .fold(None, |acc: Option<f64>, v| {
+                        Some(acc.map_or(v, |a| a.max(v)))
+                    })
+            });
+
         let (unit_label, points) = normalize_unit(physical, unit, points);
+        let peak_replica = peak_raw.map(|p| scale_metric_value(physical, p));
 
         out.push(MetricSeries {
             kind: *kind,
             label: label_for(*kind, resource_kind).to_string(),
             unit: unit_label,
             points,
+            peak_replica,
         });
     }
 
@@ -617,6 +665,66 @@ mod tests {
             series[0].points[0].value,
         );
         assert_eq!(series[0].points[1].value, 0.0);
+    }
+
+    #[test]
+    fn peak_replica_is_window_max_of_maximum_field_scaled() {
+        // When the call requests Average,Maximum, the plotted points come from
+        // `average` while `peak_replica` is the window peak of `maximum` — the
+        // busiest single replica — scaled to the same unit (mCores).
+        let payload = json!({
+            "value": [
+                {
+                    "name": { "value": "UsageNanoCores", "localizedValue": "CPU" },
+                    "unit": "NanoCores",
+                    "timeseries": [
+                        {
+                            "data": [
+                                { "timeStamp": "2026-01-01T00:00:00Z", "average": 40_000_000.0, "maximum": 60_000_000.0 },
+                                { "timeStamp": "2026-01-01T00:15:00Z", "average": 50_000_000.0, "maximum": 240_000_000.0 }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+        // The triple still carries the *primary* aggregation (Average) for
+        // point selection; the Maximum is read opportunistically.
+        let requested = vec![(
+            MetricKind::Cpu,
+            "UsageNanoCores".to_string(),
+            "Average".to_string(),
+        )];
+        let series = parse_metrics_response(&payload, &requested, ResourceKind::ContainerApp);
+        assert_eq!(series.len(), 1);
+        // Plotted = average, scaled.
+        assert!((series[0].points[1].value - 50.0).abs() < 1e-9);
+        // Peak-replica = max(maximum) = 240_000_000 ns → 240 mCores.
+        assert_eq!(series[0].peak_replica.map(|p| p.round()), Some(240.0));
+    }
+
+    #[test]
+    fn peak_replica_is_none_without_maximum_field() {
+        // A response with only `average` (no Maximum requested) leaves
+        // peak_replica unset.
+        let payload = json!({
+            "value": [
+                {
+                    "name": { "value": "UsageNanoCores", "localizedValue": "CPU" },
+                    "unit": "NanoCores",
+                    "timeseries": [
+                        { "data": [ { "timeStamp": "2026-01-01T00:00:00Z", "average": 10_000_000.0 } ] }
+                    ]
+                }
+            ]
+        });
+        let requested = vec![(
+            MetricKind::Cpu,
+            "UsageNanoCores".to_string(),
+            "Average".to_string(),
+        )];
+        let series = parse_metrics_response(&payload, &requested, ResourceKind::ContainerApp);
+        assert_eq!(series[0].peak_replica, None);
     }
 
     #[test]

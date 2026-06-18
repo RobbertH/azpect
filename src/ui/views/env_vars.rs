@@ -22,7 +22,7 @@ use crate::ui::theme::Theme;
 use crate::ui::views::detail::env_vars_for;
 
 const FOOTER: &str =
-    "x reveal/hide  ^E edit  ^N add  h/l scroll  y yank  j/k move  Esc back  q quit";
+    "x reveal/hide  Enter open kv ref  ^E edit  ^N add  h/l scroll  y yank  j/k move  Esc back  q quit";
 const HALF_PAGE: usize = 10;
 /// Characters scrolled per `h`/`l` press for long revealed values.
 const H_SCROLL_STEP: usize = 8;

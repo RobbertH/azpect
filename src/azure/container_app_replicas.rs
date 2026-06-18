@@ -54,6 +54,12 @@ pub struct ReplicaContainer {
     /// Per-container `runningState` (e.g. `Running`, `Waiting`, `Terminated`).
     /// `None` when not reported.
     pub running_state: Option<String>,
+    /// `properties.containers[].runningStateDetails` — the kubelet-style reason a
+    /// non-running container is stuck (e.g. `Back-off pulling image "…"` for an
+    /// ImagePullBackOff, or a crash/OOM message). This is what otherwise forces a
+    /// trip to the portal's revision logs to learn *why* a replica won't start.
+    /// `None`/empty when the container is healthy or Azure didn't report it.
+    pub running_state_details: Option<String>,
 }
 
 pub async fn fetch(
@@ -133,12 +139,19 @@ fn extract_container(c: &serde_json::Value) -> ReplicaContainer {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let running_state_details = c
+        .get("runningStateDetails")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     ReplicaContainer {
         name,
         ready,
         started,
         restart_count,
         running_state,
+        running_state_details,
     }
 }
 
@@ -176,6 +189,49 @@ mod tests {
         assert_eq!(r.containers[0].ready, Some(true));
         assert_eq!(r.containers[0].restart_count, 0);
         assert_eq!(r.containers[2].name, "http-auth");
+    }
+
+    #[test]
+    fn captures_running_state_details_for_stuck_container() {
+        // A waiting container carries the kubelet reason in runningStateDetails;
+        // we keep it so the UI can explain *why* the replica won't start.
+        let payload = json!({ "value": [
+            {
+                "name": "rev--abc-xyz",
+                "properties": {
+                    "runningState": "NotRunning",
+                    "containers": [
+                        {
+                            "name": "maintenance",
+                            "ready": false,
+                            "started": false,
+                            "restartCount": 0,
+                            "runningState": "Waiting",
+                            "runningStateDetails": "Back-off pulling image \"acr.io/maintenance-api:bad-tag\""
+                        }
+                    ]
+                }
+            }
+        ]});
+        let c = &extract(&payload)[0].containers[0];
+        assert_eq!(c.running_state.as_deref(), Some("Waiting"));
+        assert_eq!(
+            c.running_state_details.as_deref(),
+            Some("Back-off pulling image \"acr.io/maintenance-api:bad-tag\"")
+        );
+    }
+
+    #[test]
+    fn empty_running_state_details_becomes_none() {
+        let payload = json!({ "value": [
+            { "name": "r", "properties": { "containers": [
+                { "name": "c", "runningState": "Running", "runningStateDetails": "" }
+            ] } }
+        ]});
+        assert_eq!(
+            extract(&payload)[0].containers[0].running_state_details,
+            None
+        );
     }
 
     #[test]

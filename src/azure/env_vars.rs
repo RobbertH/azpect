@@ -79,6 +79,16 @@ pub fn from_container_env(env: &serde_json::Value) -> Vec<EnvVar> {
     out
 }
 
+/// Recover the Container App secret *name* from the display value produced by
+/// [`from_container_env`] for a `secretRef` entry (`(secret: my-secret)` →
+/// `my-secret`). This is the inverse of the formatting there — keep the two in
+/// sync. Returns `None` for any other value shape (literals, Key Vault refs).
+pub fn secret_ref_name(display_value: &str) -> Option<&str> {
+    display_value
+        .strip_prefix("(secret: ")
+        .and_then(|s| s.strip_suffix(')'))
+}
+
 /// Parse a Function App app-settings `properties` object — a flat
 /// `{ "KEY": "value", ... }` map. Values shaped like
 /// `@Microsoft.KeyVault(SecretUri=...)` are flagged `is_secret` so a revealed
@@ -155,6 +165,17 @@ mod tests {
         assert_eq!(vars[1].name, "WEBSITE_RUN_FROM_PACKAGE");
         assert!(!vars[1].is_secret);
         assert_eq!(vars[1].value, "1");
+    }
+
+    #[test]
+    fn secret_ref_name_round_trips_container_secret_display() {
+        // Inverse of the `(secret: …)` formatting in `from_container_env`.
+        let env = json!([{ "name": "DB", "secretRef": "db-password" }]);
+        let vars = from_container_env(&env);
+        assert_eq!(secret_ref_name(&vars[0].value), Some("db-password"));
+        // Non-secretRef shapes don't parse.
+        assert_eq!(secret_ref_name("plain"), None);
+        assert_eq!(secret_ref_name("@Microsoft.KeyVault(SecretUri=...)"), None);
     }
 
     #[test]

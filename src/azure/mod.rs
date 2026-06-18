@@ -3,6 +3,7 @@
 pub mod apim;
 pub mod appgw_backends;
 pub mod auth;
+pub mod az_exec;
 pub mod az_login;
 pub mod client;
 pub mod container_app_env_update;

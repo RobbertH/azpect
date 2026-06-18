@@ -38,6 +38,12 @@ futures = "0.3"
 open = "5"
 quick-xml = { version = "0.36", features = ["serialize"] }
 
+# Unix-only: temporarily ignore terminal job-control signals while a shell-out
+# child (`az containerapp exec`) owns the terminal, so Ctrl-C interrupts the
+# child rather than killing the suspended TUI. See `azure::az_exec`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
