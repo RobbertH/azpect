@@ -65,6 +65,14 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("UNKNOWN", "no data / not loaded yet"),
             ("ERROR", "couldn't fetch the health metrics"),
             ("5xx", "had server errors in 24h (flag, not the verdict)"),
+            (
+                "◌ vs ●",
+                "hollow = provisional (still loading metrics); solid = settled",
+            ),
+            (
+                "refresh",
+                "list self-updates on a timer (refresh_secs); r forces it",
+            ),
             ("note", "verdict is worst-of all signals (pessimistic)"),
         ],
     ),

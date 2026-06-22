@@ -70,6 +70,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ),
         Style::default().fg(theme.muted),
     ));
+    // Freshness indicator: "updating…" while a (re)load is in flight, otherwise
+    // "updated Xs ago" off the last completed load. Live-updates because the
+    // 250ms tick redraws. Tells the user how stale the badges/versions are and
+    // confirms auto-refresh (or a manual `r`) actually fired.
+    if state.loading_resources {
+        title_spans.push(Span::styled(
+            "· updating… ",
+            Style::default().fg(theme.accent),
+        ));
+    } else if let Some(loaded) = state.resources_loaded_at {
+        title_spans.push(Span::styled(
+            format!("· updated {} ", format_ago(loaded.elapsed())),
+            Style::default().fg(theme.muted),
+        ));
+    }
     if state.favorites_only {
         title_spans.push(Span::styled(
             "★ favorites ",
@@ -202,7 +217,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
                 let kind_tag = format!("{:<KIND_COL_WIDTH$}", r.kind.short_tag());
 
-                let (badge_color, badge_label) = badge_for_row(r, state, theme);
+                let (badge_color, badge_label, badge_settled) = badge_for_row(r, state, theme);
+                // Hollow dot while the verdict is still provisional (availability
+                // in, metrics not yet — or nothing in at all); solid once settled.
+                let badge_glyph = if badge_settled { "●" } else { "◌" };
                 // 5xx presence flag (see `errors_5xx_for_row`): a marker next to
                 // the badge, independent of the verdict.
                 let five_xx = match errors_5xx_for_row(r, state) {
@@ -236,7 +254,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     Span::raw("  "),
                     Span::styled(kind_tag, Style::default().fg(theme.accent)),
                     Span::raw("  "),
-                    Span::styled("●", Style::default().fg(badge_color)),
+                    Span::styled(badge_glyph, Style::default().fg(badge_color)),
                     Span::raw(" "),
                     Span::styled(
                         format!("{:<8}", badge_label),
@@ -308,30 +326,54 @@ pub(crate) fn errors_5xx_for_row(r: &Resource, state: &AppState) -> Option<f64> 
         .map(|m| crate::azure::health::errors_total(m))
 }
 
-pub(crate) fn badge_for_row(r: &Resource, state: &AppState, theme: &Theme) -> (Color, String) {
-    // The badge derives from two independent fetches that resolve at different
-    // times: the fixed-24h health metrics (Errors+Traffic) and Resource Health
-    // availability. Deriving from whichever lands first flashes a wrong verdict
-    // before things settle (metrics-only → IDLE, health-only → HEALTHY), so hold
-    // at LOADING until *both* have resolved. A failure on either counts as
-    // resolved: all-metrics-failed → ERROR; a 403 on Resource Health just drops
-    // the availability signal rather than pinning the row at LOADING forever.
+/// The health badge for a row: its `(color, label)` plus whether the verdict is
+/// *settled* (both underlying signals in) or still *provisional* (the renderer
+/// draws a hollow `◌` for provisional, a solid `●` once settled).
+///
+/// The badge derives from two fetches that resolve at different times: Resource
+/// Health availability (the fast, authoritative up/degraded/down signal — same
+/// thing the portal shows "instantly") and the fixed-24h Errors+Traffic metrics
+/// (the slow one). We **lead on availability**: as soon as it lands we render its
+/// verdict, then silently upgrade once metrics refine it. This is what makes the
+/// list feel as fast as the portal instead of sitting at LOADING for seconds.
+///
+/// Metrics arriving *first* don't promote a verdict on their own — availability
+/// is the lead signal, and a metrics-only read used to flash a wrong IDLE before
+/// settling. So while availability is still pending we hold at LOADING regardless
+/// of metrics.
+///
+/// A failure counts as resolved: a 403 on Resource Health drops the availability
+/// state (we fall back to the metric verdict) rather than pinning the row; an
+/// all-metrics-failed read surfaces as ERROR.
+pub(crate) fn badge_for_row(
+    r: &Resource,
+    state: &AppState,
+    theme: &Theme,
+) -> (Color, String, bool) {
     let metrics_resolved = state.health.metrics.contains_key(&r.id)
         || state.health.metrics_failures.contains_key(&r.id);
     let availability_resolved =
         state.health.by_resource.contains_key(&r.id) || state.health.failures.contains_key(&r.id);
-    if !(metrics_resolved && availability_resolved) {
-        return (theme.muted, "LOADING…".to_string());
+
+    // Lead on availability: until the fast signal lands there's nothing to show.
+    if !availability_resolved {
+        return (theme.muted, "LOADING…".to_string(), false);
     }
+    // Availability is in; the verdict is provisional until metrics refine it.
+    let settled = metrics_resolved;
     if state.health.metrics_failures.contains_key(&r.id) {
-        return (theme.critical, "ERROR".to_string());
+        return (theme.critical, "ERROR".to_string(), settled);
     }
 
     let metrics = state.health.metrics.get(&r.id);
     let availability = state.health.by_resource.get(&r.id).map(|a| a.state);
     let m: &[crate::azure::metrics::MetricSeries] = metrics.map(|v| v.as_slice()).unwrap_or(&[]);
     let status = derive(m, r.state.as_deref(), availability);
-    (color_for_health(status, theme), status.label().to_string())
+    (
+        color_for_health(status, theme),
+        status.label().to_string(),
+        settled,
+    )
 }
 
 fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
@@ -341,6 +383,22 @@ fn color_for_health(status: HealthStatus, theme: &Theme) -> Color {
         HealthStatus::Degraded => theme.degraded,
         HealthStatus::Critical => theme.critical,
         HealthStatus::Unknown => theme.unknown,
+    }
+}
+
+/// Compact "time since" for the list's freshness indicator: `just now` under
+/// 5s, then `Ns ago`, `Nm ago`, `Nh ago`. Coarse on purpose — it answers "how
+/// stale is this" at a glance, not to-the-second precision.
+fn format_ago(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
     }
 }
 
@@ -785,6 +843,19 @@ mod tests {
 
     /// Build a metrics vec with `traffic` requests and zero errors across the
     /// trailing window, so `derive` resolves to HEALTHY once both signals land.
+    #[test]
+    fn format_ago_buckets_by_magnitude() {
+        use std::time::Duration;
+        assert_eq!(format_ago(Duration::from_secs(0)), "just now");
+        assert_eq!(format_ago(Duration::from_secs(4)), "just now");
+        assert_eq!(format_ago(Duration::from_secs(5)), "5s ago");
+        assert_eq!(format_ago(Duration::from_secs(59)), "59s ago");
+        assert_eq!(format_ago(Duration::from_secs(60)), "1m ago");
+        assert_eq!(format_ago(Duration::from_secs(3599)), "59m ago");
+        assert_eq!(format_ago(Duration::from_secs(3600)), "1h ago");
+        assert_eq!(format_ago(Duration::from_secs(7200)), "2h ago");
+    }
+
     fn healthy_metrics() -> Vec<crate::azure::metrics::MetricSeries> {
         use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries};
         let now = Utc::now();
@@ -852,8 +923,10 @@ mod tests {
     }
 
     #[test]
-    fn badge_holds_loading_when_only_health_resolved() {
-        // Mirror case: health-first must not flash HEALTHY before metrics load.
+    fn badge_shows_provisional_rh_verdict_before_metrics() {
+        // We lead on Resource Health: once availability lands we render its
+        // verdict immediately (Available → HEALTHY) even though metrics haven't
+        // loaded, but mark it *un*settled so the renderer draws a hollow dot.
         let theme = Theme::catppuccin_mocha();
         let mut state = fixture();
         let res = state.resources[0].clone();
@@ -861,7 +934,18 @@ mod tests {
             .health
             .by_resource
             .insert(res.id.clone(), avail_available());
-        assert_eq!(badge_for_row(&res, &state, &theme).1, "LOADING…");
+        let (_, label, settled) = badge_for_row(&res, &state, &theme);
+        assert_eq!(label, "HEALTHY");
+        assert!(!settled, "verdict is provisional until metrics resolve");
+
+        // Metrics land → same verdict, now settled (solid dot).
+        state
+            .health
+            .metrics
+            .insert(res.id.clone(), healthy_metrics());
+        let (_, label, settled) = badge_for_row(&res, &state, &theme);
+        assert_eq!(label, "HEALTHY");
+        assert!(settled, "both signals in → settled");
     }
 
     #[test]

@@ -1320,6 +1320,55 @@ pub struct LogsCache {
     /// normal single-line mode. Reset whenever the buffer is refetched or
     /// refiltered, since the anchored index would otherwise point at a stale row.
     pub visual_anchor: Option<usize>,
+    /// Monotonic fetch-scope token. Bumped on every change that invalidates the
+    /// current buffer (errors-only toggle, window change, context jump). Each
+    /// fetch carries the generation it was issued under; `LogsLoaded` discards a
+    /// page whose generation is stale, so a slow in-flight fetch can't clobber
+    /// the buffer after the user has changed the filter again. This is what makes
+    /// the `e` toggle deterministic no matter how fast it's pressed.
+    pub generation: u64,
+    /// A specific log line the next view change should try to keep selected. Set
+    /// just before an errors-only toggle / context jump (whose refetch is async);
+    /// resolved in `LogsLoaded` once the new page lands — the cursor moves to the
+    /// same line if it still exists in the new buffer. Source cycling resolves it
+    /// synchronously instead. `None` outside a view transition.
+    pub pending_anchor: Option<LineAnchor>,
+    /// When set, the requested window for the *next* initial fetch is centered on
+    /// this timestamp (unfiltered) rather than the newest rows — this is the
+    /// "context around an error" jump triggered by toggling errors-only OFF while
+    /// a line is selected. Cleared once errors-only is turned back on, the window
+    /// changes, or the view is re-entered.
+    pub context_around: Option<chrono::DateTime<chrono::Utc>>,
+    /// One-shot flag: when true, the next render centers the cursor row in the
+    /// viewport (instead of the usual edge-scroll), then clears it. Set after an
+    /// anchor is resolved so the kept line lands mid-screen with context above and
+    /// below. `Cell` because render holds `&AppState`.
+    pub center_pending: Cell<bool>,
+}
+
+/// Identity of a single log line, used to re-select "the same line" across a
+/// filter/source change. There's no server-side unique id, so we key on the
+/// triple that is effectively unique in practice: emission time, emitting
+/// source, and the message text.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LineAnchor {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub source: String,
+    pub message: String,
+}
+
+impl LineAnchor {
+    pub fn of(line: &crate::azure::logs::LogLine) -> Self {
+        Self {
+            ts: line.ts,
+            source: line.source.clone(),
+            message: line.message.clone(),
+        }
+    }
+
+    pub fn matches(&self, line: &crate::azure::logs::LogLine) -> bool {
+        self.ts == line.ts && self.source == line.source && self.message == line.message
+    }
 }
 
 impl LogsCache {
@@ -1336,6 +1385,12 @@ impl LogsCache {
         self.search_active = false;
         self.search_input.reset();
         self.visual_anchor = None;
+        // A context jump is resource-specific (it centers on one error's
+        // timestamp), so dropping into a different resource's logs must clear it
+        // along with any anchor still waiting to resolve.
+        self.context_around = None;
+        self.pending_anchor = None;
+        self.center_pending.set(false);
     }
 }
 
@@ -1369,6 +1424,17 @@ pub struct AppState {
     pub list_filter_active: bool,
     pub favorites_only: bool,
     pub loading_resources: bool,
+    /// When the resource list last finished loading. Drives the "updated Xs ago"
+    /// indicator in the list title and the auto-refresh timer (see
+    /// `app::maybe_auto_refresh`). `None` until the first successful load. Stored
+    /// as `std::time::Instant` (monotonic) like `status_message_until`, so the
+    /// field doesn't pull a Serialize bound onto the rest of the struct.
+    pub resources_loaded_at: Option<std::time::Instant>,
+    /// When auto-refresh last *fired* a reload (success or not). Kept distinct
+    /// from `resources_loaded_at` (which only advances on a successful load) so a
+    /// failing/throttled reload re-arms the interval instead of retrying every
+    /// tick. See `app::maybe_auto_refresh`.
+    pub last_auto_refresh: Option<std::time::Instant>,
 
     /// State of the dedicated env-vars page (cursor + whether values are
     /// revealed). Reset on entering the page, so values always start masked.
@@ -1481,6 +1547,8 @@ impl AppState {
             list_filter_active: false,
             favorites_only: false,
             loading_resources: false,
+            resources_loaded_at: None,
+            last_auto_refresh: None,
             env_vars_view: EnvVarsView::default(),
             env_var_edit: None,
             detail_view: DetailView::default(),
@@ -1545,6 +1613,38 @@ impl AppState {
             Some(src) => lines.iter().filter(|l| l.source == src).collect(),
             None => lines.iter().collect(),
         }
+    }
+
+    /// The log line currently under the cursor in the logs table, resolved
+    /// through the same `visible_log_lines` view the table renders. `None` when
+    /// no resource is selected or the visible buffer is empty.
+    pub fn selected_log_line(&self) -> Option<crate::azure::logs::LogLine> {
+        let id = self.selected_resource()?.id.clone();
+        let lines = self.visible_log_lines(&id);
+        lines
+            .get(self.logs.scroll.min(lines.len().saturating_sub(1)))
+            .map(|l| (*l).clone())
+    }
+
+    /// Locate `anchor`'s line in the current visible buffer for `resource_id`,
+    /// returning its row index. Falls back to the row with the nearest timestamp
+    /// when the exact line is gone (e.g. it was an INFO line and errors-only just
+    /// turned on, or the message differs), so the cursor lands as close as
+    /// possible to where the user was. `None` only when the buffer is empty.
+    pub fn anchor_index(&self, resource_id: &str, anchor: &LineAnchor) -> Option<usize> {
+        let lines = self.visible_log_lines(resource_id);
+        if lines.is_empty() {
+            return None;
+        }
+        if let Some(i) = lines.iter().position(|l| anchor.matches(l)) {
+            return Some(i);
+        }
+        // Nearest-by-time fallback.
+        lines
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, l)| (l.ts - anchor.ts).num_milliseconds().abs())
+            .map(|(i, _)| i)
     }
 
     /// Set the bottom-row status hint with the standard auto-clear window.

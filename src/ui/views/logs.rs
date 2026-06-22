@@ -14,13 +14,13 @@ use ratatui::Frame;
 use crate::azure::logs::{LogLevel, LogLine};
 use crate::azure::metrics::TimeRange;
 use crate::ui::events::Action;
-use crate::ui::state::AppState;
 #[cfg(test)]
 use crate::ui::state::View;
+use crate::ui::state::{AppState, LineAnchor};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -123,6 +123,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             header_spans.push(Span::styled(
                 "· filter: errors only ✓ ",
                 Style::default().fg(theme.degraded),
+            ));
+        }
+        // Context jump: an unfiltered window centered on one error's timestamp.
+        // Signal it (and the centering anchor) so the user knows why this isn't
+        // the full trailing buffer and why scroll-to-load is bounded here.
+        if let Some(ts) = state.logs.context_around {
+            let stamp = ts
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string();
+            header_spans.push(Span::styled(
+                format!("· context @ {stamp} ✓ "),
+                Style::default().fg(theme.accent),
             ));
         }
         // Active source is normally shown by the dedicated tab-bar row; only
@@ -354,9 +367,18 @@ fn render_table(
     // stays put at the persisted `view_top` and only moves once the cursor
     // crosses an edge. `start` is the reconciled top — write it back for the
     // next frame (render is the only place that knows the viewport height).
+    //
+    // A one-shot center request (set after an anchor resolves) overrides the
+    // persisted top this frame so the kept line lands mid-viewport with context
+    // above and below, rather than pinned to an edge by the usual edge-scroll.
+    let requested_top = if state.logs.center_pending.replace(false) {
+        cursor.saturating_sub(data_height / 2)
+    } else {
+        state.logs.view_top.get()
+    };
     let (start, end) = visible_range(
         lines,
-        state.logs.view_top.get(),
+        requested_top,
         cursor,
         data_height,
         wrap,
@@ -1000,7 +1022,24 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::ToggleErrorsOnly => {
-            state.logs.errors_only = !state.logs.errors_only;
+            // Remember the line under the cursor so the refetch can re-select it
+            // (it survives whenever it still matches the new filter).
+            let anchor = state.selected_log_line().map(|l| LineAnchor::of(&l));
+            let turning_on = !state.logs.errors_only;
+            state.logs.errors_only = turning_on;
+            // Turning the filter OFF while a line is selected is the "context
+            // around this error" jump: fetch an unfiltered window centered on it
+            // so the INFO lines bracketing it are actually in the buffer. Turning
+            // it back ON returns to the normal newest-rows errors window.
+            state.logs.context_around = if turning_on {
+                None
+            } else {
+                anchor.as_ref().map(|a| a.ts)
+            };
+            state.logs.pending_anchor = anchor;
+            // New fetch scope — bump the generation so any in-flight fetch under
+            // the old filter is discarded when it lands (keeps `e` deterministic).
+            state.logs.generation = state.logs.generation.wrapping_add(1);
             if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
                 state.logs.by_resource.remove(&id);
             }
@@ -1130,8 +1169,10 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 /// order is stable while pages stream in. `direction` is `+1` (Tab) to advance
 /// and `-1` (Shift+Tab) to go back; both wrap through the "all" (None) slot. A
 /// current filter that no longer matches any cached source (e.g. after a window
-/// change refetched the buffer) is treated as the "all" position. The cursor
-/// resets — row indexes mean something different under the new filter.
+/// change refetched the buffer) is treated as the "all" position. The line under
+/// the cursor stays selected across the switch when it's still visible under the
+/// new filter (otherwise the cursor lands on the nearest line by time), so
+/// flipping sources keeps you oriented around the same moment in the stream.
 fn cycle_source_filter(state: &mut AppState, direction: i32) {
     let Some(id) = state.selected_resource().map(|r| r.id.clone()) else {
         return;
@@ -1140,6 +1181,11 @@ fn cycle_source_filter(state: &mut AppState, direction: i32) {
     if sources.is_empty() {
         return;
     }
+
+    // Capture the line under the cursor before the filter changes; source
+    // cycling is a synchronous client-side refilter, so we can re-select it
+    // immediately against the new visible set (no refetch involved).
+    let anchor = state.selected_log_line().map(|l| LineAnchor::of(&l));
 
     // Model the cycle as indices `0..=len` where `len` is the "all" slot, so
     // forward/back wrap cleanly through "all" with plain modular arithmetic. A
@@ -1156,8 +1202,14 @@ fn cycle_source_filter(state: &mut AppState, direction: i32) {
         Some(n) if n != all => Some(sources[n as usize].clone()),
         _ => None,
     };
-    state.logs.scroll = 0;
+    // Re-select the same line under the new filter (or the nearest by time);
+    // `anchor_index` reads `visible_log_lines`, which now reflects the filter we
+    // just set. Center it so context is visible above and below.
+    state.logs.scroll = anchor
+        .and_then(|a| state.anchor_index(&id, &a))
+        .unwrap_or(0);
     state.logs.view_top.set(0);
+    state.logs.center_pending.set(true);
     state.logs.visual_anchor = None;
 }
 
@@ -1264,6 +1316,12 @@ fn set_window(state: &mut AppState, range: TimeRange) -> bool {
         return true;
     }
     state.logs.range = range;
+    // A context window is pinned to one error's timestamp; choosing a different
+    // range means the user wants the normal trailing window again.
+    state.logs.context_around = None;
+    state.logs.pending_anchor = None;
+    // New fetch scope — invalidate any in-flight fetch from the old window.
+    state.logs.generation = state.logs.generation.wrapping_add(1);
     if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
         state.logs.by_resource.remove(&id);
     }
@@ -1343,6 +1401,89 @@ mod tests {
         assert!(handle(Action::CycleSourceFilter, &mut state));
         assert_eq!(state.logs.source_filter, None);
         assert_eq!(state.visible_log_lines(&id).len(), 3);
+    }
+
+    #[test]
+    fn source_cycle_keeps_the_selected_line() {
+        // Selecting a line, then Tab-ing to the source it belongs to, should keep
+        // the cursor on that exact line rather than resetting to the top.
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![
+                line(1, LogLevel::Info, "reports", "alpha"),
+                line(2, LogLevel::Info, "http-auth", "beta"),
+                line(3, LogLevel::Info, "reports", "gamma"),
+            ],
+        );
+        // Cursor on the http-auth line ("beta") in the unfiltered view.
+        state.logs.scroll = 1;
+        assert_eq!(state.selected_log_line().unwrap().message, "beta");
+
+        // Tab to the http-auth filter: the same line is the only one visible and
+        // stays selected.
+        assert!(handle(Action::CycleSourceFilter, &mut state));
+        assert_eq!(state.logs.source_filter.as_deref(), Some("http-auth"));
+        assert_eq!(state.selected_log_line().unwrap().message, "beta");
+    }
+
+    #[test]
+    fn errors_toggle_off_sets_context_anchor_and_bumps_generation() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        // Start in errors-only with one error line selected.
+        state.logs.errors_only = true;
+        let err = line(5, LogLevel::Error, "app", "boom");
+        state.logs.by_resource.insert(id.clone(), vec![err.clone()]);
+        state.logs.scroll = 0;
+        let gen0 = state.logs.generation;
+
+        assert!(handle(Action::ToggleErrorsOnly, &mut state));
+
+        // Filter is off, the buffer was dropped for a refetch, the generation
+        // advanced (so a stale in-flight page is discarded), and a context window
+        // + anchor were armed around the selected error.
+        assert!(!state.logs.errors_only);
+        assert!(!state.logs.by_resource.contains_key(&id));
+        assert_eq!(state.logs.generation, gen0 + 1);
+        assert_eq!(state.logs.context_around, Some(err.ts));
+        assert_eq!(
+            state
+                .logs
+                .pending_anchor
+                .as_ref()
+                .map(|a| a.message.as_str()),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn errors_toggle_on_arms_anchor_without_context_window() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        // All-logs view; select an error line, then turn errors-only ON.
+        let err = line(2, LogLevel::Error, "app", "kaboom");
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![line(1, LogLevel::Info, "app", "hello"), err.clone()],
+        );
+        state.logs.scroll = 1;
+
+        assert!(handle(Action::ToggleErrorsOnly, &mut state));
+
+        assert!(state.logs.errors_only);
+        // Turning the filter ON is not a context jump — no centered window.
+        assert_eq!(state.logs.context_around, None);
+        // But the anchor is armed so the error stays selected after the refetch.
+        assert_eq!(
+            state
+                .logs
+                .pending_anchor
+                .as_ref()
+                .map(|a| a.message.as_str()),
+            Some("kaboom")
+        );
     }
 
     #[test]

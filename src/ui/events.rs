@@ -48,6 +48,10 @@ pub enum AppEvent {
     LogsLoaded {
         resource_id: String,
         append: bool,
+        /// The `logs.generation` this fetch was issued under. The handler drops
+        /// the page if it no longer matches the current generation — a stale
+        /// in-flight fetch must not clobber a buffer the user has since refiltered.
+        generation: u64,
         result: Result<crate::azure::logs::LogsPage, String>,
     },
     /// Background load completion: Azure Resource Health availability for a

@@ -37,10 +37,23 @@ pub struct Config {
     /// One of: `"catppuccin-mocha"`, `"catppuccin-latte"`, `"dark"`, `"light"`.
     #[serde(default = "default_theme")]
     pub theme: String,
+
+    /// How often (seconds) the resource list silently re-fetches every row's
+    /// health badge and deployed version while it's the active view, so the list
+    /// self-updates without an explicit `r`. The refresh is paused while a modal,
+    /// the command palette, or the search box is open so it can't yank data out
+    /// from under the user. `0` disables auto-refresh entirely (press `r` to
+    /// refresh on demand). See `app::maybe_auto_refresh`.
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_secs: u64,
 }
 
 fn default_theme() -> String {
     "catppuccin-mocha".to_string()
+}
+
+fn default_refresh_secs() -> u64 {
+    60
 }
 
 impl Default for Config {
@@ -51,6 +64,7 @@ impl Default for Config {
             favorites: Vec::new(),
             default_window: TimeRange::default(),
             theme: default_theme(),
+            refresh_secs: default_refresh_secs(),
         }
     }
 }
@@ -129,6 +143,17 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(dirs.config_dir().join("config.toml"))
 }
 
+/// Resolve the diagnostics log file path (under the OS cache dir). The TUI logs
+/// here instead of stderr: stderr shares the terminal with the alternate-screen
+/// UI, so any `tracing` line would paint raw text over the rendered frame —
+/// outside ratatui's cell buffer, so it never gets cleared (it survives resize,
+/// scroll, and refresh). Pure function so tests can inspect it.
+pub fn log_path() -> anyhow::Result<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "azpect")
+        .ok_or_else(|| anyhow!("could not determine a cache directory for this OS"))?;
+    Ok(dirs.cache_dir().join("azpect.log"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +169,7 @@ mod tests {
         assert_eq!(parsed.favorites, cfg.favorites);
         assert_eq!(parsed.default_window, cfg.default_window);
         assert_eq!(parsed.theme, cfg.theme);
+        assert_eq!(parsed.refresh_secs, cfg.refresh_secs);
     }
 
     #[test]
@@ -179,5 +205,14 @@ mod tests {
             .and_then(|s| s.to_str())
             .expect("config path has a parent directory");
         assert_eq!(dir, "azpect");
+    }
+
+    #[test]
+    fn log_path_is_named_azpect_log() {
+        let path = log_path().expect("resolve log path");
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("azpect.log")
+        );
     }
 }

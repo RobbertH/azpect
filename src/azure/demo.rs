@@ -1251,6 +1251,7 @@ pub fn logs(
     range: TimeRange,
     errors_only: bool,
     older_than: Option<DateTime<Utc>>,
+    around: Option<DateTime<Utc>>,
 ) -> LogsPage {
     if older_than.is_some() {
         return LogsPage {
@@ -1265,7 +1266,12 @@ pub fn logs(
         ResourceKind::Apim => apim_log_lines(range),
         ResourceKind::AppGateway => Vec::new(),
     };
-    if errors_only {
+    if let Some(ts) = around {
+        // Context jump: an unfiltered window around the error's timestamp, so the
+        // INFO lines bracketing it survive (mirrors the real windowed fetch).
+        let half = Duration::minutes(3);
+        lines.retain(|l| (l.ts - ts).num_seconds().abs() <= half.num_seconds());
+    } else if errors_only {
         lines.retain(|l| matches!(l.level, LogLevel::Warn | LogLevel::Error));
     }
     LogsPage {
@@ -1613,7 +1619,7 @@ mod tests {
         let rs = resources(&[]);
         let apim = rs.iter().find(|r| r.kind == ResourceKind::Apim).unwrap();
 
-        let page = logs(apim, TimeRange::Hour, false, None);
+        let page = logs(apim, TimeRange::Hour, false, None, None);
         assert!(!page.lines.is_empty());
         assert!(
             !page.has_more,
@@ -1633,7 +1639,7 @@ mod tests {
             assert!(w[0].ts >= w[1].ts);
         }
 
-        let errors = logs(apim, TimeRange::Hour, true, None);
+        let errors = logs(apim, TimeRange::Hour, true, None, None);
         assert!(
             !errors.lines.is_empty(),
             "demo data must include some 4xx/5xx"
@@ -1644,7 +1650,7 @@ mod tests {
             .all(|l| matches!(l.level, LogLevel::Warn | LogLevel::Error)));
 
         // Pagination cursor terminates immediately.
-        let older = logs(apim, TimeRange::Hour, false, Some(Utc::now()));
+        let older = logs(apim, TimeRange::Hour, false, Some(Utc::now()), None);
         assert!(older.lines.is_empty());
         assert!(!older.has_more);
     }

@@ -127,22 +127,24 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let failure = state.metrics.failures.get(&resource.id);
     let availability = state.health.by_resource.get(&resource.id).map(|a| a.state);
     // The badge derives from the fixed-24h health metrics + Resource Health, NOT
-    // the chart series (`metrics_opt`, which follow the selected range). Hold at
-    // LOADING until both health signals resolve; see `badge_for_row` for the
-    // rationale. A failure on either counts as resolved.
+    // the chart series (`metrics_opt`, which follow the selected range). Same
+    // RH-first rule as the list rows (`list::badge_for_row`): lead on the fast
+    // availability signal and render its verdict as soon as it lands, then refine
+    // once the slower metrics resolve. `badge_settled` is false while still
+    // provisional so the dot renders hollow, like the list.
     let health_metrics = state.health.metrics.get(&resource.id);
     let metrics_resolved =
         health_metrics.is_some() || state.health.metrics_failures.contains_key(&resource.id);
     let availability_resolved = state.health.by_resource.contains_key(&resource.id)
         || state.health.failures.contains_key(&resource.id);
-    let (badge_color, badge_label) = if state.health.metrics_failures.contains_key(&resource.id) {
-        (theme.critical, "ERROR")
-    } else if !(metrics_resolved && availability_resolved) {
-        (theme.muted, "LOADING")
+    let (badge_color, badge_label, badge_settled) = if !availability_resolved {
+        (theme.muted, "LOADING", false)
+    } else if state.health.metrics_failures.contains_key(&resource.id) {
+        (theme.critical, "ERROR", metrics_resolved)
     } else {
         let m: &[MetricSeries] = health_metrics.map(|v| v.as_slice()).unwrap_or(&[]);
         let h = derive(m, resource.state.as_deref(), availability);
-        (color_for_health(h, theme), h.label())
+        (color_for_health(h, theme), h.label(), metrics_resolved)
     };
 
     // The second header line either reports an error or surfaces the resource's
@@ -299,7 +301,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Span::styled(" · ", Style::default().fg(theme.muted)),
         Span::styled(resource.kind.short_tag(), Style::default().fg(theme.accent)),
         Span::styled(" · ", Style::default().fg(theme.muted)),
-        Span::styled("●", Style::default().fg(badge_color)),
+        Span::styled(
+            if badge_settled { "●" } else { "◌" },
+            Style::default().fg(badge_color),
+        ),
         Span::raw(" "),
         Span::styled(badge_label, Style::default().fg(badge_color)),
     ];

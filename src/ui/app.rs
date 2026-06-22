@@ -50,6 +50,22 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// `g` chord must complete within this window or it's discarded.
 const CHORD_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// Max concurrent per-row health fetches. Each one fans out to an availability
+/// call plus two Monitor metric calls, so the unbounded "one task per resource"
+/// fan-out hit ARM/Monitor with a burst that throttled (429s) on large
+/// subscriptions and made the badges *slower* to settle. A modest cap smooths the
+/// burst — and matters more now that auto-refresh re-fires it on a timer.
+const HEALTH_FETCH_CONCURRENCY: usize = 8;
+
+/// Process-wide gate limiting concurrent health fetches to [`HEALTH_FETCH_CONCURRENCY`].
+/// Lazily created so it shares one permit pool across every `spawn_load_health`.
+fn health_fetch_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(HEALTH_FETCH_CONCURRENCY)))
+        .clone()
+}
+
 /// Restores the terminal on drop. Owned by `run`; if a panic blows past it
 /// (or the program exits early via `?`), the user gets their terminal back.
 struct TerminalGuard {
@@ -222,6 +238,7 @@ async fn event_loop(
                         state.status_message_until = None;
                     }
                 }
+                maybe_auto_refresh(state, auth, tx, now);
             }
             AppEvent::Resize { .. } => {
                 // ratatui re-measures on next draw. Nothing to do.
@@ -554,6 +571,10 @@ async fn event_loop(
                 match res {
                     Ok(rs) => {
                         state.resources = rs;
+                        // Stamp the load time for the "updated Xs ago" indicator
+                        // and to re-arm the auto-refresh interval (see
+                        // `maybe_auto_refresh`).
+                        state.resources_loaded_at = Some(Instant::now());
                         // Restore the cursor to the last-selected resource if
                         // it's still in the loaded set; otherwise clamp.
                         if let Some(last) = state.config.last_resource_id.as_deref() {
@@ -604,34 +625,63 @@ async fn event_loop(
             AppEvent::LogsLoaded {
                 resource_id,
                 append,
+                generation,
                 result,
             } => {
-                if append {
-                    state.logs.loading_more = false;
+                // Stale-fetch guard: the user changed the filter / window / context
+                // after this fetch was issued, so its result no longer describes
+                // what's on screen. Drop it without touching the buffer or the
+                // loading flags — the fetch for the *current* generation owns those.
+                if generation != state.logs.generation {
+                    // Intentionally nothing: the in-flight current-generation fetch
+                    // still owns the loading flags and will populate the buffer.
                 } else {
-                    state.logs.loading = false;
-                }
-                match result {
-                    Ok(page) => {
-                        state.logs.last_error = None;
-                        state
-                            .logs
-                            .more_available
-                            .insert(resource_id.clone(), page.has_more);
-                        // Workspace ARM id (Container Apps, first page only) — the
-                        // scope `o` uses for the portal Logs deep-link. Cache it;
-                        // its absence on later pages must not evict a known value.
-                        if let Some(ws) = page.workspace_arm_id {
-                            state.logs.workspace_ids.insert(resource_id.clone(), ws);
-                        }
-                        if append {
-                            let entry = state.logs.by_resource.entry(resource_id).or_default();
-                            entry.extend(page.lines);
-                        } else {
-                            state.logs.by_resource.insert(resource_id, page.lines);
-                        }
+                    if append {
+                        state.logs.loading_more = false;
+                    } else {
+                        state.logs.loading = false;
                     }
-                    Err(e) => state.logs.last_error = Some(e),
+                    match result {
+                        Ok(page) => {
+                            state.logs.last_error = None;
+                            state
+                                .logs
+                                .more_available
+                                .insert(resource_id.clone(), page.has_more);
+                            // Workspace ARM id (Container Apps, first page only) —
+                            // the scope `o` uses for the portal Logs deep-link.
+                            // Cache it; its absence on later pages must not evict a
+                            // known value.
+                            if let Some(ws) = page.workspace_arm_id {
+                                state.logs.workspace_ids.insert(resource_id.clone(), ws);
+                            }
+                            if append {
+                                let entry = state
+                                    .logs
+                                    .by_resource
+                                    .entry(resource_id.clone())
+                                    .or_default();
+                                entry.extend(page.lines);
+                            } else {
+                                state
+                                    .logs
+                                    .by_resource
+                                    .insert(resource_id.clone(), page.lines);
+                                // A fresh page is the moment a pending anchor can be
+                                // resolved: re-select the same line (or the nearest
+                                // by time) in the new buffer and center it. Only on
+                                // the initial fetch — appends extend an existing
+                                // view whose cursor shouldn't jump.
+                                if let Some(anchor) = state.logs.pending_anchor.take() {
+                                    if let Some(idx) = state.anchor_index(&resource_id, &anchor) {
+                                        state.logs.scroll = idx;
+                                        state.logs.center_pending.set(true);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => state.logs.last_error = Some(e),
+                    }
                 }
             }
             AppEvent::HealthLoaded {
@@ -2771,16 +2821,26 @@ fn after_action(
     tx: &UnboundedSender<AppEvent>,
 ) {
     match action {
+        // Changing the logs fetch scope (errors-only toggle, time window) must
+        // ALWAYS spawn a fresh fetch, even while a prior one is still in flight —
+        // otherwise a rapid second press is swallowed by the loading debounce and
+        // the buffer ends up reflecting the wrong filter. The generation guard in
+        // `LogsLoaded` discards whichever in-flight fetch is now stale, so forcing
+        // here is safe. Forcing is scoped to the logs view; the Detail metrics
+        // window-change clears its own cache and needs no force.
+        Action::ToggleErrorsOnly
+        | Action::SetWindowHour
+        | Action::SetWindowDay
+        | Action::SetWindowWeek => {
+            let force = matches!(state.view, View::Logs | View::LogDetail);
+            kick_off_loads_for_view(state, auth, tx, force);
+        }
         // The view handler likely transitioned `state.view`. Kick off loads
         // appropriate to whatever the new view is.
         Action::OpenSelected
         | Action::OpenLogs
         | Action::OpenStorage
         | Action::OpenRegistries
-        | Action::SetWindowHour
-        | Action::SetWindowDay
-        | Action::SetWindowWeek
-        | Action::ToggleErrorsOnly
         // NextPanel / PrevPanel toggle a sub-kind in place (Key Vault
         // secrets↔certs, Service Bus queues↔topics). Kick off a load so the
         // newly-selected kind fetches without an extra `r`; the per-key
@@ -2796,6 +2856,55 @@ fn after_action(
 /// Look at `state.view` and the loading flags, and spawn whichever loaders are
 /// missing. `force` overrides the loading-flag debounce (used for the explicit
 /// Refresh action).
+/// Silently re-fetch the resource list's health + version on a timer so the list
+/// self-updates without the user pressing `r`. Driven from the `Tick` arm.
+///
+/// Only fires on the List view, and only once `config.refresh_secs` has elapsed
+/// since the last load landed (`resources_loaded_at`). It's a no-op while a
+/// resource load is already in flight (`loading_resources` re-arms once it
+/// completes) and while any input-capturing overlay is open — a background reload
+/// that reordered rows or moved the cursor mid-interaction would be hostile.
+///
+/// The refresh is a `force` `kick_off_loads_for_view`, identical to `r`: it
+/// re-fetches in place without dropping cached values, so settled rows update
+/// silently instead of flashing back to LOADING.
+fn maybe_auto_refresh(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    now: Instant,
+) {
+    let interval = state.config.refresh_secs;
+    if interval == 0 || state.view != View::List || state.loading_resources {
+        return;
+    }
+    // Don't yank data out from under an open modal / active typing.
+    if state.command_active
+        || state.env_var_edit.is_some()
+        || state.quit_confirm
+        || state.auth_prompt != AuthPrompt::Hidden
+        || state.list_filter_active
+    {
+        return;
+    }
+    // Re-arm off whichever is most recent: the last successful load *or* the last
+    // auto-refresh attempt. Using the max means a failed/throttled reload (which
+    // doesn't advance `resources_loaded_at`) still waits a full interval before
+    // retrying instead of firing every tick, and a manual `r` (which advances
+    // `resources_loaded_at`) pushes the next auto-refresh out by an interval too.
+    let reference = match (state.resources_loaded_at, state.last_auto_refresh) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    // No successful load yet — the initial kick-off (or a manual `r`) owns that;
+    // auto-refresh only keeps an already-loaded list fresh.
+    let due = reference.is_some_and(|t| now.duration_since(t) >= Duration::from_secs(interval));
+    if due {
+        state.last_auto_refresh = Some(now);
+        kick_off_loads_for_view(state, auth, tx, /* force */ true);
+    }
+}
+
 fn kick_off_loads_for_view(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -2960,12 +3069,18 @@ fn kick_off_loads_for_view(
                     // suppress fetch-more on the new dataset).
                     state.logs.more_available.remove(&resource.id);
                     state.logs.loading = true;
+                    // A pending context jump fetches an unfiltered window
+                    // centered on the error; otherwise the newest-rows window for
+                    // the current errors-only / range scope.
+                    let around = state.logs.context_around;
                     spawn_load_logs(
                         auth.clone(),
                         resource,
                         state.logs.range,
                         state.logs.errors_only,
                         None,
+                        around,
+                        state.logs.generation,
                         tx.clone(),
                     );
                 }
@@ -3394,6 +3509,9 @@ fn drain_fetch_more_requested(
         state.logs.range,
         state.logs.errors_only,
         Some(older_than),
+        // Pagination never applies to a context window — it's a bounded slice.
+        None,
+        state.logs.generation,
         tx.clone(),
     );
 }
@@ -4403,6 +4521,11 @@ fn spawn_load_health(
         return;
     }
     tokio::spawn(async move {
+        // Hold a permit for the duration of the fan-out so no more than
+        // HEALTH_FETCH_CONCURRENCY resources hit ARM/Monitor at once. The task is
+        // already spawned; it just parks here until a slot frees. A closed gate
+        // (never happens — we never close it) would drop the permit and proceed.
+        let _permit = health_fetch_gate().acquire_owned().await;
         // Two independent signals feed the health badge, fetched concurrently:
         //   1. availability — the platform's up/degraded/down state
         //   2. health metrics — a fixed-24h Errors+Traffic window (range-agnostic)
@@ -5193,12 +5316,15 @@ fn spawn_load_sb_subscriptions(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_load_logs(
     auth: AzureAuth,
     resource: Resource,
     range: TimeRange,
     errors_only: bool,
     older_than: Option<chrono::DateTime<chrono::Utc>>,
+    around: Option<chrono::DateTime<chrono::Utc>>,
+    generation: u64,
     tx: UnboundedSender<AppEvent>,
 ) {
     let append = older_than.is_some();
@@ -5206,22 +5332,26 @@ fn spawn_load_logs(
         let _ = tx.send(AppEvent::LogsLoaded {
             resource_id: resource.id.clone(),
             append,
+            generation,
             result: Ok(crate::azure::demo::logs(
                 &resource,
                 range,
                 errors_only,
                 older_than,
+                around,
             )),
         });
         return;
     }
     tokio::spawn(async move {
         let resource_id = resource.id.clone();
-        let result = crate::azure::logs::fetch(&auth, &resource, range, errors_only, older_than)
-            .await
-            .map_err(|e| format!("{e:#}"));
+        let result =
+            crate::azure::logs::fetch(&auth, &resource, range, errors_only, older_than, around)
+                .await
+                .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::LogsLoaded {
             resource_id,
+            generation,
             append,
             result,
         });
@@ -6191,7 +6321,7 @@ mod tests {
         );
 
         let theme = Theme::catppuccin_mocha();
-        let (_, label) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
+        let (_, label, _) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
         assert_eq!(label.trim(), "IDLE");
 
         // And with traffic + healthy ratio under Available, we should get HEALTHY.
@@ -6211,7 +6341,7 @@ mod tests {
             resource.id.clone(),
             vec![zero_series(MetricKind::Errors), traffic_series],
         );
-        let (_, label) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
+        let (_, label, _) = crate::ui::views::list::badge_for_row(&resource, &state, &theme);
         assert_eq!(label.trim(), "HEALTHY");
     }
 

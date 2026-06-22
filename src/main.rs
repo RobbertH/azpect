@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -21,15 +23,45 @@ enum Command {
     DebugAuth,
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+/// Install the global tracing subscriber. `tui` selects the writer: the TUI
+/// must keep its terminal pristine, so it logs to a file (best-effort — if the
+/// file can't be opened we discard logs rather than fall back to stderr, which
+/// would corrupt the rendered frame). The one-shot CLI keeps stderr.
+fn init_tracing(tui: bool) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
 
+    if !tui {
+        builder.with_writer(std::io::stderr).init();
+        return;
+    }
+
+    // TUI: route to a log file under the cache dir. On any failure, fall back to
+    // a sink that discards output — never stderr, which shares the alt screen.
+    let file = azpect::config::log_path().ok().and_then(|path| {
+        path.parent().map(std::fs::create_dir_all);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+    });
+    match file {
+        Some(f) => builder.with_ansi(false).with_writer(Mutex::new(f)).init(),
+        None => builder.with_writer(std::io::sink).init(),
+    }
+}
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Logging destination depends on the command. The TUI owns the terminal via
+    // an alternate screen, and stderr writes land on that same surface — a
+    // `tracing` line would paint raw text *outside* ratatui's cell buffer, where
+    // it never gets cleared (it survives resize/scroll/refresh, looking like
+    // "random characters" on the rendered frame). So the TUI logs to a file; the
+    // one-shot `debug-auth` subcommand has no TUI and keeps stderr.
+    init_tracing(cli.command.is_none());
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {

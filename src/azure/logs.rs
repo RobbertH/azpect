@@ -234,6 +234,7 @@ pub async fn fetch(
     range: TimeRange,
     errors_only: bool,
     older_than: Option<DateTime<Utc>>,
+    around: Option<DateTime<Utc>>,
 ) -> anyhow::Result<LogsPage> {
     if !supports_logs(resource.kind) {
         return Err(anyhow!(AzpectError::UnsupportedMetric(format!(
@@ -243,7 +244,13 @@ pub async fn fetch(
     }
 
     let kql = build_kql(resource, errors_only, older_than)?;
-    let timespan = range.timespan();
+    // A context jump fetches a tight window centered on one error's timestamp so
+    // the surrounding INFO lines are actually in the buffer; otherwise use the
+    // selected range's trailing window (newest rows back to `range`).
+    let timespan = match around {
+        Some(ts) => context_timespan(ts),
+        None => range.timespan(),
+    };
 
     let client = LogsClient::new(auth.clone())?;
     let mut workspace_arm_id: Option<String> = None;
@@ -278,6 +285,23 @@ pub async fn fetch(
         has_more,
         workspace_arm_id,
     })
+}
+
+/// Half-width of the "context around an error" window. A failed request and the
+/// INFO lines bracketing it almost always fall within a couple of minutes, and a
+/// tight window keeps the fetch comfortably under the page limit.
+const CONTEXT_HALF_WINDOW_MINUTES: i64 = 3;
+
+/// `start/end` ISO-8601 timespan centered on `ts`, used for context jumps.
+fn context_timespan(ts: DateTime<Utc>) -> String {
+    let half = chrono::Duration::minutes(CONTEXT_HALF_WINDOW_MINUTES);
+    let start = ts - half;
+    let end = ts + half;
+    format!(
+        "{}/{}",
+        start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
 }
 
 /// Splice the errors-only filter (and an `older_than` cursor for pagination)
