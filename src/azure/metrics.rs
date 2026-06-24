@@ -32,6 +32,13 @@ pub enum MetricKind {
     Traffic,
     Cpu,
     Memory,
+    /// Azure SQL eDTU / DTU consumption (`dtu_consumption_percent`). Only the
+    /// DTU purchasing model reports it; vCore resources leave it absent.
+    Dtu,
+    /// Azure SQL storage utilization (`storage_percent`).
+    Storage,
+    /// Azure SQL worker / session utilization (`workers_percent`).
+    Workers,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
@@ -184,6 +191,11 @@ fn label_for(kind: MetricKind, resource_kind: ResourceKind) -> &'static str {
         (MetricKind::Cpu, ResourceKind::AppGateway) => "Capacity Units",
         (MetricKind::Cpu, _) => "CPU",
         (MetricKind::Memory, _) => "Memory",
+        // SQL-only kinds never reach this Apis-path mapping (they carry their
+        // own labels from `crate::azure::sql`), but the match must stay total.
+        (MetricKind::Dtu, _) => "eDTU",
+        (MetricKind::Storage, _) => "Storage",
+        (MetricKind::Workers, _) => "Workers",
     }
 }
 

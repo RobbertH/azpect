@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::azure::health::{derive, find, HealthStatus};
@@ -76,6 +76,11 @@ fn metric_row_label(kind: MetricKind, resource_kind: ResourceKind) -> &'static s
         (MetricKind::Errors, _) => "Http 5xx",
         (MetricKind::Cpu, _) => "CPU",
         (MetricKind::Memory, _) => "Memory",
+        // SQL-only kinds are never charted in the Apis Detail view (they belong
+        // to `super::sql_detail`), but the match must stay total.
+        (MetricKind::Dtu, _) => "eDTU",
+        (MetricKind::Storage, _) => "Storage",
+        (MetricKind::Workers, _) => "Workers",
     }
 }
 
@@ -502,7 +507,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     if metric_rows[4].height > 0 {
-        render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
+        super::metric_chart::render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
     }
 
     let mut hint = footer_hint_for(resource.kind);
@@ -513,93 +518,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         hint = format!("e env vars  {hint}");
     }
     render_footer(frame, chunks[2], theme, &hint);
-}
-
-/// Render a 1-row time axis aligned under the sparkline grid. Five
-/// evenly-spaced labels are placed by column, marking the window's start, the
-/// three quarter-points, and `now` (right-anchored). For very narrow widths,
-/// degrades to just the start and end labels.
-fn render_time_axis(frame: &mut Frame, area: Rect, range: TimeRange, theme: &Theme) {
-    let line = build_time_axis(range, area.width);
-    let p = Paragraph::new(Line::from(Span::styled(
-        line,
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
-}
-
-fn build_time_axis(range: TimeRange, width: u16) -> String {
-    let w = width as usize;
-    if w < 6 {
-        return String::new();
-    }
-    let total_minutes = match range {
-        TimeRange::Hour => 60_i64,
-        TimeRange::Day => 24 * 60_i64,
-        TimeRange::Week => 7 * 24 * 60_i64,
-    };
-
-    // Anchor positions at 0, 1/4, 2/4, 3/4 of the width (left-anchored), and
-    // a final "now" right-anchored to the very end. Fall back to two labels on
-    // narrow widths so we never render overlapping garbage.
-    let mut row: Vec<char> = vec![' '; w];
-
-    let place = |row: &mut Vec<char>, start: usize, label: &str| {
-        for (i, c) in label.chars().enumerate() {
-            if start + i < row.len() {
-                row[start + i] = c;
-            }
-        }
-    };
-
-    let now = "now";
-    let now_start = w.saturating_sub(now.chars().count());
-
-    if w >= 40 {
-        let positions = [0usize, w / 4, w / 2, (3 * w) / 4];
-        for p in positions.iter() {
-            let frac = *p as f64 / w as f64;
-            let mins_ago = ((1.0 - frac) * total_minutes as f64).round() as i64;
-            let label = format_relative_minutes(mins_ago);
-            // Don't bleed into the "now" label.
-            let max_label_end = now_start.saturating_sub(1);
-            if *p < max_label_end {
-                let truncated_end = (p + label.chars().count()).min(max_label_end);
-                let trimmed: String = label.chars().take(truncated_end - p).collect();
-                place(&mut row, *p, &trimmed);
-            }
-        }
-    } else {
-        // Just the start label.
-        let label = format_relative_minutes(total_minutes);
-        let max_end = now_start.saturating_sub(1);
-        let trimmed: String = label.chars().take(max_end).collect();
-        place(&mut row, 0, &trimmed);
-    }
-
-    place(&mut row, now_start, now);
-    row.into_iter().collect()
-}
-
-/// Format a "minutes ago" count as a short relative timestamp (`-15m`, `-3h`,
-/// `-2d`). Zero collapses to `now`.
-fn format_relative_minutes(m: i64) -> String {
-    if m <= 0 {
-        return "now".to_string();
-    }
-    if m < 60 {
-        return format!("-{m}m");
-    }
-    if m < 24 * 60 {
-        return format!("-{}h", m / 60);
-    }
-    let days = m / (24 * 60);
-    let rem_h = (m % (24 * 60)) / 60;
-    if rem_h == 0 {
-        format!("-{days}d")
-    } else {
-        format!("-{days}d{rem_h}h")
-    }
 }
 
 /// Approximate how many terminal rows `text` will occupy after Paragraph
@@ -633,9 +551,9 @@ fn render_metric_row(
 ) {
     let series = metrics.and_then(|m| find(m, kind));
 
-    // Two stacked lines: title row + sparkline bars.
-    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-
+    // The summary line is the only resource-specific bit; the rest (title
+    // layout, sparkline, placeholder) is shared with the SQL detail view via
+    // `metric_chart`.
     let summary = match series {
         Some(s) => summary_for(kind, s, limits),
         None if state.metrics.loading => "loading…".to_string(),
@@ -643,70 +561,16 @@ fn render_metric_row(
         None => "—".to_string(),
     };
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!("{label:<10}"),
-            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(summary, Style::default().fg(theme.muted)),
-    ]));
-    frame.render_widget(title, parts[0]);
-
-    match series {
-        Some(s) if !s.points.is_empty() => {
-            let data = scaled_data(s);
-            // Ratatui's Sparkline draws one bar per data point left-to-right
-            // and leaves the remaining columns blank. With a 1d/PT15M window
-            // (96 points) and a chart wider than that, the latest sample
-            // lands mid-area and the right ~25% looks dead. Pre-stretch so
-            // bars span the full width and the most recent point sits at
-            // `now`.
-            let stretched = stretch_to_width(&data, parts[1].width as usize);
-            let max = stretched.iter().copied().max().unwrap_or(1).max(1);
-            let color = color_for_metric(kind, theme);
-            let sparkline = Sparkline::default()
-                .data(&stretched[..])
-                .max(max)
-                .style(Style::default().fg(color));
-            frame.render_widget(sparkline, parts[1]);
-        }
-        _ => {
-            let placeholder = match missing_reason {
-                Some(reason) => format!("not available · {}", short_missing_reason(reason)),
-                None => "—".to_string(),
-            };
-            let p = Paragraph::new(Line::from(Span::styled(
-                placeholder,
-                Style::default().fg(theme.muted),
-            )))
-            .wrap(Wrap { trim: false });
-            frame.render_widget(p, parts[1]);
-        }
-    }
-}
-
-/// Translate the raw Azure error into a one-line, plain-language hint. Falls
-/// back to the first chunk of the error if we don't recognise the pattern.
-fn short_missing_reason(reason: &str) -> String {
-    if reason.contains("Failed to find metric configuration") {
-        // The most common case: the metric name doesn't exist for this
-        // resource's plan tier (e.g. CpuTime on a non-Consumption Function App).
-        "metric not exposed for this plan/tier".to_string()
-    } else if reason.contains("403") || reason.contains("Forbidden") {
-        "permission denied (need Monitoring Reader)".to_string()
-    } else if reason.contains("404") {
-        "resource not found".to_string()
-    } else if reason.contains("BadRequest") || reason.contains("400") {
-        "request rejected by Azure".to_string()
-    } else {
-        // Generic fallback: trim to a single line, cap length.
-        let one_line: String = reason.chars().take(80).collect();
-        if reason.chars().count() > 80 {
-            format!("{one_line}…")
-        } else {
-            one_line
-        }
-    }
+    super::metric_chart::render_chart_row(
+        frame,
+        area,
+        kind,
+        label,
+        series,
+        &summary,
+        missing_reason,
+        theme,
+    );
 }
 
 /// Meta-row labels for a failing active revision (running status + the
@@ -1546,44 +1410,6 @@ fn meta_hint_row(label: &str, value: &str, theme: &Theme) -> (Line<'static>, Str
     (line, format!("{label} {value}"))
 }
 
-/// Resample `data` so its length matches `width` using nearest-neighbor
-/// indexing. Each output column maps back to `data[i * data.len() / width]`,
-/// so the leftmost output is `data[0]` and the rightmost is the last sample.
-/// Works for both upsampling (sparse data, wide chart) and downsampling
-/// (lots of points, narrow chart).
-fn stretch_to_width(data: &[u64], width: usize) -> Vec<u64> {
-    if width == 0 || data.is_empty() {
-        return Vec::new();
-    }
-    (0..width)
-        .map(|i| {
-            let idx = i * data.len() / width;
-            data[idx.min(data.len() - 1)]
-        })
-        .collect()
-}
-
-fn scaled_data(series: &MetricSeries) -> Vec<u64> {
-    series
-        .points
-        .iter()
-        .map(|p| {
-            let v = p.value;
-            if !v.is_finite() || v <= 0.0 {
-                0u64
-            } else {
-                // Multiply by 100 for sub-unit precision; clamp to u64.
-                let scaled = (v * 100.0).round();
-                if scaled >= u64::MAX as f64 {
-                    u64::MAX
-                } else {
-                    scaled as u64
-                }
-            }
-        })
-        .collect()
-}
-
 fn summary_for(
     kind: MetricKind,
     s: &MetricSeries,
@@ -1634,6 +1460,19 @@ fn summary_for(
                 Some(max_b) => format!("{base} / max {}", format_bytes(max_b as f64)),
                 None => base,
             }
+        }
+        // SQL utilization kinds never reach the Apis summary (they're rendered
+        // by `super::sql_detail` with its own percentage summary), but the
+        // match must stay total.
+        MetricKind::Dtu | MetricKind::Storage | MetricKind::Workers => {
+            let latest = s.latest().unwrap_or(0.0);
+            let highest = s.max().max(0.0);
+            let suffix = unit_suffix(s);
+            format!(
+                "latest: {}{suffix} / highest: {}{suffix}",
+                format_value(latest),
+                format_value(highest),
+            )
         }
     }
 }
@@ -1686,15 +1525,6 @@ fn format_bytes(v: f64) -> String {
         format!("{:.1} KB", v / KB)
     } else {
         format!("{v:.0} B")
-    }
-}
-
-fn color_for_metric(kind: MetricKind, theme: &Theme) -> Color {
-    match kind {
-        MetricKind::Traffic => theme.accent,
-        MetricKind::Errors => theme.critical,
-        MetricKind::Cpu => theme.healthy,
-        MetricKind::Memory => theme.degraded,
     }
 }
 
@@ -2392,103 +2222,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    #[test]
-    fn relative_minutes_formatting() {
-        assert_eq!(format_relative_minutes(0), "now");
-        assert_eq!(format_relative_minutes(-5), "now");
-        assert_eq!(format_relative_minutes(15), "-15m");
-        assert_eq!(format_relative_minutes(60), "-1h");
-        assert_eq!(format_relative_minutes(150), "-2h");
-        assert_eq!(format_relative_minutes(24 * 60), "-1d");
-        assert_eq!(format_relative_minutes(24 * 60 + 180), "-1d3h");
-        assert_eq!(format_relative_minutes(7 * 24 * 60), "-7d");
-    }
-
-    #[test]
-    fn time_axis_anchors_now_at_right_edge() {
-        let axis = build_time_axis(TimeRange::Day, 60);
-        assert!(axis.ends_with("now"));
-        // Day start label should appear at the very left.
-        assert!(axis.starts_with("-1d") || axis.starts_with("-24h"));
-        // Should be exactly the column width.
-        assert_eq!(axis.chars().count(), 60);
-    }
-
-    #[test]
-    fn time_axis_degrades_on_narrow_widths() {
-        let axis = build_time_axis(TimeRange::Week, 12);
-        assert!(axis.ends_with("now"));
-        assert_eq!(axis.chars().count(), 12);
-    }
-
-    #[test]
-    fn time_axis_returns_empty_below_threshold() {
-        assert_eq!(build_time_axis(TimeRange::Day, 4), "");
-    }
-
-    #[test]
-    fn missing_reason_recognises_metric_not_exposed() {
-        let raw = "azure api error 400: {\"code\":\"BadRequest\",\"message\":\
-            \"Failed to find metric configuration for provider: \
-            Microsoft.Web, resource Type: sites, metric: CpuTime, ...\"}";
-        assert_eq!(
-            short_missing_reason(raw),
-            "metric not exposed for this plan/tier"
-        );
-    }
-
-    #[test]
-    fn missing_reason_recognises_permission_denied() {
-        let raw = "azure api error 403: Forbidden";
-        assert_eq!(
-            short_missing_reason(raw),
-            "permission denied (need Monitoring Reader)"
-        );
-    }
-
-    #[test]
-    fn missing_reason_truncates_unknown_errors() {
-        let long = "x".repeat(200);
-        let out = short_missing_reason(&long);
-        assert!(out.ends_with('…'));
-        assert!(out.chars().count() <= 81);
-    }
-
-    #[test]
-    fn stretch_to_width_upsamples_data() {
-        // 4 data points stretched to 8 columns — each input bar covers 2 cols.
-        let data = vec![1u64, 2, 3, 4];
-        let out = stretch_to_width(&data, 8);
-        assert_eq!(out, vec![1, 1, 2, 2, 3, 3, 4, 4]);
-    }
-
-    #[test]
-    fn stretch_to_width_downsamples_data() {
-        // 8 → 4: pick every other point.
-        let data = vec![10u64, 20, 30, 40, 50, 60, 70, 80];
-        let out = stretch_to_width(&data, 4);
-        assert_eq!(out, vec![10, 30, 50, 70]);
-    }
-
-    #[test]
-    fn stretch_to_width_handles_empty_and_zero() {
-        assert!(stretch_to_width(&[], 10).is_empty());
-        assert!(stretch_to_width(&[1u64, 2], 0).is_empty());
-    }
-
-    #[test]
-    fn stretch_to_width_last_column_is_last_sample() {
-        // With 96 points stretched to 120 cols, the rightmost column must
-        // still be the most recent sample (not blank, not wrapped).
-        let mut data: Vec<u64> = (0..96).collect();
-        let out = stretch_to_width(&data, 120);
-        assert_eq!(out.len(), 120);
-        assert_eq!(*out.last().unwrap(), 95);
-        // Same shape regardless of width parity.
-        data.push(96);
-        let out = stretch_to_width(&data, 100);
-        assert_eq!(*out.last().unwrap(), 96);
-    }
+    // NOTE: time-axis / stretch_to_width / missing-reason tests moved to
+    // `super::metric_chart` alongside the functions they exercise.
 
     #[test]
     fn meta_lines_full_shape_emits_expected_rows() {
@@ -3475,6 +3210,7 @@ mod tests {
                 MetricKind::Traffic | MetricKind::Errors => "count".into(),
                 MetricKind::Cpu => "%".into(),
                 MetricKind::Memory => "bytes".into(),
+                MetricKind::Dtu | MetricKind::Storage | MetricKind::Workers => "%".into(),
             },
             points: vals
                 .iter()

@@ -189,15 +189,23 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // over the *filtered* list so `/`-search narrows what j/k and Enter see.
     let total = state.filtered_subscription_list().len() + 1;
 
+    // Esc clears the search filter — whether the box is still focused or the
+    // filter was applied then defocused (via Enter/Down) — and returns to the
+    // full list. Only an already-clear list lets Esc fall through to navigation
+    // (the root quit-confirm modal). Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.subscription_filter_active || !state.subscription_filter.value().is_empty())
+    {
+        state.subscription_filter_active = false;
+        state.subscription_filter.reset();
+        state.subscription_cursor = 0;
+        return true;
+    }
+
     // While the search box is focused, swallow most actions and let Lane 3
     // forward raw keys into `subscription_filter`. Mirrors the resource list.
     if state.subscription_filter_active {
         match action {
-            Action::Back => {
-                // Esc defocuses the box (keeps the typed filter, like the list).
-                state.subscription_filter_active = false;
-                return true;
-            }
             Action::OpenSelected => {
                 // First Enter defocuses; a second Enter (below) pins the row.
                 state.subscription_filter_active = false;

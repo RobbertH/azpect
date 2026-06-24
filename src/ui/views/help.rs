@@ -169,6 +169,18 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Azure SQL (pools + databases)",
+        &[
+            (":sql / :sqldb", "enter azure sql mode (palette only)"),
+            ("Enter", "open utilization sparklines for the pool/database"),
+            ("0 / 1 / 7", "chart window: 1h / 1d / 7d"),
+            ("/", "filter pools & databases by name / server"),
+            ("y", "yank resource id"),
+            ("o", "open pool / database in Azure Portal"),
+            ("r", "refresh"),
+        ],
+    ),
+    (
         "Global",
         &[
             ("r", "refresh"),
@@ -188,6 +200,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             (":cosmos", "enter cosmos mode"),
             (":keyvaults / :kv / :vaults", "enter key vault mode"),
             (":servicebus / :sb / :bus", "enter service bus mode"),
+            (":sql / :sqldb / :sqlpools", "enter azure sql mode"),
             (":apis", "back to apis list"),
             (":subscriptions / :subs", "subscription picker"),
             (":help / :h / :?", "open help"),
@@ -310,7 +323,7 @@ mod tests {
         // right-column footers further down — bump backend height if you add
         // sections that grow either column past ~30 lines.
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(100, 60);
+        let backend = TestBackend::new(100, 72);
         let mut term = Terminal::new(backend).unwrap();
         let state = AppState::new(Config::default());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -323,6 +336,7 @@ mod tests {
             s.contains("Service Bus"),
             "Service Bus section should render"
         );
+        assert!(s.contains("Azure SQL"), "Azure SQL section should render");
     }
 
     #[test]

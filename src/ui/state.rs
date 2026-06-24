@@ -43,6 +43,10 @@ pub enum Category {
     /// ARM `countDetails` block, so `Reader` suffices. See
     /// [`crate::azure::service_bus`].
     ServiceBus,
+    /// Azure SQL elastic pools + single databases, in one flat list, each with
+    /// a utilization-sparkline detail view. Control-plane discovery via
+    /// Resource Graph + Azure Monitor metrics. See [`crate::azure::sql`].
+    Sql,
 }
 
 impl Category {
@@ -56,6 +60,7 @@ impl Category {
         Category::Cosmos,
         Category::KeyVaults,
         Category::ServiceBus,
+        Category::Sql,
     ];
 
     /// The top-level list view for this category — the screen the user lands
@@ -69,6 +74,7 @@ impl Category {
             Category::Cosmos => View::CosmosAccounts,
             Category::KeyVaults => View::KeyVaults,
             Category::ServiceBus => View::ServiceBusNamespaces,
+            Category::Sql => View::SqlResources,
         }
     }
 
@@ -112,6 +118,7 @@ impl Category {
                         | View::ServiceBusEntities
                         | View::ServiceBusSubscriptions,
                 )
+                | (Category::Sql, View::SqlResources | View::SqlDetail)
         )
     }
 
@@ -153,6 +160,9 @@ impl Category {
             Category::ServiceBus => {
                 state.service_bus = ServiceBusCache::default();
             }
+            Category::Sql => {
+                state.sql = SqlCache::default();
+            }
         }
     }
 
@@ -167,6 +177,7 @@ impl Category {
             Category::Cosmos => state.cosmos.accounts_cursor = 0,
             Category::KeyVaults => state.key_vault.vaults_cursor = 0,
             Category::ServiceBus => state.service_bus.namespaces_cursor = 0,
+            Category::Sql => state.sql.cursor = 0,
         }
     }
 
@@ -185,6 +196,7 @@ impl Category {
             Category::Cosmos => &["cosmos"],
             Category::KeyVaults => &["keyvaults", "kv", "vaults"],
             Category::ServiceBus => &["servicebus", "sb", "bus"],
+            Category::Sql => &["sql", "sqldb", "sqlpools"],
         }
     }
 }
@@ -302,6 +314,14 @@ pub enum View {
     /// Subscriptions on the pinned topic, with their active / dead-letter
     /// counts. Opened with Enter from `ServiceBusEntities` while viewing topics.
     ServiceBusSubscriptions,
+    /// Top-level "Azure SQL" mode entry point — one flat list of elastic pools
+    /// and single databases across the selected subscriptions. Opened via the
+    /// `:sql` palette command (no keybind). Enter pins the row and opens
+    /// `SqlDetail`.
+    SqlResources,
+    /// Utilization-sparkline detail for the pinned pool / database: CPU %,
+    /// eDTU/DTU %, storage %, workers %. Opened with Enter from `SqlResources`.
+    SqlDetail,
     Help,
 }
 
@@ -1249,6 +1269,61 @@ impl ServiceBusCache {
     }
 }
 
+/// State for the Azure SQL category: one flat list of elastic pools + single
+/// databases (no drill chain), plus per-resource utilization metrics keyed by
+/// ARM id. The metrics fields mirror [`MetricsCache`] but are scoped to this
+/// category so a SQL detail refresh never collides with the Apis chart cache.
+#[derive(Clone, Default)]
+pub struct SqlCache {
+    /// All pools + databases discovered for the current subscription scope.
+    /// `Option` distinguishes "never fetched" from "fetched and empty".
+    pub resources: Option<Vec<crate::azure::sql::SqlResource>>,
+    pub pending: bool,
+    pub error: Option<String>,
+    pub cursor: usize,
+    pub filter: Input,
+    pub filter_active: bool,
+    /// Row the user drilled into — pinned so a background list refresh that
+    /// reorders the list can't retarget the open detail view.
+    pub selected: Option<crate::azure::sql::SqlResource>,
+
+    /// Utilization series keyed by SQL resource id.
+    pub metrics: HashMap<String, Vec<MetricSeries>>,
+    pub metrics_pending: HashSet<String>,
+    /// Per-resource, per-metric "missing" reasons (e.g. `dtu_consumption_percent`
+    /// absent on a vCore resource), so the detail view can explain a blank row.
+    pub metrics_missing: HashMap<String, HashMap<MetricKind, String>>,
+    /// Per-resource whole-fetch failures (mutually exclusive with `metrics`).
+    pub metrics_failures: HashMap<String, String>,
+    /// Currently-selected chart window; changed with `0`/`1`/`7` in the detail.
+    pub metrics_range: TimeRange,
+}
+
+impl SqlCache {
+    /// Apply `filter` to `resources` as a case-insensitive substring match on
+    /// the resource name or its logical server. Empty filter passes everything;
+    /// returns empty when nothing's been fetched yet.
+    pub fn filtered_resources(&self) -> Vec<&crate::azure::sql::SqlResource> {
+        let needle = self.filter.value().to_lowercase();
+        match self.resources.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|r| {
+                    needle.is_empty()
+                        || r.name.to_lowercase().contains(&needle)
+                        || r.server.to_lowercase().contains(&needle)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The row currently under the cursor in the filtered list.
+    pub fn selected_in_list(&self) -> Option<crate::azure::sql::SqlResource> {
+        self.filtered_resources().get(self.cursor).copied().cloned()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct LogsCache {
     /// keyed by resource id
@@ -1465,6 +1540,7 @@ pub struct AppState {
     pub cosmos: CosmosCache,
     pub key_vault: KeyVaultCache,
     pub service_bus: ServiceBusCache,
+    pub sql: SqlCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -1575,6 +1651,7 @@ impl AppState {
             cosmos: CosmosCache::default(),
             key_vault: KeyVaultCache::default(),
             service_bus: ServiceBusCache::default(),
+            sql: SqlCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -1669,6 +1746,28 @@ impl AppState {
             .filter(|r| !self.favorites_only || self.config.is_favorite(&r.id))
             .filter(|r| needle.is_empty() || is_subsequence(&needle, &r.name.to_lowercase()))
             .collect()
+    }
+
+    /// Re-anchor `list_cursor` after `resources` is replaced (e.g. by the 60s
+    /// autorefresh or a manual `r`). Because `list_cursor` indexes into
+    /// [`Self::filtered_resources`] — not the full `resources` vec — both the
+    /// restore and the clamp must happen in *filtered* index space. Clamping
+    /// against the full list instead lets an active filter strand the cursor
+    /// past the last visible row, which renders as a jump to the bottom that
+    /// then needs many `k` presses to climb out of (the highlight stays pinned
+    /// while the out-of-range index counts down). Restores to `anchor_id` if
+    /// that resource is still in the filtered set; otherwise just clamps.
+    pub fn restore_list_cursor(&mut self, anchor_id: Option<&str>) {
+        let filtered = self.filtered_resources();
+        let filtered_len = filtered.len();
+        let restored = anchor_id.and_then(|anchor| filtered.iter().position(|r| r.id == anchor));
+        drop(filtered);
+        if let Some(idx) = restored {
+            self.list_cursor = idx;
+        }
+        if self.list_cursor >= filtered_len {
+            self.list_cursor = filtered_len.saturating_sub(1);
+        }
     }
 
     /// Subscriptions matching the picker's `/`-search box, in original order.

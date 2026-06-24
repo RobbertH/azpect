@@ -188,6 +188,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             header_spans.push(hdr("NETWORK", max_network));
             header_spans.push(Span::raw("  "));
             header_spans.push(hdr("CREATED", DATE_COL_WIDTH));
+            header_spans.push(Span::raw("  "));
+            header_spans.push(hdr("MODIFIED", DATE_COL_WIDTH));
             let header_spans = clip_spans_to_width(header_spans, ha.width as usize, theme);
             frame.render_widget(Paragraph::new(Line::from(header_spans)), ha);
         }
@@ -195,6 +197,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let cursor = state.list_cursor.min(filtered.len() - 1);
         let visible = body_area.height as usize;
         let scroll = scroll_for(cursor, filtered.len(), visible);
+
+        // Sampled once per frame so every CREATED / MODIFIED cell tints against
+        // the same "now" (see `date_cell`).
+        let now = Utc::now();
 
         let lines: Vec<Line> = filtered
             .iter()
@@ -240,11 +246,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     width = max_rg
                 );
 
-                let created = format!(
-                    "{:<width$}",
-                    format_date(r.created_at.as_ref()),
-                    width = DATE_COL_WIDTH
-                );
+                let (created_text, created_color) = date_cell(r.created_at.as_ref(), now, theme);
+                let created = format!("{created_text:<DATE_COL_WIDTH$}");
+                let (modified_text, modified_color) = date_cell(r.modified_at.as_ref(), now, theme);
+                let modified = format!("{modified_text:<DATE_COL_WIDTH$}");
 
                 let mut spans = vec![
                     Span::raw(if selected { "▍ " } else { "  " }),
@@ -291,7 +296,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 spans.push(Span::styled(network, Style::default().fg(net_color)));
 
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled(created, Style::default().fg(theme.muted)));
+                spans.push(Span::styled(created, Style::default().fg(created_color)));
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(modified, Style::default().fg(modified_color)));
 
                 // Clip the assembled row to the visible width with a trailing `…`
                 // so a chopped-off column reads as truncated, not silently cut.
@@ -409,6 +416,29 @@ fn format_date(dt: Option<&DateTime<Utc>>) -> String {
     match dt {
         Some(d) => d.format("%Y-%m-%d").to_string(),
         None => String::new(),
+    }
+}
+
+/// `YYYY-MM-DD` plus a recency-tinted colour for the CREATED / MODIFIED columns,
+/// so a freshly-deployed or just-touched resource catches the eye against the
+/// muted older rows. Tiers (by age relative to `now`): under a week reads in
+/// `accent`, under a month in the normal `fg`, and older — or a `None`
+/// timestamp from a pre-`systemData` resource — stays `muted`. A timestamp that
+/// lands slightly in the future (minor clock skew) counts as freshest.
+fn date_cell(dt: Option<&DateTime<Utc>>, now: DateTime<Utc>, theme: &Theme) -> (String, Color) {
+    match dt {
+        Some(d) => {
+            let days = now.signed_duration_since(*d).num_days();
+            let color = if days < 7 {
+                theme.accent
+            } else if days < 30 {
+                theme.fg
+            } else {
+                theme.muted
+            };
+            (format_date(Some(d)), color)
+        }
+        None => (String::new(), theme.muted),
     }
 }
 
@@ -564,9 +594,20 @@ fn flex_widths(
     // favorite prefix (4), the gap after NAME, KIND with its trailing gap,
     // the badge + STATUS + 5xx block including its trailing gap (16), the
     // gaps after VERSION / RESOURCE GROUP / NETWORK, the extra gap before
-    // SUBSCRIPTION when shown, and the trailing CREATED column.
-    let fixed =
-        4 + 2 + KIND_COL_WIDTH + 2 + 16 + 2 + 2 + if show_sub { 2 } else { 0 } + 2 + DATE_COL_WIDTH;
+    // SUBSCRIPTION when shown, and the two trailing date columns (CREATED +
+    // MODIFIED), each with its leading gap.
+    let fixed = 4
+        + 2
+        + KIND_COL_WIDTH
+        + 2
+        + 16
+        + 2
+        + 2
+        + if show_sub { 2 } else { 0 }
+        + 2
+        + DATE_COL_WIDTH
+        + 2
+        + DATE_COL_WIDTH;
     let base = fixed + name + version + rg + network + if show_sub { sub } else { 0 };
     let mut slack = width.saturating_sub(base);
     for (col, want) in [
@@ -1273,7 +1314,7 @@ mod tests {
 
         // Slack covers only part of the deficit → NAME (highest priority)
         // absorbs all of it; RESOURCE GROUP waits its turn.
-        let base = 49 // fixed overhead with SUBSCRIPTION shown, see `flex_widths`
+        let base = 61 // fixed overhead with SUBSCRIPTION shown, see `flex_widths`
             + NAME_COL_WIDTH
             + VERSION_COL_WIDTH
             + RG_COL_WIDTH
@@ -1286,9 +1327,10 @@ mod tests {
 
     /// Pins `flex_widths`' fixed-overhead constant to the real row layout: at
     /// a width that *exactly* fits the grown NAME column, the full name and
-    /// the full CREATED date must both render. If the constant overcounts,
-    /// NAME comes up short and keeps its ellipsis; if it undercounts, the row
-    /// overflows and CREATED gets clipped.
+    /// both the CREATED and the trailing MODIFIED date must render. If the
+    /// constant overcounts, NAME comes up short and keeps its ellipsis; if it
+    /// undercounts, the row overflows and the trailing MODIFIED date gets
+    /// clipped.
     #[test]
     fn flex_widths_fixed_overhead_matches_row_layout() {
         use chrono::TimeZone;
@@ -1296,11 +1338,12 @@ mod tests {
         let mut state = AppState::new(Config::default());
         let mut res = r("/r/long", &"n".repeat(50), ResourceKind::ContainerApp);
         res.created_at = Some(Utc.with_ymd_and_hms(2024, 1, 15, 0, 0, 0).unwrap());
+        res.modified_at = Some(Utc.with_ymd_and_hms(2024, 2, 20, 0, 0, 0).unwrap());
         state.resources = vec![res];
         // Inner width exactly fits NAME grown to 50: base layout with the
-        // SUBSCRIPTION column (49 fixed + 112 base columns) + NAME's 14-char
-        // deficit = 175, plus 2 for the block borders.
-        let backend = TestBackend::new(177, 8);
+        // SUBSCRIPTION column (61 fixed + 112 base columns) + NAME's 14-char
+        // deficit = 187, plus 2 for the block borders.
+        let backend = TestBackend::new(189, 8);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
@@ -1309,6 +1352,50 @@ mod tests {
             s.contains("2024-01-15"),
             "expected full CREATED date in {s}"
         );
+        assert!(
+            s.contains("2024-02-20"),
+            "expected full MODIFIED date in {s}"
+        );
+    }
+
+    #[test]
+    fn date_cell_tints_by_recency() {
+        use chrono::TimeZone;
+        let theme = Theme::catppuccin_mocha();
+        let now = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
+
+        // Under a week → accent; under a month → fg; older → muted.
+        assert_eq!(
+            date_cell(Some(&(now - chrono::Duration::days(2))), now, &theme).1,
+            theme.accent
+        );
+        assert_eq!(
+            date_cell(Some(&(now - chrono::Duration::days(20))), now, &theme).1,
+            theme.fg
+        );
+        assert_eq!(
+            date_cell(Some(&(now - chrono::Duration::days(90))), now, &theme).1,
+            theme.muted
+        );
+
+        // Missing timestamp → blank text, muted.
+        let (text, color) = date_cell(None, now, &theme);
+        assert!(text.is_empty());
+        assert_eq!(color, theme.muted);
+    }
+
+    #[test]
+    fn renders_modified_column() {
+        use chrono::TimeZone;
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(200, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.resources[0].modified_at = Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("MODIFIED"), "expected MODIFIED header in {s}");
+        assert!(s.contains("2026-06-01"), "expected modified date in {s}");
     }
 
     #[test]
@@ -1468,5 +1555,41 @@ mod tests {
         let mut state = fixture();
         assert!(handle(Action::ToggleFavoritesOnly, &mut state));
         assert!(state.favorites_only);
+    }
+
+    #[test]
+    fn restore_list_cursor_reanchors_in_filtered_space() {
+        // Regression: the 60s autorefresh (and manual `r`) restores the cursor
+        // to the last-selected resource after replacing `resources`. With a
+        // filter active, restoring/clamping against the *full* list left the
+        // cursor past the last visible row — the highlight pinned to the bottom
+        // and needed many `k` presses to climb out. The restore must happen in
+        // filtered-index space.
+        let mut state = fixture();
+        // Filter to a single match ("beta-apim" at full index 1) so the full
+        // and filtered index spaces diverge.
+        state.list_filter = tui_input::Input::new("beta".to_string());
+        assert_eq!(state.filtered_resources().len(), 1);
+
+        // Anchor on the resource at full index 2, which is *not* in the
+        // filtered set: the cursor must clamp to the single filtered row, not
+        // jump to full index 2 (which would render as a bottom-clamped ghost).
+        state.list_cursor = 99;
+        state.restore_list_cursor(Some("/r/three"));
+        assert_eq!(state.list_cursor, 0);
+        assert!(state.selected_resource().is_some());
+
+        // Anchor on the resource that *is* in the filtered set → restore to its
+        // filtered index (0 here), regardless of its full-list index (1).
+        state.list_cursor = 99;
+        state.restore_list_cursor(Some("/r/two"));
+        assert_eq!(state.list_cursor, 0);
+
+        // No filter, no anchor: a stale out-of-range cursor still clamps to the
+        // last row of the full list.
+        state.list_filter.reset();
+        state.list_cursor = 99;
+        state.restore_list_cursor(None);
+        assert_eq!(state.list_cursor, state.resources.len() - 1);
     }
 }

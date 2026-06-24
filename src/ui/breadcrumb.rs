@@ -275,6 +275,16 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s.push("subscriptions".to_string());
             s
         }
+
+        View::SqlResources => vec![subscription_segment(state), "azure sql".to_string()],
+
+        View::SqlDetail => {
+            let mut s = vec![subscription_segment(state), "azure sql".to_string()];
+            if let Some(r) = state.sql.selected.as_ref() {
+                s.push(format!("{}/{}", r.server, r.name));
+            }
+            s
+        }
     }
 }
 

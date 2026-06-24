@@ -453,6 +453,11 @@ async fn event_loop(
                     state.cosmos.containers_cursor = 0;
                     continue;
                 }
+                if should_forward_to_sql_filter(state, key) {
+                    state.sql.filter.handle_event(&CtEvent::Key(key));
+                    state.sql.cursor = 0;
+                    continue;
+                }
                 if should_forward_to_key_vaults_filter(state, key) {
                     state
                         .key_vault
@@ -532,7 +537,9 @@ async fn event_loop(
                         if let Some(last) = state.selected_subscription.clone() {
                             if let Some(idx) = state.subscriptions.iter().position(|s| s.id == last)
                             {
-                                state.subscription_cursor = idx;
+                                // Row 0 is the synthetic "All subscriptions" scope,
+                                // so the matching subscription renders at idx + 1.
+                                state.subscription_cursor = idx + 1;
                             }
                         }
                         // No subs visible to this credential is almost always
@@ -570,21 +577,27 @@ async fn event_loop(
                 state.loading_resources = false;
                 match res {
                     Ok(rs) => {
+                        // `list_cursor` indexes into `filtered_resources()`, not
+                        // the full `resources` vec, so the cursor restore/clamp
+                        // below must work in filtered-index space — otherwise an
+                        // active filter (where the two spaces diverge) leaves the
+                        // cursor pointing past the visible rows. Capture the row
+                        // the user was actually on before swapping in the reload.
+                        let anchor_id = state
+                            .selected_resource()
+                            .map(|r| r.id.clone())
+                            .or_else(|| state.config.last_resource_id.clone());
                         state.resources = rs;
                         // Stamp the load time for the "updated Xs ago" indicator
                         // and to re-arm the auto-refresh interval (see
                         // `maybe_auto_refresh`).
                         state.resources_loaded_at = Some(Instant::now());
-                        // Restore the cursor to the last-selected resource if
-                        // it's still in the loaded set; otherwise clamp.
-                        if let Some(last) = state.config.last_resource_id.as_deref() {
-                            if let Some(idx) = state.resources.iter().position(|r| r.id == last) {
-                                state.list_cursor = idx;
-                            }
-                        }
-                        if state.list_cursor >= state.resources.len() {
-                            state.list_cursor = state.resources.len().saturating_sub(1);
-                        }
+                        // Restore the cursor to the previously-selected resource
+                        // if it survived the reload (and the active filter);
+                        // otherwise clamp to the filtered list so a 60s
+                        // autorefresh under a filter can't strand the cursor
+                        // below the last visible row.
+                        state.restore_list_cursor(anchor_id.as_deref());
                         // Per-row badges derive from the health fetch (availability
                         // + a fixed-24h Errors+Traffic window). Chart metrics are
                         // fetched lazily on detail entry, not eagerly per row.
@@ -1072,6 +1085,47 @@ async fn event_loop(
                     Err(e) => {
                         state.cosmos.items.remove(&key);
                         state.cosmos.items_error.insert(key, e);
+                    }
+                }
+            }
+            AppEvent::SqlResourcesLoaded(res) => {
+                state.sql.pending = false;
+                match res {
+                    Ok(rows) => {
+                        state.sql.error = None;
+                        if !rows.is_empty() && state.sql.cursor >= rows.len() {
+                            state.sql.cursor = rows.len() - 1;
+                        }
+                        state.sql.resources = Some(rows);
+                    }
+                    Err(e) => {
+                        state.sql.resources = None;
+                        state.sql.error = Some(e);
+                    }
+                }
+            }
+            AppEvent::SqlMetricsLoaded {
+                resource_id,
+                result,
+            } => {
+                state.sql.metrics_pending.remove(&resource_id);
+                match result {
+                    Ok(r) => {
+                        state.sql.metrics_failures.remove(&resource_id);
+                        if r.missing.is_empty() {
+                            state.sql.metrics_missing.remove(&resource_id);
+                        } else {
+                            state
+                                .sql
+                                .metrics_missing
+                                .insert(resource_id.clone(), r.missing);
+                        }
+                        state.sql.metrics.insert(resource_id, r.series);
+                    }
+                    Err(e) => {
+                        state.sql.metrics.remove(&resource_id);
+                        state.sql.metrics_missing.remove(&resource_id);
+                        state.sql.metrics_failures.insert(resource_id, e);
                     }
                 }
             }
@@ -1568,6 +1622,21 @@ fn should_forward_to_tags_filter(state: &AppState, key: crossterm::event::KeyEve
 }
 
 /// Mirror of `should_forward_to_filter` for the cosmos-accounts name filter.
+/// Mirror of `should_forward_to_filter` for the flat Azure SQL list filter.
+fn should_forward_to_sql_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::SqlResources
+        && state.sql.filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 fn should_forward_to_cosmos_accounts_filter(
     state: &AppState,
     key: crossterm::event::KeyEvent,
@@ -1901,7 +1970,8 @@ fn decide_action(
         || (state.view == View::ServiceBusSubscriptions
             && state.service_bus.subscriptions_filter_active)
         || (state.view == View::ApimApis && state.apim.apis_filter_active)
-        || (state.view == View::ApimOperations && state.apim.operations_filter_active);
+        || (state.view == View::ApimOperations && state.apim.operations_filter_active)
+        || (state.view == View::SqlResources && state.sql.filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -1969,6 +2039,8 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::ServiceBusSubscriptions => {
             crate::ui::views::service_bus_subscriptions::handle(action, state)
         }
+        View::SqlResources => crate::ui::views::sql_resources::handle(action, state),
+        View::SqlDetail => crate::ui::views::sql_detail::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -2450,6 +2522,19 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_namespace
             .as_ref()
             .map(|n| format!("{PORTAL_BASE}{}", n.id)),
+        // Azure SQL: the flat list opens the highlighted pool/database blade;
+        // the detail view opens the pinned resource. Both land on the resource
+        // overview, where the portal's Metrics blade is one click away.
+        View::SqlResources => state
+            .sql
+            .filtered_resources()
+            .get(state.sql.cursor)
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        View::SqlDetail => state
+            .sql
+            .selected
+            .as_ref()
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         View::Help => None,
     }
 }
@@ -2657,6 +2742,13 @@ fn yank_target(state: &AppState) -> Option<String> {
                 .get(state.service_bus.subscriptions_cursor)
                 .map(|s| format!("{}/{}/{}", ns.name, topic, s.name))
         }
+        // Azure SQL: yank the highlighted/pinned resource's ARM id.
+        View::SqlResources => state
+            .sql
+            .filtered_resources()
+            .get(state.sql.cursor)
+            .map(|r| r.id.clone()),
+        View::SqlDetail => state.sql.selected.as_ref().map(|r| r.id.clone()),
         View::Help => None,
     }
 }
@@ -2809,6 +2901,8 @@ fn semantic_parent(view: View) -> Option<View> {
         View::ServiceBusNamespaces => Some(View::Subscriptions),
         View::ServiceBusEntities => Some(View::ServiceBusNamespaces),
         View::ServiceBusSubscriptions => Some(View::ServiceBusEntities),
+        View::SqlResources => Some(View::Subscriptions),
+        View::SqlDetail => Some(View::SqlResources),
     }
 }
 
@@ -3321,6 +3415,37 @@ fn kick_off_loads_for_view(
                 spawn_load_cosmos_accounts(auth.clone(), sub_ids, tx.clone());
             }
         }
+        View::SqlResources => {
+            let cached = state.sql.resources.is_some();
+            let in_flight = state.sql.pending;
+            if force || (!cached && !in_flight) {
+                let sub_ids = match &state.selected_subscription {
+                    Some(id) => vec![id.clone()],
+                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                };
+                if force {
+                    state.sql.resources = None;
+                    state.sql.error = None;
+                }
+                state.sql.pending = true;
+                spawn_load_sql_resources(auth.clone(), sub_ids, tx.clone());
+            }
+        }
+        View::SqlDetail => {
+            if let Some(resource) = state.sql.selected.clone() {
+                let id = resource.id.clone();
+                let cached = state.sql.metrics.contains_key(&id);
+                let in_flight = state.sql.metrics_pending.contains(&id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.sql.metrics.remove(&id);
+                        state.sql.metrics_failures.remove(&id);
+                    }
+                    state.sql.metrics_pending.insert(id.clone());
+                    spawn_load_sql_metrics(auth.clone(), id, state.sql.metrics_range, tx.clone());
+                }
+            }
+        }
         View::CosmosDatabases => {
             if let Some(account) = state.cosmos.selected_account.clone() {
                 let cached = state.cosmos.databases.contains_key(&account.id);
@@ -3607,6 +3732,8 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::ServiceBusSubscriptions => {
             crate::ui::views::service_bus_subscriptions::render(f, view_area, state, theme)
         }
+        View::SqlResources => crate::ui::views::sql_resources::render(f, view_area, state, theme),
+        View::SqlDetail => crate::ui::views::sql_detail::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -5080,6 +5207,45 @@ fn spawn_load_tags(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::RegistryTagsLoaded { key, result });
+    });
+}
+
+fn spawn_load_sql_resources(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlResourcesLoaded(Ok(
+            crate::azure::demo::sql_resources(&sub_ids),
+        )));
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql::list_sql_resources(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlResourcesLoaded(result));
+    });
+}
+
+fn spawn_load_sql_metrics(
+    auth: AzureAuth,
+    resource_id: String,
+    range: TimeRange,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlMetricsLoaded {
+            resource_id: resource_id.clone(),
+            result: Ok(crate::azure::demo::sql_metrics(&resource_id, range)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql::fetch_metrics(&auth, &resource_id, range)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlMetricsLoaded {
+            resource_id,
+            result,
+        });
     });
 }
 

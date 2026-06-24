@@ -211,6 +211,17 @@ pub enum AppEvent {
         key: String,
         result: Result<crate::azure::cosmos::CosmosItemPreview, String>,
     },
+    /// Background load completion: flat list of Azure SQL elastic pools +
+    /// single databases for the current subscription scope. Resource Graph
+    /// control-plane call.
+    SqlResourcesLoaded(Result<Vec<crate::azure::sql::SqlResource>, String>),
+    /// Background load completion: utilization metrics for one pool / database,
+    /// keyed by ARM id. Mirrors [`AppEvent::MetricsLoaded`] but scoped to the
+    /// SQL category's cache.
+    SqlMetricsLoaded {
+        resource_id: String,
+        result: Result<crate::azure::metrics::MetricsResult, String>,
+    },
     /// Background load completion: list of Key Vaults for the current
     /// subscription scope. Resource Graph control-plane call.
     KeyVaultsLoaded(Result<Vec<crate::azure::key_vault::KeyVault>, String>),

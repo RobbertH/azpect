@@ -39,6 +39,7 @@ use crate::azure::resources::{Resource, ResourceKind, ResourceMeta};
 use crate::azure::service_bus::{
     CountDetails, ServiceBusNamespace, ServiceBusQueue, ServiceBusSubscription, ServiceBusTopic,
 };
+use crate::azure::sql::{SqlKind, SqlResource};
 use crate::azure::storage::{
     Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, StorageAccount,
     StorageAccountStats,
@@ -978,6 +979,141 @@ pub fn tags(_repository: &str) -> Vec<Tag> {
 // Cosmos DB
 // ---------------------------------------------------------------------------
 
+/// Flat list of demo Azure SQL resources: a couple of elastic pools and a few
+/// single databases (one of them pooled), spread across the demo subscriptions.
+pub fn sql_resources(sub_ids: &[String]) -> Vec<SqlResource> {
+    let sql_id = |sub: &str, rg: &str, server: &str, leaf: &str| {
+        resource_id(sub, rg, &format!("Microsoft.Sql/servers/{server}"), leaf)
+    };
+    let pool_a_id = sql_id(
+        SUB_PROD,
+        "rg-commerce-prod",
+        "sql-contoso-prod",
+        "elasticPools/pool-prod",
+    );
+    let mut all = vec![
+        SqlResource {
+            id: pool_a_id.clone(),
+            name: "pool-prod".to_string(),
+            server: "sql-contoso-prod".to_string(),
+            resource_group: "rg-commerce-prod".to_string(),
+            subscription_id: SUB_PROD.to_string(),
+            location: LOCATION.to_string(),
+            kind: SqlKind::ElasticPool,
+            sku_name: Some("GP_Gen5".to_string()),
+            sku_tier: Some("GeneralPurpose".to_string()),
+            capacity: Some(8),
+            status: Some("Ready".to_string()),
+            elastic_pool_id: None,
+            max_size_bytes: Some(268_435_456_000),
+        },
+        SqlResource {
+            id: sql_id(
+                SUB_PROD,
+                "rg-commerce-prod",
+                "sql-contoso-prod",
+                "databases/orders",
+            ),
+            name: "orders".to_string(),
+            server: "sql-contoso-prod".to_string(),
+            resource_group: "rg-commerce-prod".to_string(),
+            subscription_id: SUB_PROD.to_string(),
+            location: LOCATION.to_string(),
+            kind: SqlKind::Database,
+            sku_name: Some("GP_Gen5_2".to_string()),
+            sku_tier: Some("GeneralPurpose".to_string()),
+            capacity: Some(2),
+            status: Some("Online".to_string()),
+            // Member of the prod pool above.
+            elastic_pool_id: Some(pool_a_id),
+            max_size_bytes: Some(34_359_738_368),
+        },
+        SqlResource {
+            id: sql_id(
+                SUB_PROD,
+                "rg-commerce-prod",
+                "sql-contoso-prod",
+                "databases/inventory",
+            ),
+            name: "inventory".to_string(),
+            server: "sql-contoso-prod".to_string(),
+            resource_group: "rg-commerce-prod".to_string(),
+            subscription_id: SUB_PROD.to_string(),
+            location: LOCATION.to_string(),
+            kind: SqlKind::Database,
+            sku_name: Some("S3".to_string()),
+            sku_tier: Some("Standard".to_string()),
+            capacity: Some(100),
+            status: Some("Online".to_string()),
+            elastic_pool_id: None,
+            max_size_bytes: Some(268_435_456_000),
+        },
+        SqlResource {
+            id: sql_id(
+                SUB_STAGING,
+                "rg-commerce-staging",
+                "sql-contoso-staging",
+                "databases/orders",
+            ),
+            name: "orders".to_string(),
+            server: "sql-contoso-staging".to_string(),
+            resource_group: "rg-commerce-staging".to_string(),
+            subscription_id: SUB_STAGING.to_string(),
+            location: LOCATION.to_string(),
+            kind: SqlKind::Database,
+            sku_name: Some("Basic".to_string()),
+            sku_tier: Some("Basic".to_string()),
+            capacity: Some(5),
+            status: Some("Paused".to_string()),
+            elastic_pool_id: None,
+            max_size_bytes: Some(2_147_483_648),
+        },
+    ];
+    all.retain(|r| in_subs(&r.subscription_id, sub_ids));
+    all
+}
+
+/// Synthesized utilization metrics for a demo SQL pool / database, shaped
+/// exactly like [`crate::azure::sql::fetch_metrics`] would return them. Basic
+/// (DTU) tier resources omit the workers metric to exercise the `missing` path.
+pub fn sql_metrics(resource_id: &str, range: TimeRange) -> MetricsResult {
+    let seed = seed_for(resource_id);
+    let pct = |base: f64, amp: f64| {
+        move |_i: usize, wave: f64, nz: f64| (base + amp * wave + 6.0 * nz).clamp(0.0, 100.0)
+    };
+    let series = vec![
+        series(MetricKind::Cpu, "CPU", "%", range, seed, pct(22.0, 50.0)),
+        series(
+            MetricKind::Dtu,
+            "eDTU",
+            "%",
+            range,
+            seed.wrapping_add(1),
+            pct(30.0, 45.0),
+        ),
+        series(
+            MetricKind::Storage,
+            "Storage",
+            "%",
+            range,
+            seed.wrapping_add(2),
+            pct(58.0, 4.0),
+        ),
+        series(
+            MetricKind::Workers,
+            "Workers",
+            "%",
+            range,
+            seed.wrapping_add(3),
+            pct(12.0, 30.0),
+        ),
+    ];
+    MetricsResult {
+        series,
+        missing: HashMap::new(),
+    }
+}
+
 pub fn cosmos_accounts(sub_ids: &[String]) -> Vec<CosmosAccount> {
     let mut all = vec![CosmosAccount {
         id: resource_id(
@@ -1531,6 +1667,42 @@ mod tests {
         assert!(rs.iter().all(|r| r.subscription_id == SUB_STAGING));
         // Empty filter = everything.
         assert!(resources(&[]).len() > rs.len());
+    }
+
+    #[test]
+    fn sql_resources_cover_both_kinds_belong_to_subs_and_have_metrics() {
+        let subs: Vec<String> = subscriptions().into_iter().map(|s| s.id).collect();
+        let all = sql_resources(&[]);
+        assert!(all.iter().any(|r| r.kind == SqlKind::ElasticPool), "a pool");
+        assert!(
+            all.iter().any(|r| r.kind == SqlKind::Database),
+            "a database"
+        );
+        // A pooled database points at a pool that exists in the list.
+        let pool_ids: Vec<&str> = all
+            .iter()
+            .filter(|r| r.kind == SqlKind::ElasticPool)
+            .map(|r| r.id.as_str())
+            .collect();
+        for r in &all {
+            assert!(subs.contains(&r.subscription_id), "{} bad sub", r.name);
+            assert!(r.id.contains("/servers/"), "{} id has no server", r.name);
+            if let Some(pool) = r.elastic_pool_id.as_deref() {
+                assert!(
+                    pool_ids.contains(&pool),
+                    "{} points at unknown pool",
+                    r.name
+                );
+            }
+            // Every resource yields the four utilization series in demo mode.
+            let m = sql_metrics(&r.id, TimeRange::Day);
+            assert_eq!(m.series.len(), 4, "{} metric count", r.name);
+            assert!(m.series.iter().all(|s| s.unit == "%"));
+        }
+        // Subscription filter scopes the list.
+        let staging = sql_resources(&[SUB_STAGING.to_string()]);
+        assert!(!staging.is_empty());
+        assert!(staging.iter().all(|r| r.subscription_id == SUB_STAGING));
     }
 
     #[test]
