@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
 
-use super::{name_col_width, truncate_ellipsis};
+use super::{col_width, truncate_ellipsis};
 use crate::azure::sql::{SqlKind, SqlResource};
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
@@ -109,31 +109,22 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         Some(_) => {
             let show_sub_cols = state.selected_subscription.is_none();
+            let layout = plan_columns(&filtered, body_area.width, show_sub_cols, state);
 
-            // NAME absorbs the leftover width; `fixed_w` sums the Length()s
-            // below — keep them in sync.
-            let fixed_w: u16 = 10 + 28 + 16 + 8 + 12 + if show_sub_cols { 22 } else { 0 };
-            let n_cols: u16 = if show_sub_cols { 7 } else { 6 };
-            let longest = filtered
-                .iter()
-                .map(|r| r.name.chars().count() as u16)
-                .max()
-                .unwrap_or(0);
-            let name_w = name_col_width(body_area.width, fixed_w, n_cols, longest);
-
-            let mut widths: Vec<Constraint> = vec![
-                Constraint::Length(name_w), // NAME
-                Constraint::Length(10),     // KIND
-                Constraint::Length(28),     // SERVER
-                Constraint::Length(16),     // SKU
-                Constraint::Length(8),      // CAP
-                Constraint::Length(12),     // STATUS
-            ];
-            let mut headers: Vec<&'static str> =
-                vec!["NAME", "KIND", "SERVER", "SKU", "CAP", "STATUS"];
-            if show_sub_cols {
-                widths.push(Constraint::Length(22));
-                headers.push("SUB NAME");
+            let mut widths: Vec<Constraint> = vec![Constraint::Length(layout.name_w)];
+            let mut headers: Vec<&'static str> = vec!["NAME"];
+            for (w, header) in [
+                (layout.kind, "KIND"),
+                (layout.server, "SERVER"),
+                (layout.sku, "SKU"),
+                (layout.cap, "CAP"),
+                (layout.status, "STATUS"),
+                (layout.sub, "SUB NAME"),
+            ] {
+                if let Some(w) = w {
+                    widths.push(Constraint::Length(w));
+                    headers.push(header);
+                }
             }
 
             let header_row = Row::new(headers).style(
@@ -145,7 +136,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.sql.cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|r| build_row(r, state, show_sub_cols, name_w, theme))
+                .map(|r| build_row(r, state, &layout, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -163,11 +154,107 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     render_footer(frame, chunks[1], theme);
 }
 
+/// Chosen widths for one render. NAME is mandatory; every other column is
+/// `Some(width)` when it earned a slot or `None` when it was dropped to keep the
+/// table inside the terminal. See [`plan_columns`].
+struct ColLayout {
+    name_w: u16,
+    kind: Option<u16>,
+    server: Option<u16>,
+    sku: Option<u16>,
+    cap: Option<u16>,
+    status: Option<u16>,
+    sub: Option<u16>,
+}
+
+/// Decide column widths for the SQL table. NAME is sacred — it's the only column
+/// that uniquely identifies a row — so it's never ellipsized: it gets its full
+/// longest value and the remaining columns are added in importance order, each
+/// only if it still fits. The least important (SUB NAME, then SERVER, …) are the
+/// first to be dropped on a narrow terminal, rather than chopping NAME into an
+/// unreadable stub. NAME is clipped only in the degenerate case where it alone
+/// exceeds the terminal width.
+fn plan_columns(
+    filtered: &[&SqlResource],
+    area_width: u16,
+    show_sub_cols: bool,
+    state: &AppState,
+) -> ColLayout {
+    let max_len = |f: &dyn Fn(&SqlResource) -> usize| -> u16 {
+        filtered.iter().map(|r| f(r) as u16).max().unwrap_or(0)
+    };
+    let kind_w = col_width("KIND", max_len(&|r| r.kind.short_tag().chars().count()), 10);
+    let server_w = col_width("SERVER", max_len(&|r| r.server.chars().count()), 28);
+    let sku_w = col_width(
+        "SKU",
+        max_len(&|r| r.sku_name.as_deref().unwrap_or("").chars().count()),
+        16,
+    );
+    let cap_w = col_width(
+        "CAP",
+        max_len(&|r| r.capacity.map_or(0, |c| c.to_string().len())),
+        8,
+    );
+    let status_w = col_width(
+        "STATUS",
+        max_len(&|r| r.status.as_deref().unwrap_or("—").chars().count()),
+        12,
+    );
+    let sub_w = if show_sub_cols {
+        col_width(
+            "SUB NAME",
+            max_len(&|r| {
+                subscription_display_name(state, &r.subscription_id)
+                    .unwrap_or("")
+                    .chars()
+                    .count()
+            }),
+            22,
+        )
+    } else {
+        0
+    };
+
+    // Chrome before any cell: the selection symbol "▍ " (2 cols). Each column
+    // also costs 2 cols of spacing to its left neighbour.
+    let longest_name = max_len(&|r| r.name.chars().count());
+    let name_budget = area_width.saturating_sub(2);
+    let name_w = longest_name.max(4).min(name_budget.max(4));
+
+    // Display-order slots: 0 KIND, 1 SERVER, 2 SKU, 3 CAP, 4 STATUS, 5 SUB NAME.
+    let widths = [kind_w, server_w, sku_w, cap_w, status_w, sub_w];
+    let mut kept = [None; 6];
+    // Importance order (most important first), as display-slot indices. We add
+    // columns until one no longer fits, then stop — so the kept set is always a
+    // prefix of this ranking: a less important column never survives while a more
+    // important one is dropped. SUB NAME (5) is therefore the first to go.
+    let mut used = 2 + name_w;
+    for &slot in &[0usize, 4, 2, 3, 1, 5] {
+        let w = widths[slot];
+        if w == 0 {
+            continue; // hidden column (SUB NAME when a single sub is selected)
+        }
+        if used + 2 + w > area_width {
+            break;
+        }
+        used += 2 + w;
+        kept[slot] = Some(w);
+    }
+    ColLayout {
+        name_w,
+        kind: kept[0],
+        server: kept[1],
+        sku: kept[2],
+        cap: kept[3],
+        status: kept[4],
+        sub: kept[5],
+    }
+}
+
 fn build_row<'a>(
     r: &'a SqlResource,
     state: &'a AppState,
-    show_sub_cols: bool,
-    name_w: u16,
+    layout: &ColLayout,
     theme: &Theme,
 ) -> Row<'a> {
     // Pools and databases get distinct accents so the flat list stays scannable.
@@ -175,37 +262,52 @@ fn build_row<'a>(
         SqlKind::ElasticPool => theme.accent,
         SqlKind::Database => theme.fg,
     };
-    let status = match r.status.as_deref() {
+    let status_style = match r.status.as_deref() {
         Some(s) if s.eq_ignore_ascii_case("online") || s.eq_ignore_ascii_case("ready") => {
-            Cell::from(s.to_string()).style(Style::default().fg(theme.healthy))
+            Style::default().fg(theme.healthy)
         }
         Some(s) if s.eq_ignore_ascii_case("paused") || s.eq_ignore_ascii_case("disabled") => {
-            Cell::from(s.to_string()).style(Style::default().fg(theme.idle))
+            Style::default().fg(theme.idle)
         }
-        Some(s) => Cell::from(s.to_string()).style(Style::default().fg(theme.fg)),
-        None => Cell::from("—").style(Style::default().fg(theme.muted)),
-    };
-    let cap = match r.capacity {
-        Some(c) => c.to_string(),
-        None => String::new(),
+        Some(_) => Style::default().fg(theme.fg),
+        None => Style::default().fg(theme.muted),
     };
 
     let mut cells: Vec<Cell> = vec![
-        Cell::from(truncate_ellipsis(&r.name, name_w as usize))
+        Cell::from(truncate_ellipsis(&r.name, layout.name_w as usize))
             .style(Style::default().fg(theme.fg)),
-        Cell::from(r.kind.short_tag()).style(Style::default().fg(kind_color)),
-        Cell::from(truncate_ellipsis(&r.server, 28)).style(Style::default().fg(theme.muted)),
-        Cell::from(r.sku_name.clone().unwrap_or_default()).style(Style::default().fg(theme.muted)),
-        Cell::from(cap).style(Style::default().fg(theme.muted)),
-        status,
     ];
-    if show_sub_cols {
+    if layout.kind.is_some() {
+        cells.push(Cell::from(r.kind.short_tag()).style(Style::default().fg(kind_color)));
+    }
+    if let Some(w) = layout.server {
         cells.push(
-            Cell::from(
-                subscription_display_name(state, &r.subscription_id)
-                    .unwrap_or("")
-                    .to_string(),
-            )
+            Cell::from(truncate_ellipsis(&r.server, w as usize))
+                .style(Style::default().fg(theme.muted)),
+        );
+    }
+    if let Some(w) = layout.sku {
+        cells.push(
+            Cell::from(truncate_ellipsis(
+                r.sku_name.as_deref().unwrap_or(""),
+                w as usize,
+            ))
+            .style(Style::default().fg(theme.muted)),
+        );
+    }
+    if layout.cap.is_some() {
+        let cap = r.capacity.map(|c| c.to_string()).unwrap_or_default();
+        cells.push(Cell::from(cap).style(Style::default().fg(theme.muted)));
+    }
+    if layout.status.is_some() {
+        cells.push(Cell::from(r.status.as_deref().unwrap_or("—").to_string()).style(status_style));
+    }
+    if let Some(w) = layout.sub {
+        cells.push(
+            Cell::from(truncate_ellipsis(
+                subscription_display_name(state, &r.subscription_id).unwrap_or(""),
+                w as usize,
+            ))
             .style(Style::default().fg(theme.muted)),
         );
     }
@@ -352,6 +454,57 @@ mod tests {
         assert!(buf.contains("pool-a"), "name renders");
         assert!(buf.contains("Pool"), "kind tag renders");
         assert!(buf.contains("Ready"), "status renders");
+    }
+
+    #[test]
+    fn narrow_terminal_shows_full_name_and_drops_sub_column() {
+        // Regression: on a narrow terminal NAME used to be chopped into a 3-char
+        // ellipsis ("D36…") while every other column kept its slot. NAME is now
+        // never ellipsized — the least important columns (SUB NAME first) are
+        // dropped to make room.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(72, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // Distinct subscriptions so SUB NAME would otherwise show (show_sub_cols).
+        let mut a = pool("database-with-a-long-name");
+        a.server = "imecd365replicationv2".into();
+        let mut b = pool("other");
+        b.subscription_id = "s2".into();
+        state.sql.resources = Some(vec![a, b]);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        // NAME renders in full, with no ellipsis anywhere in the buffer.
+        assert!(
+            buf.contains("database-with-a-long-name"),
+            "name renders in full"
+        );
+        assert!(!buf.contains('\u{2026}'), "nothing is ellipsized");
+        // The least important column was dropped to make room.
+        assert!(
+            !buf.contains("SUB NAME"),
+            "SUB NAME column dropped when cramped"
+        );
+    }
+
+    #[test]
+    fn plan_columns_drops_sub_before_chopping_name() {
+        let state = fixture();
+        let mut a = pool("a-fairly-long-database-name");
+        a.server = "imecd365replicationv2".into();
+        let resources = [a];
+        let filtered: Vec<&SqlResource> = resources.iter().collect();
+        // Wide enough for NAME but not every column.
+        let layout = plan_columns(&filtered, 60, true, &state);
+        assert_eq!(
+            layout.name_w as usize,
+            "a-fairly-long-database-name".len(),
+            "NAME gets its full width"
+        );
+        assert!(
+            layout.sub.is_none(),
+            "SUB NAME dropped first on a tight budget"
+        );
     }
 
     #[test]

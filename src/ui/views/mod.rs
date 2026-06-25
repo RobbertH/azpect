@@ -29,6 +29,15 @@ pub(crate) fn truncate_ellipsis(s: &str, max: usize) -> String {
 /// (NAME included); `longest` is the longest name in chars. Floors at 4 so the
 /// "NAME" header always reads. Pair with [`truncate_ellipsis`] on the cell text
 /// so an over-budget name shows the cut.
+/// Width for a fixed (non-NAME) table column: the wider of its header and its
+/// widest value, capped at `cap`. Sizing to the actual content frees slack for
+/// the NAME column instead of reserving a generous fixed width that starves NAME
+/// into an unreadable 3-char ellipsis on a narrow terminal. `longest_value` is
+/// the widest value in chars; pass 0 when the column is empty.
+pub(crate) fn col_width(header: &str, longest_value: u16, cap: u16) -> u16 {
+    longest_value.max(header.chars().count() as u16).min(cap)
+}
+
 pub(crate) fn name_col_width(area_width: u16, fixed_w: u16, n_cols: u16, longest: u16) -> u16 {
     // Chrome the table eats before columns: the selection symbol ("▍ ", 2 cols)
     // plus 2 cols of spacing between each adjacent column.
