@@ -17,6 +17,11 @@ pub struct Theme {
     /// "no traffic" at a glance, but not alarming like `degraded`.
     pub idle: Color,
     pub degraded: Color,
+    /// HTTP 4xx client errors: worth seeing but usually the caller's fault —
+    /// sits between `degraded` (yellow) and `critical` (red) in severity, and
+    /// must stay distinguishable from both since the metric grid shows all
+    /// three side by side.
+    pub client_error: Color,
     pub critical: Color,
     pub unknown: Color,
     pub border: Color,
@@ -45,6 +50,7 @@ impl Theme {
             healthy: Color::Rgb(0xa6, 0xe3, 0xa1),      // green
             idle: Color::Rgb(0x89, 0xb4, 0xfa),         // blue
             degraded: Color::Rgb(0xf9, 0xe2, 0xaf),     // yellow
+            client_error: Color::Rgb(0xfa, 0xb3, 0x87), // peach
             critical: Color::Rgb(0xf3, 0x8b, 0xa8),     // red
             unknown: Color::Rgb(0x6c, 0x70, 0x86),      // overlay0
             border: Color::Rgb(0x45, 0x47, 0x5a),       // surface1
@@ -64,6 +70,7 @@ impl Theme {
             healthy: Color::Rgb(0x40, 0xa0, 0x2b),      // green
             idle: Color::Rgb(0x1e, 0x66, 0xf5),         // blue
             degraded: Color::Rgb(0xdf, 0x8e, 0x1d),     // yellow
+            client_error: Color::Rgb(0xfe, 0x64, 0x0b), // peach
             critical: Color::Rgb(0xd2, 0x0f, 0x39),     // red
             unknown: Color::Rgb(0x9c, 0xa0, 0xb0),      // overlay0
             border: Color::Rgb(0xbc, 0xc0, 0xcc),       // surface1
@@ -83,6 +90,9 @@ impl Theme {
             healthy: Color::Green,
             idle: Color::Blue,
             degraded: Color::Yellow,
+            // No orange in the ANSI-16 palette; LightRed is the closest tone
+            // that stays apart from both Yellow (degraded) and Red (critical).
+            client_error: Color::LightRed,
             critical: Color::Red,
             unknown: Color::DarkGray,
             border: Color::DarkGray,
@@ -101,6 +111,7 @@ impl Theme {
             healthy: Color::Green,
             idle: Color::Blue,
             degraded: Color::Yellow,
+            client_error: Color::LightRed,
             critical: Color::Red,
             unknown: Color::Gray,
             border: Color::Gray,

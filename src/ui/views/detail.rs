@@ -1,5 +1,5 @@
-//! Detail view: four sparklines (Requests, Http 5xx, CPU, Memory) plus a header
-//! with the resource name + RG + health badge + window label.
+//! Detail view: five sparklines (Requests, Http 5xx, Http 4xx, CPU, Memory)
+//! plus a header with the resource name + RG + health badge + window label.
 
 #![allow(dead_code, unused_variables)]
 
@@ -57,9 +57,10 @@ fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
     format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
 }
 
-const ROW_KINDS: [MetricKind; 4] = [
+const ROW_KINDS: [MetricKind; 5] = [
     MetricKind::Traffic,
     MetricKind::Errors,
+    MetricKind::ClientErrors,
     MetricKind::Cpu,
     MetricKind::Memory,
 ];
@@ -74,6 +75,7 @@ fn metric_row_label(kind: MetricKind, resource_kind: ResourceKind) -> &'static s
         (MetricKind::Memory, ResourceKind::ContainerApp) => "Memory (avg/replica)",
         (MetricKind::Traffic, _) => "Requests",
         (MetricKind::Errors, _) => "Http 5xx",
+        (MetricKind::ClientErrors, _) => "Http 4xx",
         (MetricKind::Cpu, _) => "CPU",
         (MetricKind::Memory, _) => "Memory",
         // SQL-only kinds are never charted in the Apis Detail view (they belong
@@ -472,10 +474,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .scroll((context_scroll, 0));
     frame.render_widget(context, body[0]);
 
-    // Sparkline grid: 4 rows of equal fixed height (1 label line + 2 bars),
+    // Sparkline grid: 5 rows of equal fixed height (1 label line + 2 bars),
     // plus a single shared time-axis row at the bottom. All sparklines span
     // the same window, so one axis serves the whole grid.
     let metric_rows = Layout::vertical([
+        Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
@@ -506,8 +509,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    if metric_rows[4].height > 0 {
-        super::metric_chart::render_time_axis(frame, metric_rows[4], state.metrics.range, theme);
+    if metric_rows[5].height > 0 {
+        super::metric_chart::render_time_axis(frame, metric_rows[5], state.metrics.range, theme);
     }
 
     let mut hint = footer_hint_for(resource.kind);
@@ -1416,7 +1419,7 @@ fn summary_for(
     limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
 ) -> String {
     match kind {
-        MetricKind::Traffic | MetricKind::Errors => {
+        MetricKind::Traffic | MetricKind::Errors | MetricKind::ClientErrors => {
             let total = s.sum();
             format!("total: {}{}", format_count(total), unit_suffix(s))
         }
@@ -3207,7 +3210,9 @@ mod tests {
             kind,
             label: label.into(),
             unit: match kind {
-                MetricKind::Traffic | MetricKind::Errors => "count".into(),
+                MetricKind::Traffic | MetricKind::Errors | MetricKind::ClientErrors => {
+                    "count".into()
+                }
                 MetricKind::Cpu => "%".into(),
                 MetricKind::Memory => "bytes".into(),
                 MetricKind::Dtu | MetricKind::Storage | MetricKind::Workers => "%".into(),

@@ -93,6 +93,7 @@ pub(crate) fn color_for_metric(kind: MetricKind, theme: &Theme) -> Color {
     match kind {
         MetricKind::Traffic => theme.accent,
         MetricKind::Errors => theme.critical,
+        MetricKind::ClientErrors => theme.client_error,
         MetricKind::Cpu => theme.healthy,
         MetricKind::Memory => theme.degraded,
         MetricKind::Dtu => theme.accent,

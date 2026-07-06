@@ -1,8 +1,9 @@
 //! Azure Monitor metrics fetch + per-resource-type metric mapping.
 //!
-//! All resource types expose four logical metrics through this module — Errors,
-//! Traffic, Cpu, Memory — backed by different physical metric names depending
-//! on the resource. Callers see a uniform `Vec<MetricSeries>`.
+//! All resource types expose five logical metrics through this module — Errors
+//! (5xx), ClientErrors (4xx), Traffic, Cpu, Memory — backed by different
+//! physical metric names depending on the resource. Callers see a uniform
+//! `Vec<MetricSeries>`.
 
 #![allow(dead_code, unused_variables)]
 
@@ -29,6 +30,10 @@ pub struct MetricsResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum MetricKind {
     Errors,
+    /// HTTP 4xx client errors. Backed by `Http4xx` on Web sites; elsewhere by
+    /// the same request metric as [`Self::Errors`] with a `4xx` dimension
+    /// filter. Charted only — the health verdict stays 5xx-based.
+    ClientErrors,
     Traffic,
     Cpu,
     Memory,
@@ -152,27 +157,31 @@ pub fn metric_names(kind: ResourceKind) -> &'static [(MetricKind, &'static str, 
     match kind {
         ResourceKind::FunctionApp => &[
             (MetricKind::Errors, "Http5xx", "Total"),
+            (MetricKind::ClientErrors, "Http4xx", "Total"),
             (MetricKind::Traffic, "Requests", "Total"),
             (MetricKind::Cpu, "CpuTime", "Total"),
             (MetricKind::Memory, "MemoryWorkingSet", "Average"),
         ],
         ResourceKind::Apim => &[
-            // Errors via $filter on GatewayResponseCodeCategory eq '5xx'
+            // Errors / ClientErrors via $filter on GatewayResponseCodeCategory
             (MetricKind::Errors, "Requests", "Total"),
+            (MetricKind::ClientErrors, "Requests", "Total"),
             (MetricKind::Traffic, "Requests", "Total"),
             (MetricKind::Cpu, "Capacity", "Average"),
             // No memory metric on APIM
         ],
         ResourceKind::ContainerApp => &[
-            // Errors via $filter on statusCodeCategory eq '5xx'
+            // Errors / ClientErrors via $filter on statusCodeCategory
             (MetricKind::Errors, "Requests", "Total"),
+            (MetricKind::ClientErrors, "Requests", "Total"),
             (MetricKind::Traffic, "Requests", "Total"),
             (MetricKind::Cpu, "UsageNanoCores", "Average"),
             (MetricKind::Memory, "WorkingSetBytes", "Average"),
         ],
         ResourceKind::AppGateway => &[
-            // Errors via $filter on HttpStatusGroup eq '5xx'
+            // Errors / ClientErrors via $filter on HttpStatusGroup
             (MetricKind::Errors, "ResponseStatus", "Total"),
+            (MetricKind::ClientErrors, "ResponseStatus", "Total"),
             (MetricKind::Traffic, "TotalRequests", "Total"),
             // CapacityUnits is v2-only; on v1 SKUs the per-metric call 400s
             // and the fetch layer logs it as "missing" without failing the rest.
@@ -186,6 +195,7 @@ pub fn metric_names(kind: ResourceKind) -> &'static [(MetricKind, &'static str, 
 fn label_for(kind: MetricKind, resource_kind: ResourceKind) -> &'static str {
     match (kind, resource_kind) {
         (MetricKind::Errors, _) => "Http 5xx",
+        (MetricKind::ClientErrors, _) => "Http 4xx",
         (MetricKind::Traffic, _) => "Requests",
         (MetricKind::Cpu, ResourceKind::Apim) => "Capacity",
         (MetricKind::Cpu, ResourceKind::AppGateway) => "Capacity Units",
@@ -331,11 +341,6 @@ async fn fetch_core(
         resource_id.trim_end_matches('/')
     );
 
-    let needs_error_filter = matches!(
-        resource_kind,
-        ResourceKind::Apim | ResourceKind::ContainerApp | ResourceKind::AppGateway
-    );
-
     type Handle = tokio::task::JoinHandle<(MetricKind, Result<Option<MetricSeries>, String>)>;
     let mut handles: Vec<Handle> = Vec::new();
 
@@ -343,23 +348,35 @@ async fn fetch_core(
         let kind = *kind;
         let name = (*name).to_string();
         let agg = (*agg).to_string();
-        let filter = if needs_error_filter && kind == MetricKind::Errors {
-            match resource_kind {
-                ResourceKind::Apim => Some("GatewayResponseCodeCategory eq '5xx'".to_string()),
-                // Monitor's $filter only supports `eq`, `ne`, and `sw`
-                // (NOT `startswith`), so an earlier `statusCode startswith '5'`
-                // got rejected with BadRequest. `statusCodeCategory` is a
-                // first-class dimension on Container App `Requests` whose
-                // values are `2xx` / `4xx` / `5xx`, so an `eq` on it is both
-                // valid syntax and cleaner than `statusCode sw '5'`.
-                ResourceKind::ContainerApp => Some("statusCodeCategory eq '5xx'".to_string()),
-                // App Gateway exposes `HttpStatusGroup` as `1xx`/`2xx`/.../`5xx`
-                // on the `ResponseStatus` metric.
-                ResourceKind::AppGateway => Some("HttpStatusGroup eq '5xx'".to_string()),
-                ResourceKind::FunctionApp => None,
+        let filter = match kind {
+            MetricKind::Errors | MetricKind::ClientErrors => {
+                let category = if kind == MetricKind::Errors {
+                    "5xx"
+                } else {
+                    "4xx"
+                };
+                match resource_kind {
+                    ResourceKind::Apim => {
+                        Some(format!("GatewayResponseCodeCategory eq '{category}'"))
+                    }
+                    // Monitor's $filter only supports `eq`, `ne`, and `sw`
+                    // (NOT `startswith`), so an earlier `statusCode startswith '5'`
+                    // got rejected with BadRequest. `statusCodeCategory` is a
+                    // first-class dimension on Container App `Requests` whose
+                    // values are `2xx` / `4xx` / `5xx`, so an `eq` on it is both
+                    // valid syntax and cleaner than `statusCode sw '5'`.
+                    ResourceKind::ContainerApp => {
+                        Some(format!("statusCodeCategory eq '{category}'"))
+                    }
+                    // App Gateway exposes `HttpStatusGroup` as `1xx`/`2xx`/.../`5xx`
+                    // on the `ResponseStatus` metric.
+                    ResourceKind::AppGateway => Some(format!("HttpStatusGroup eq '{category}'")),
+                    // Function Apps have dedicated Http5xx / Http4xx metrics; no
+                    // dimension filter needed.
+                    ResourceKind::FunctionApp => None,
+                }
             }
-        } else {
-            None
+            _ => None,
         };
         let path = path.clone();
         let timespan = timespan.clone();

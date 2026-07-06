@@ -345,8 +345,19 @@ pub fn metrics(resource: &Resource, range: TimeRange) -> MetricsResult {
         },
     );
 
+    // Low-grade 4xx noise on every resource — client errors are a fact of life
+    // on any public endpoint, unlike the 5xx series which stays mostly flat.
+    let client_errors = series(
+        MetricKind::ClientErrors,
+        "Http 4xx",
+        "count",
+        range,
+        seed.wrapping_add(4),
+        |_i, wave, nz| (1.0 + 5.0 * wave + 3.0 * nz).round(),
+    );
+
     let mut out = MetricsResult {
-        series: vec![errors, traffic],
+        series: vec![errors, client_errors, traffic],
         missing: HashMap::new(),
     };
 
@@ -1755,7 +1766,7 @@ mod tests {
             .unwrap();
 
         let hour = metrics(func, TimeRange::Hour);
-        assert_eq!(hour.series.len(), 4);
+        assert_eq!(hour.series.len(), 5);
         assert!(hour.series.iter().all(|s| s.points.len() == 60));
         assert!(hour.missing.is_empty());
 
