@@ -7,10 +7,11 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::registries::Registry;
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
@@ -65,10 +66,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     if let Some(err) = state.registry.registries_error.as_deref() {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -110,12 +114,27 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .iter()
                 .any(|r| r.anonymous_pull_enabled == Some(true));
 
-            let name_w = filtered
+            // NAME absorbs the leftover width; on a narrow terminal it caps to
+            // the budget and truncates with an ellipsis (see `build_row`)
+            // rather than the table clipping it silently. `fixed_w` sums the
+            // non-NAME widths below (the Min(20) counts its minimum); keep the
+            // two in sync.
+            let fixed_w: u16 = 10
+                + 7
+                + 10
+                + if show_anon { 7 } else { 0 }
+                + 20
+                + 22
+                + 10
+                + if show_sub_cols { 22 } else { 0 }
+                + 14;
+            let n_cols: u16 = 8 + if show_anon { 1 } else { 0 } + if show_sub_cols { 1 } else { 0 };
+            let longest = filtered
                 .iter()
                 .map(|r| r.name.chars().count() as u16)
                 .max()
-                .unwrap_or(0)
-                .max(4);
+                .unwrap_or(0);
+            let name_w = name_col_width(body_area.width, fixed_w, n_cols, longest);
 
             let mut widths: Vec<Constraint> = vec![
                 Constraint::Length(name_w), // NAME
@@ -152,7 +171,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.registry.registries_cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|registry| build_row(registry, state, show_sub_cols, show_anon, theme))
+                .map(|registry| build_row(registry, state, show_sub_cols, show_anon, name_w, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -161,9 +180,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts =
+                TableState::default().with_offset(state.registry.registries_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.registry.registries_view_top.set(ts.offset());
         }
     }
 
@@ -175,6 +198,7 @@ fn build_row<'a>(
     state: &'a AppState,
     show_sub_cols: bool,
     show_anon: bool,
+    name_w: u16,
     theme: &Theme,
 ) -> Row<'a> {
     let admin = match registry.admin_user_enabled {
@@ -191,7 +215,8 @@ fn build_row<'a>(
         None => Cell::from("?").style(Style::default().fg(theme.muted)),
     };
     let mut cells: Vec<Cell> = vec![
-        Cell::from(registry.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&registry.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         Cell::from(registry.sku.as_deref().unwrap_or("—").to_string())
             .style(Style::default().fg(theme.muted)),
         admin,
@@ -321,7 +346,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.registry.selected_registry = Some(registry);
                 state.registry.repositories_cursor = 0;
                 state.registry.repositories_filter = tui_input::Input::default();
-                state.view_stack.push(state.view);
                 state.view = View::RegistryRepositories;
             }
             true
@@ -388,6 +412,46 @@ mod tests {
         assert!(
             buf.contains("myreg.azurecr.io"),
             "login server should render"
+        );
+    }
+
+    #[test]
+    fn long_access_denied_error_wraps_instead_of_clipping() {
+        let theme = Theme::catppuccin_mocha();
+        // Narrow buffer so a long message must wrap to be fully visible.
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.registries_error = Some(
+            "403 from Azure Resource Manager: the client does not have \
+             authorization to perform action \
+             'Microsoft.ContainerRegistry/registries/read'. Assign the AcrPull \
+             role."
+                .into(),
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+
+        // Reconstruct the on-screen text row by row, joining rows with a space.
+        // A clipped (unwrapped) line would lose everything past the right edge,
+        // so the tail words only survive when the paragraph wraps.
+        let buffer = term.backend().buffer().clone();
+        let area = *buffer.area();
+        let mut screen = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                screen.push_str(buffer[(x, y)].symbol());
+            }
+            screen.push(' ');
+        }
+
+        assert!(screen.contains("error: 403"), "error prefix should render");
+        assert!(
+            screen.contains("AcrPull"),
+            "tail of long message must wrap into view, not clip"
+        );
+        assert!(
+            screen.contains("role."),
+            "final word of message must be visible after wrapping"
         );
     }
 

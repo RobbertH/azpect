@@ -221,7 +221,12 @@ pub async fn list_containers(
     db_name: &str,
 ) -> anyhow::Result<Vec<CosmosContainer>> {
     let client = ArmClient::new(auth.clone())?;
-    let path = format!("{}/sqlDatabases/{}/containers", account.id, db_name);
+    // Database ids allow spaces / `%`, which would corrupt the ARM path.
+    let path = format!(
+        "{}/sqlDatabases/{}/containers",
+        account.id,
+        encode_path_segment(db_name)
+    );
     let resp = client
         .get(&path, &[("api-version", COSMOS_API_VERSION)])
         .await
@@ -292,15 +297,18 @@ pub async fn query_top_items(
         "query": "SELECT * FROM c",
         "parameters": [],
     });
+    let body_bytes = serde_json::to_vec(&body).expect("cosmos query body is always valid json");
 
-    let resp = http
-        .post(&url)
-        .headers(headers)
-        .body(serde_json::to_vec(&body).expect("cosmos query body is always valid json"))
-        .send()
-        .await
-        .map_err(|e| anyhow!("cosmos data-plane network error: {e}"))
-        .map_err(|e| classify_data_plane_error(&account.name, &host, e))?;
+    // Retried: RU-throttled containers 429 routinely, and re-running a
+    // read-only query is safe.
+    let resp = send_with_retry(|| {
+        http.post(&url)
+            .headers(headers.clone())
+            .body(body_bytes.clone())
+    })
+    .await
+    .map_err(|e| anyhow!("cosmos data-plane network error: {e}"))
+    .map_err(|e| classify_data_plane_error(&account.name, &host, e))?;
 
     let status = resp.status();
     let response_headers = resp.headers().clone();
@@ -345,11 +353,106 @@ pub async fn query_top_items(
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-fn build_http() -> anyhow::Result<reqwest::Client> {
+/// Data-plane HTTP client, shared (like [`send_with_retry`]) by the modules
+/// that can't go through `client.rs`'s clients. Mirrors that file's timeout
+/// discipline — its `CONNECT_TIMEOUT` / `REQUEST_TIMEOUT` consts and
+/// `build_http_with_timeout` are private — because reqwest sets no default
+/// timeouts, so a black-holed endpoint (e.g. a private-endpoint host that
+/// resolves but doesn't route) would otherwise hang a fetch forever.
+pub(crate) fn build_http() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(concat!("azpect/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| anyhow!("failed to build reqwest client: {e}"))
+}
+
+/// Shared bounded-retry send for the raw data-plane requests (Cosmos, Key
+/// Vault, ACR) and the ETag-guarded Container App write. Mirrors the policy of
+/// `client.rs`'s `send_with_retry` — same backoff schedule, retries 429/5xx and
+/// network errors, honours `Retry-After` — but returns the raw
+/// [`reqwest::Response`] so callers keep their own status handling and error
+/// classification, and leaves auth-header attachment to the caller (each data
+/// plane has its own token shape). It can't live in `client.rs` itself because
+/// that helper is coupled to ARM-scope token acquisition and JSON parsing.
+///
+/// Only pass requests that are safe to replay: GETs, re-runnable queries,
+/// token exchanges, or writes guarded by a precondition (`If-Match`).
+///
+/// `build` is invoked on every attempt so nothing stale is replayed. When the
+/// retry budget runs out on a retryable status, the last response is returned
+/// (not an error) so the caller reports the real status code.
+pub(crate) async fn send_with_retry<F>(mut build: F) -> anyhow::Result<reqwest::Response>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    /// Matches `client.rs`'s `BACKOFF_MS`.
+    const BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000];
+    /// Cap on how far a server-supplied `Retry-After` can stretch one wait —
+    /// a TUI shouldn't sit frozen for minutes because a throttled endpoint
+    /// asked it to.
+    const RETRY_AFTER_CLAMP_SECS: u64 = 30;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    let mut iter = BACKOFF_MS.iter().copied();
+    let mut next_backoff: Option<u64> = Some(0); // first attempt has no preceding wait
+
+    while let Some(prelude_ms) = next_backoff {
+        if prelude_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(prelude_ms)).await;
+        }
+        next_backoff = iter.next();
+
+        let resp = match build().send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("network error: {e}"));
+                if next_backoff.is_some() {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        };
+
+        let status = resp.status();
+        let retryable =
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+        if retryable {
+            if let Some(base) = next_backoff {
+                let after_ms = retry_after_ms(resp.headers())
+                    .unwrap_or(0)
+                    .min(RETRY_AFTER_CLAMP_SECS * 1_000);
+                // Drain the body so we don't keep the connection in an odd state.
+                let _ = resp.bytes().await;
+                next_backoff = Some(base + after_ms);
+                continue;
+            }
+        }
+        return Ok(resp);
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("request failed after retries")))
+}
+
+/// Server-requested wait before retrying, in milliseconds. Cosmos throttling
+/// sends `x-ms-retry-after-ms`; everything else uses the standard integer-
+/// seconds `Retry-After` (the HTTP-date form is rare in Azure responses and
+/// not worth the deps — same call as `client.rs`).
+fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
+    if let Some(ms) = headers
+        .get("x-ms-retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+    {
+        return Some(ms.ceil() as u64);
+    }
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| secs * 1_000)
 }
 
 fn truncate_error_body(s: &str) -> String {
@@ -374,10 +477,35 @@ fn rfc1123_now() -> String {
 
 /// Build the items-query URL by stripping trailing `/` from the endpoint
 /// (Resource Graph reports `documentEndpoint` with a trailing slash) and
-/// joining with `/dbs/{db}/colls/{coll}/docs`. Factored out for unit testing.
+/// joining with `/dbs/{db}/colls/{coll}/docs`. The db/container ids are
+/// percent-encoded — see [`encode_path_segment`]. Factored out for unit
+/// testing.
 pub(crate) fn items_url(endpoint: &str, db: &str, coll: &str) -> String {
     let trimmed = endpoint.trim_end_matches('/');
-    format!("{trimmed}/dbs/{db}/colls/{coll}/docs")
+    format!(
+        "{trimmed}/dbs/{}/colls/{}/docs",
+        encode_path_segment(db),
+        encode_path_segment(coll)
+    )
+}
+
+/// Percent-encode one URL path segment. Cosmos database/container ids allow
+/// nearly any character (spaces, `%`, unicode), so interpolating them raw
+/// produces wrong or unparseable URLs. Mirrors `storage.rs`'s
+/// `encode_blob_path` (duplicated by design — the modules stay self-contained)
+/// except `/` is NOT preserved: these are single segments, and a literal `/`
+/// in an id must not create an extra path level.
+pub(crate) fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let ok = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if ok {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Pull the host out of an endpoint URL for error classification (so the
@@ -856,6 +984,30 @@ mod tests {
             items_url("https://acc.documents.azure.com:443", "db", "c"),
             "https://acc.documents.azure.com:443/dbs/db/colls/c/docs"
         );
+    }
+
+    #[test]
+    fn items_url_percent_encodes_db_and_container_ids() {
+        // Cosmos ids may contain spaces, `%`, and `/` — all must be encoded so
+        // the path stays unambiguous.
+        assert_eq!(
+            items_url("https://a.documents.azure.com:443/", "my db", "100%"),
+            "https://a.documents.azure.com:443/dbs/my%20db/colls/100%25/docs"
+        );
+        assert_eq!(
+            items_url("https://a.documents.azure.com:443/", "db", "orders/v2"),
+            "https://a.documents.azure.com:443/dbs/db/colls/orders%2Fv2/docs"
+        );
+    }
+
+    #[test]
+    fn encode_path_segment_keeps_unreserved_and_encodes_the_rest() {
+        assert_eq!(encode_path_segment("plain-id_0.9~"), "plain-id_0.9~");
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("50%"), "50%25");
+        // Unlike storage's encode_blob_path, `/` is a single-segment breaker
+        // here and must be encoded.
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
     }
 
     #[test]

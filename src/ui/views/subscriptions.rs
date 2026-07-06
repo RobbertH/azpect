@@ -270,7 +270,12 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             };
             state.selected_subscription = new_selection.clone();
             state.config.last_subscription_id = new_selection;
-            state.view_stack.push(state.view);
+            // New scope: orphan every in-flight scope-level fetch. Their
+            // results were issued for the previous subscription set and the
+            // `*Loaded` handlers drop mismatched generations — without this, a
+            // slow "all subscriptions" fetch could land after the pin and be
+            // displayed as if it were the pinned subscription's data.
+            state.scope_generation = state.scope_generation.wrapping_add(1);
             // Every subscription-scoped cache is stale for the new scope. Loop
             // over `Category::ALL` so adding a new resource type automatically
             // gets its cache flushed here — no risk of a future ACR-style

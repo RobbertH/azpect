@@ -7,8 +7,8 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use super::{name_col_width, truncate_ellipsis};
@@ -66,10 +66,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     if let Some(err) = state.cosmos.accounts_error.as_deref() {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -154,9 +157,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.cosmos.accounts_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.cosmos.accounts_view_top.set(ts.offset());
         }
     }
 
@@ -291,7 +297,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.cosmos.selected_account = Some(account);
                 state.cosmos.databases_cursor = 0;
                 state.cosmos.databases_filter = tui_input::Input::default();
-                state.view_stack.push(state.view);
                 state.view = View::CosmosDatabases;
             }
             true

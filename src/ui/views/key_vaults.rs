@@ -164,9 +164,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.key_vault.vaults_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.key_vault.vaults_view_top.set(ts.offset());
         }
     }
 
@@ -300,9 +303,15 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .cloned();
             if let Some(vault) = vault {
                 state.key_vault.selected_vault = Some(vault);
+                // Fresh entry into the items view: default to secrets, reset
+                // the shared cursor / filter.
+                state.key_vault.items_kind = crate::azure::key_vault::ItemKind::Secret;
                 state.key_vault.items_cursor = 0;
                 state.key_vault.items_filter = tui_input::Input::default();
-                state.view_stack.push(state.view);
+                // Organic drill-in: Esc should walk the breadcrumb back to
+                // this vaults list, not to a stale env-vars origin recorded by
+                // an earlier Key Vault reference jump.
+                state.key_vault.items_return_view = None;
                 state.view = View::KeyVaultItems;
             }
             true
@@ -393,6 +402,7 @@ mod tests {
     fn enter_pins_vault_and_drills_in() {
         let mut state = fixture();
         state.key_vault.vaults = Some(vec![vault("myvault")]);
+        state.key_vault.items_kind = crate::azure::key_vault::ItemKind::Certificate;
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::KeyVaultItems);
         assert_eq!(
@@ -402,6 +412,11 @@ mod tests {
                 .as_ref()
                 .map(|v| v.name.as_str()),
             Some("myvault")
+        );
+        // Drilling in resets the toggle back to secrets.
+        assert_eq!(
+            state.key_vault.items_kind,
+            crate::azure::key_vault::ItemKind::Secret
         );
     }
 

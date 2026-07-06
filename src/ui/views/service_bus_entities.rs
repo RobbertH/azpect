@@ -11,10 +11,11 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::service_bus::{EntityKind, ServiceBusQueue, ServiceBusTopic};
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
@@ -106,10 +107,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = error {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -154,12 +158,17 @@ fn render_queues(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
         return;
     }
 
-    let name_w = filtered
+    // NAME absorbs the leftover width; on a narrow terminal it caps to the
+    // budget and truncates with an ellipsis (see `queue_row`) rather than
+    // pushing the ACTIVE/DLQ counts — the point of this view — off-screen.
+    // `fixed_w` sums the Length()s below; keep the two in sync.
+    let fixed_w: u16 = 10 + 8 + 8 + 8 + 8 + 7;
+    let longest = filtered
         .iter()
         .map(|q| q.name.chars().count() as u16)
         .max()
-        .unwrap_or(0)
-        .max(4);
+        .unwrap_or(0);
+    let name_w = name_col_width(area.width, fixed_w, 7, longest);
 
     let widths = [
         Constraint::Length(name_w), // NAME
@@ -180,7 +189,10 @@ fn render_queues(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
     );
 
     let cursor = state.service_bus.entities_cursor.min(filtered.len() - 1);
-    let body_rows: Vec<Row> = filtered.iter().map(|q| queue_row(q, theme)).collect();
+    let body_rows: Vec<Row> = filtered
+        .iter()
+        .map(|q| queue_row(q, name_w, theme))
+        .collect();
 
     let table = Table::new(body_rows, widths)
         .header(header_row)
@@ -188,14 +200,18 @@ fn render_queues(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
         .highlight_symbol("▍ ")
         .column_spacing(2);
 
-    let mut ts = TableState::default();
+    // Offset persisted across frames so the window only scrolls when the
+    // cursor pushes against an edge (ratatui reconciles it during render).
+    let mut ts = TableState::default().with_offset(state.service_bus.entities_view_top.get());
     ts.select(Some(cursor));
     frame.render_stateful_widget(table, area, &mut ts);
+    state.service_bus.entities_view_top.set(ts.offset());
 }
 
-fn queue_row<'a>(q: &'a ServiceBusQueue, theme: &Theme) -> Row<'a> {
+fn queue_row<'a>(q: &'a ServiceBusQueue, name_w: u16, theme: &Theme) -> Row<'a> {
     Row::new(vec![
-        Cell::from(q.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&q.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         status_cell(q.status.as_deref(), theme),
         Cell::from(q.counts.active.to_string()).style(Style::default().fg(theme.fg)),
         dlq_cell(q.counts.dead_letter, theme),
@@ -221,12 +237,15 @@ fn render_topics(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
         return;
     }
 
-    let name_w = filtered
+    // Same budget-capped NAME treatment as `render_queues` (see the comment
+    // there); topic names share the same generous Service Bus length limit.
+    let fixed_w: u16 = 10 + 6 + 12;
+    let longest = filtered
         .iter()
         .map(|t| t.name.chars().count() as u16)
         .max()
-        .unwrap_or(0)
-        .max(4);
+        .unwrap_or(0);
+    let name_w = name_col_width(area.width, fixed_w, 4, longest);
 
     let widths = [
         Constraint::Length(name_w), // NAME
@@ -241,7 +260,10 @@ fn render_topics(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
     );
 
     let cursor = state.service_bus.entities_cursor.min(filtered.len() - 1);
-    let body_rows: Vec<Row> = filtered.iter().map(|t| topic_row(t, theme)).collect();
+    let body_rows: Vec<Row> = filtered
+        .iter()
+        .map(|t| topic_row(t, name_w, theme))
+        .collect();
 
     let table = Table::new(body_rows, widths)
         .header(header_row)
@@ -249,14 +271,18 @@ fn render_topics(frame: &mut Frame, area: Rect, state: &AppState, ns_id: &str, t
         .highlight_symbol("▍ ")
         .column_spacing(2);
 
-    let mut ts = TableState::default();
+    // Offset persisted across frames so the window only scrolls when the
+    // cursor pushes against an edge (ratatui reconciles it during render).
+    let mut ts = TableState::default().with_offset(state.service_bus.entities_view_top.get());
     ts.select(Some(cursor));
     frame.render_stateful_widget(table, area, &mut ts);
+    state.service_bus.entities_view_top.set(ts.offset());
 }
 
-fn topic_row<'a>(t: &'a ServiceBusTopic, theme: &Theme) -> Row<'a> {
+fn topic_row<'a>(t: &'a ServiceBusTopic, name_w: u16, theme: &Theme) -> Row<'a> {
     Row::new(vec![
-        Cell::from(t.name.as_str()).style(Style::default().fg(theme.fg)),
+        Cell::from(truncate_ellipsis(&t.name, name_w as usize))
+            .style(Style::default().fg(theme.fg)),
         status_cell(t.status.as_deref(), theme),
         Cell::from(opt_num(t.subscription_count)).style(Style::default().fg(theme.fg)),
         Cell::from(format_bytes(t.size_bytes)).style(Style::default().fg(theme.muted)),
@@ -449,7 +475,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                     state.service_bus.selected_topic = Some(topic);
                     state.service_bus.subscriptions_cursor = 0;
                     state.service_bus.subscriptions_filter = tui_input::Input::default();
-                    state.view_stack.push(state.view);
                     state.view = View::ServiceBusSubscriptions;
                 }
             }

@@ -523,13 +523,87 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     render_footer(frame, chunks[2], theme, &hint);
 }
 
-/// Approximate how many terminal rows `text` will occupy after Paragraph
-/// wrapping at the given width. Counts by char (close enough for ASCII error
-/// messages; double-width glyphs would slightly over-reserve, which is fine).
-fn wrapped_line_count(text: &str, width: u16) -> usize {
-    let w = width.max(1) as usize;
-    let chars = text.chars().count().max(1);
-    chars.div_ceil(w)
+/// How many terminal rows `text` will occupy after `Paragraph` wrapping with
+/// `Wrap { trim: false }` at the given width.
+///
+/// Mirrors ratatui's `WordWrapper`: greedy wrap at whitespace (a word that
+/// would overflow moves wholesale to the next row, and whitespace spilling
+/// past the break is dropped), words wider than the pane hard-split at the
+/// width boundary, and everything is measured in *display* columns so
+/// double-width glyphs (CJK) count as two. The old `ceil(chars / width)`
+/// estimate under-counted both cases — word wrap breaks *earlier* than a char
+/// count suggests on space-heavy lines (tags), and wide glyphs occupy two
+/// columns each — which clipped the bottom meta rows and desynced the
+/// cursor-follow offsets built from these counts. Hard `\n`s each start a new
+/// row. Shared with the sibling scrollable panes/modals so every scroll clamp
+/// agrees with what `Paragraph` actually draws.
+pub(crate) fn wrapped_line_count(text: &str, width: u16) -> usize {
+    let max_w = width.max(1) as usize;
+    text.split('\n')
+        .map(|line| wrapped_rows_one_line(line, max_w))
+        .sum::<usize>()
+        .max(1)
+}
+
+/// One hard line's wrapped row count — the greedy word-wrap simulation behind
+/// [`wrapped_line_count`].
+fn wrapped_rows_one_line(line: &str, max_w: usize) -> usize {
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    // Walk alternating whitespace / word tokens (maximal same-class runs).
+    let mut rest = line;
+    while let Some(first) = rest.chars().next() {
+        let is_ws = first.is_whitespace();
+        let split = rest
+            .char_indices()
+            .find(|&(_, c)| c.is_whitespace() != is_ws)
+            .map_or(rest.len(), |(i, _)| i);
+        let (token, tail) = rest.split_at(split);
+        rest = tail;
+        let tw = display_width(token);
+        if is_ws {
+            // Whitespace flows up to the row edge; the spill is exactly what
+            // ratatui drops at a wrap point, so it never opens a new row.
+            col = (col + tw).min(max_w);
+        } else if col + tw <= max_w {
+            col += tw;
+        } else if tw <= max_w {
+            // Greedy word wrap: an overflowing word moves wholesale to a
+            // fresh row (the break's whitespace was absorbed above).
+            rows += 1;
+            col = tw;
+        } else {
+            // Word wider than the pane: starts on a fresh row, then splits at
+            // display-width boundaries. Counted per char because a wide glyph
+            // that would straddle the edge wraps early — dividing the total
+            // width would under-count those rows.
+            if col > 0 {
+                rows += 1;
+                col = 0;
+            }
+            for ch in token.chars() {
+                let cw = display_width(ch.encode_utf8(&mut [0u8; 4]));
+                // ratatui skips zero-width symbols and ones wider than the
+                // whole line rather than wrapping on them.
+                if cw == 0 || cw > max_w {
+                    continue;
+                }
+                if col + cw > max_w {
+                    rows += 1;
+                    col = cw;
+                } else {
+                    col += cw;
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Display-column width of `s`, measured through ratatui's own unicode-width
+/// (`Span::width`) so the estimate can't disagree with what `Paragraph` draws.
+fn display_width(s: &str) -> usize {
+    Span::raw(s).width()
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, hint: &str) {
@@ -1946,6 +2020,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // Any other action (refresh, window switch, …) falls through to the
     // normal handler so the user can still drive the page underneath.
     if state.detail_view.modal.is_some() {
+        // Every mutation clamps to the render-published `scroll_max` so the
+        // stored offset never parks past the content — a stale over-scroll
+        // (e.g. after the pane grew) self-heals on the next key press instead
+        // of making `k` look dead.
+        let max_scroll = state.scroll_max.get();
         match action {
             Action::Back => {
                 state.detail_view.modal = None;
@@ -1953,25 +2032,25 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             Action::MoveDown => {
                 if let Some(m) = state.detail_view.modal.as_mut() {
-                    m.scroll = m.scroll.saturating_add(1);
+                    m.scroll = m.scroll.saturating_add(1).min(max_scroll);
                 }
                 return true;
             }
             Action::MoveUp => {
                 if let Some(m) = state.detail_view.modal.as_mut() {
-                    m.scroll = m.scroll.saturating_sub(1);
+                    m.scroll = m.scroll.min(max_scroll).saturating_sub(1);
                 }
                 return true;
             }
             Action::HalfPageDown => {
                 if let Some(m) = state.detail_view.modal.as_mut() {
-                    m.scroll = m.scroll.saturating_add(8);
+                    m.scroll = m.scroll.saturating_add(8).min(max_scroll);
                 }
                 return true;
             }
             Action::HalfPageUp => {
                 if let Some(m) = state.detail_view.modal.as_mut() {
-                    m.scroll = m.scroll.saturating_sub(8);
+                    m.scroll = m.scroll.min(max_scroll).saturating_sub(8);
                 }
                 return true;
             }
@@ -1983,9 +2062,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             Action::GotoBottom => {
                 if let Some(m) = state.detail_view.modal.as_mut() {
-                    // Saturating-add gets clamped by the renderer; the
-                    // modal's own clamp keeps us at the last line.
-                    m.scroll = u16::MAX;
+                    m.scroll = max_scroll;
                 }
                 return true;
             }
@@ -2054,7 +2131,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 Some(ResourceKind::ContainerApp | ResourceKind::FunctionApp) => {
                     // Fresh page: cursor at top, values masked.
                     state.env_vars_view = crate::ui::state::EnvVarsView::default();
-                    state.view_stack.push(state.view);
                     state.view = View::EnvVars;
                 }
                 _ => state.set_status("no environment variables for this resource type"),
@@ -2070,7 +2146,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 // Drop the previous resource's source/search filters so the new
                 // app's logs aren't hidden behind a stale container-name filter.
                 state.logs.reset_view_filters();
-                state.view_stack.push(state.view);
                 state.view = View::Logs;
             } else {
                 state.set_status("logs are not supported for this resource type");
@@ -2087,7 +2162,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if is_apim {
                 state.apim.apis_cursor = 0;
                 state.apim.selected_api_id = None;
-                state.view_stack.push(state.view);
                 state.view = View::ApimApis;
                 return true;
             }
@@ -2187,9 +2261,22 @@ pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
         .iter()
         .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg))))
         .collect();
-    // `scroll((y, x))` skips the first `y` rows of the wrapped output; clamped
-    // to `lines.len()` so the user can't scroll past the end into blankness.
-    let scroll_y = (modal.scroll as usize).min(lines.len()) as u16;
+    // `scroll((y, x))` skips the first `y` *wrapped* rows, so the ceiling must
+    // count wrapped rows minus the viewport — clamping to `lines.len()` let G
+    // scroll every line out of view (blank modal) and left long wrapped lines
+    // unreachable. Publish the max through `scroll_max` so the key handler can
+    // clamp the stored offset too; otherwise `k` after G walks down invisibly
+    // from a huge sentinel before anything moves.
+    let total_rows: usize = modal
+        .lines
+        .iter()
+        .map(|l| wrapped_line_count(l, body_area.width))
+        .sum();
+    let max_scroll = total_rows
+        .saturating_sub(body_area.height as usize)
+        .min(u16::MAX as usize) as u16;
+    state.scroll_max.set(max_scroll);
+    let scroll_y = modal.scroll.min(max_scroll);
     let body = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
@@ -3738,5 +3825,89 @@ mod tests {
         let s = format!("{:?}", term.backend().buffer());
         // Inline preview still teases the overflow; the section is one stop.
         assert!(s.contains("+5 more"));
+    }
+
+    #[test]
+    fn wrapped_line_count_word_wraps_like_ratatui() {
+        // Word wrap breaks *earlier* than a char count suggests: each word
+        // that would straddle the edge moves wholesale to the next row. The
+        // old `ceil(chars / width)` estimate under-counted this, clipping the
+        // bottom meta rows.
+        //
+        // width 10: "tags:" | "env=prod" | "team=platf" | "orm" → 4 rows,
+        // where ceil(28 / 10) would claim 3.
+        assert_eq!(wrapped_line_count("tags: env=prod team=platform", 10), 4);
+        // Exact fits don't wrap.
+        assert_eq!(wrapped_line_count("aaaa bbbb", 9), 1);
+        // The break's whitespace is dropped, not carried onto the next row.
+        assert_eq!(wrapped_line_count("aaaa bbbb", 5), 2);
+        // Long unbroken words hard-split at the width boundary.
+        assert_eq!(wrapped_line_count(&"x".repeat(25), 10), 3);
+        // Hard newlines each start a row; empty text still occupies one.
+        assert_eq!(wrapped_line_count("a\nb\nc", 10), 3);
+        assert_eq!(wrapped_line_count("", 10), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_uses_display_width_for_wide_glyphs() {
+        // 8 CJK chars are 16 display columns: 2 rows at width 10, where a
+        // char-based count (8 chars) would claim a single row.
+        assert_eq!(wrapped_line_count("日本語のテキスト", 10), 2);
+        // A wide glyph that would straddle the row edge wraps early, so rows
+        // can't be derived by dividing total width: at width 3 only one
+        // 2-column glyph fits per row → 8 rows, where ceil(16 / 3) claims 6.
+        assert_eq!(wrapped_line_count("日本語のテキスト", 3), 8);
+    }
+
+    #[test]
+    fn modal_goto_bottom_reaches_tail_and_move_up_responds_immediately() {
+        // Regression, twofold: (1) the modal's render clamp was `min(len)` on
+        // unwrapped lines — G scrolled the entire content out of view (blank
+        // modal); (2) G stored u16::MAX while only the renderer clamped it, so
+        // `k` decremented invisibly for thousands of presses.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture_no_metrics();
+        state.detail_view.modal = Some(crate::ui::state::DetailModal {
+            title: "image".into(),
+            lines: (0..40).map(|i| format!("line {i}")).collect(),
+            scroll: 0,
+        });
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+
+        assert!(handle(Action::GotoBottom, &mut state));
+        let max = state.scroll_max.get();
+        assert!(
+            max > 0 && max < 40,
+            "expected a small real max scroll, got {max}"
+        );
+        assert_eq!(state.detail_view.modal.as_ref().unwrap().scroll, max);
+
+        // The tail must still be on screen at the clamped offset.
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("line 39"), "tail line must stay visible after G");
+
+        assert!(handle(Action::MoveUp, &mut state));
+        assert_eq!(state.detail_view.modal.as_ref().unwrap().scroll, max - 1);
+    }
+
+    #[test]
+    fn open_logs_resets_previous_resource_scroll() {
+        // Regression: `reset_view_filters` cleared the filters but not the
+        // cursor/viewport, so opening resource B's logs after deep-scrolling
+        // resource A's left `k` apparently dead for hundreds of presses.
+        let mut state = fixture_no_metrics();
+        state.logs.scroll = 500;
+        state.logs.view_top.set(480);
+        state.logs.h_offset = 24;
+        assert!(handle(Action::OpenLogs, &mut state));
+        assert_eq!(state.view, View::Logs);
+        assert_eq!(state.logs.scroll, 0);
+        assert_eq!(state.logs.view_top.get(), 0);
+        assert_eq!(state.logs.h_offset, 0);
     }
 }

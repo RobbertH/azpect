@@ -14,7 +14,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::azure::metrics::MetricsResult;
+use crate::azure::metrics::{MetricsResult, TimeRange};
 use crate::azure::resources::Resource;
 use crate::azure::subscriptions::Subscription;
 use crate::ui::state::View;
@@ -26,18 +26,43 @@ pub enum AppEvent {
     Tick,
     /// Raw keyboard input from crossterm.
     Key(KeyEvent),
+    /// Bracketed paste from crossterm (enabled by the terminal guard). Kept
+    /// distinct from `Key` so a paste can be routed into the focused text
+    /// input as a unit — without bracketed paste a terminal delivers pastes
+    /// as a burst of key events, and every character that happens to be bound
+    /// (`q`, `r`, `s`, `y`, `o`, …) fires its action.
+    Paste(String),
     /// Terminal resize.
     Resize { width: u16, height: u16 },
 
     /// Background load completion: subscription list.
-    SubscriptionsLoaded(Result<Vec<Subscription>, String>),
+    ///
+    /// `scope` is the `AppState::scope_generation` the fetch was issued under.
+    /// Every subscription-scope-level load event carries it; the handlers drop
+    /// results from a previous scope (the user switched subscription or
+    /// re-logged-in while the fetch was in flight) instead of displaying data
+    /// that no longer matches what's pinned. Sub-resource loads keyed by ARM id
+    /// don't need it — their cache keys can't collide across scopes.
+    SubscriptionsLoaded {
+        scope: u64,
+        result: Result<Vec<Subscription>, String>,
+    },
     /// Background load completion: resource list for the active subscription set.
-    ResourcesLoaded(Result<Vec<Resource>, String>),
+    ResourcesLoaded {
+        scope: u64,
+        result: Result<Vec<Resource>, String>,
+    },
     /// Background load completion: metrics for a specific resource id. The
     /// success payload carries both the loaded series and a per-metric error
     /// map for ones that the resource's plan doesn't expose.
+    ///
+    /// `range` is the chart window the fetch was issued for. The handler drops
+    /// results whose range no longer matches `state.metrics.range` — switching
+    /// the window mid-flight must not render the old range's series under the
+    /// new range's axis labels.
     MetricsLoaded {
         resource_id: String,
+        range: TimeRange,
         result: Result<MetricsResult, String>,
     },
     /// Background load completion: logs for a specific resource id.
@@ -143,8 +168,11 @@ pub enum AppEvent {
         result: Result<Vec<crate::azure::appgw_backends::BackendPool>, String>,
     },
     /// Background load completion: list of storage accounts for the current
-    /// subscription scope.
-    StorageAccountsLoaded(Result<Vec<crate::azure::storage::StorageAccount>, String>),
+    /// subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
+    StorageAccountsLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::storage::StorageAccount>, String>,
+    },
     /// Background load completion: list of blob containers for one storage
     /// account, keyed by ARM id.
     StorageContainersLoaded {
@@ -173,8 +201,11 @@ pub enum AppEvent {
         result: Result<crate::azure::storage::BlobPreview, String>,
     },
     /// Background load completion: list of container registries for the
-    /// current subscription scope.
-    RegistriesLoaded(Result<Vec<crate::azure::registries::Registry>, String>),
+    /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
+    RegistriesLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::registries::Registry>, String>,
+    },
     /// Background load completion: list of repositories inside one registry,
     /// keyed by registry ARM id.
     RegistryRepositoriesLoaded {
@@ -189,8 +220,11 @@ pub enum AppEvent {
         result: Result<Vec<crate::azure::registries::Tag>, String>,
     },
     /// Background load completion: list of Cosmos DB (SQL/Core) accounts for
-    /// the current subscription scope.
-    CosmosAccountsLoaded(Result<Vec<crate::azure::cosmos::CosmosAccount>, String>),
+    /// the current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
+    CosmosAccountsLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::cosmos::CosmosAccount>, String>,
+    },
     /// Background load completion: list of SQL databases inside one Cosmos
     /// account, keyed by account ARM id.
     CosmosDatabasesLoaded {
@@ -213,18 +247,26 @@ pub enum AppEvent {
     },
     /// Background load completion: flat list of Azure SQL elastic pools +
     /// single databases for the current subscription scope. Resource Graph
-    /// control-plane call.
-    SqlResourcesLoaded(Result<Vec<crate::azure::sql::SqlResource>, String>),
+    /// control-plane call. `scope` — see [`AppEvent::SubscriptionsLoaded`].
+    SqlResourcesLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::sql::SqlResource>, String>,
+    },
     /// Background load completion: utilization metrics for one pool / database,
     /// keyed by ARM id. Mirrors [`AppEvent::MetricsLoaded`] but scoped to the
-    /// SQL category's cache.
+    /// SQL category's cache; `range` plays the same stale-window role.
     SqlMetricsLoaded {
         resource_id: String,
+        range: TimeRange,
         result: Result<crate::azure::metrics::MetricsResult, String>,
     },
     /// Background load completion: list of Key Vaults for the current
-    /// subscription scope. Resource Graph control-plane call.
-    KeyVaultsLoaded(Result<Vec<crate::azure::key_vault::KeyVault>, String>),
+    /// subscription scope. Resource Graph control-plane call. `scope` — see
+    /// [`AppEvent::SubscriptionsLoaded`].
+    KeyVaultsLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::key_vault::KeyVault>, String>,
+    },
     /// Background load completion: list of secrets *or* certificates inside
     /// one vault. `key` is the `(vault_id, kind)` pair flattened by
     /// [`crate::ui::state::KeyVaultCache::items_key`]. Data-plane call.
@@ -242,8 +284,12 @@ pub enum AppEvent {
         result: Result<String, String>,
     },
     /// Background load completion: list of Service Bus namespaces for the
-    /// current subscription scope. Resource Graph control-plane call.
-    ServiceBusNamespacesLoaded(Result<Vec<crate::azure::service_bus::ServiceBusNamespace>, String>),
+    /// current subscription scope. Resource Graph control-plane call. `scope` —
+    /// see [`AppEvent::SubscriptionsLoaded`].
+    ServiceBusNamespacesLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::service_bus::ServiceBusNamespace>, String>,
+    },
     /// Background load completion: list of queues inside one namespace, keyed
     /// by namespace ARM id.
     ServiceBusQueuesLoaded {
@@ -377,6 +423,15 @@ pub enum Action {
 /// (event loop) holds the chord state and consults [`is_chord_starter`] /
 /// [`resolve_chord`].
 pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
+    // Ctrl+C first, before any mode-specific capture: raw mode disables
+    // SIGINT, so the reflexive interrupt press must be honoured as a key or
+    // it does nothing during a slow fetch. It mirrors `q` exactly (Back —
+    // quit-confirm at the root, one level up elsewhere), and while the search
+    // input owns printable keys it cancels the input like Esc.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Action::Back;
+    }
+
     // Search-mode capture: the input field eats most keys, but vertical
     // navigation must continue to drive the underlying list so the user can
     // pick a row without leaving the search box.
@@ -699,6 +754,20 @@ mod tests {
             key_to_action(key('s'), View::LogDetail, false),
             Action::SwitchSubscription
         );
+    }
+
+    #[test]
+    fn ctrl_c_mirrors_q_everywhere() {
+        // Raw mode swallows SIGINT, so Ctrl+C must be an in-band key that
+        // behaves exactly like `q` (Back) — in every view…
+        for v in [View::List, View::Detail, View::Logs, View::EnvVars] {
+            assert_eq!(key_to_action(key_ctrl('c'), v, false), Action::Back);
+        }
+        // …and even while the search input owns printable keys, where it
+        // cancels the input like Esc instead of being swallowed as Noop.
+        assert_eq!(key_to_action(key_ctrl('c'), View::List, true), Action::Back);
+        // Plain `c` stays unbound.
+        assert_eq!(key_to_action(key('c'), View::List, false), Action::Noop);
     }
 
     #[test]

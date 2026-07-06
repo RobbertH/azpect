@@ -212,7 +212,10 @@ const MESSAGE_TRUNCATE: usize = 500;
 ///
 /// A returned page with exactly `PAGE_SIZE` rows is taken as the signal that
 /// older data may still exist (`has_more = true`). Fewer rows → we've hit
-/// the start of the window.
+/// the start of the window. Note the page handed to the caller can be
+/// slightly smaller than `PAGE_SIZE` even when `has_more` is true:
+/// boundary-tied rows are trimmed so pagination can't drop rows — see
+/// [`trim_boundary_ties`].
 pub const PAGE_SIZE: u32 = 500;
 
 /// One page of log rows plus whether the workspace likely has more older rows
@@ -278,13 +281,38 @@ pub async fn fetch(
         _ => client.query(&resource.id, &kql, &timespan).await?,
     };
 
-    let lines = parse_logs_response(&resp, resource.kind)?;
+    let mut lines = parse_logs_response(&resp, resource.kind)?;
     let has_more = lines.len() as u32 >= PAGE_SIZE;
+    // A full page's `take` may have cut mid-way through a group of rows that
+    // share one TimeGenerated; the next fetch's strict `<` cursor (the oldest
+    // ts the caller holds) would then skip the group's unseen remainder. Trim
+    // the tied tail so the page boundary always falls between distinct
+    // timestamps — the next page re-fetches the whole group, no drop, no dup.
+    // Context windows (`around`) are never paginated, so trimming there would
+    // lose rows for no benefit.
+    if has_more && around.is_none() {
+        trim_boundary_ties(&mut lines);
+    }
     Ok(LogsPage {
         lines,
         has_more,
         workspace_arm_id,
     })
+}
+
+/// Drop trailing rows sharing the page's oldest timestamp (see the call site
+/// in [`fetch`] for why). No-op when *every* row in the page carries the same
+/// timestamp — trimming would then make no progress at all, so we keep the
+/// page and accept that pagination may skip unseen siblings of that single
+/// timestamp (500+ rows on one 100ns tick; not a realistic workload).
+fn trim_boundary_ties(lines: &mut Vec<LogLine>) {
+    let Some(oldest) = lines.last().map(|l| l.ts) else {
+        return;
+    };
+    let tied = lines.iter().rev().take_while(|l| l.ts == oldest).count();
+    if tied < lines.len() {
+        lines.truncate(lines.len() - tied);
+    }
 }
 
 /// Half-width of the "context around an error" window. A failed request and the
@@ -338,9 +366,15 @@ fn build_kql(
         filter_block.push('\n');
     }
     if let Some(ts) = older_than {
-        // RFC3339 with microsecond precision keeps cursor strictly older than
-        // the last received row even if two rows landed in the same second.
-        let stamp = ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        // Full nanosecond precision — KQL `datetime()` accepts RFC3339 with
+        // nanos, and TimeGenerated carries 100ns precision, so anything
+        // coarser (e.g. micros) rounds the cursor *below* the oldest received
+        // row and the strict `<` then skips its same-microsecond older
+        // siblings. Strict `<` itself is safe against rows that share the
+        // cursor timestamp exactly because [`fetch`] trims boundary-tied rows
+        // off every full page (see [`trim_boundary_ties`]), so the caller's
+        // oldest row is always the last of its timestamp group.
+        let stamp = ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         filter_block.push_str(&format!(r#"| where TimeGenerated < datetime("{stamp}")"#));
         filter_block.push('\n');
     }
@@ -1224,10 +1258,79 @@ mod tests {
             where_idx < order_idx,
             "cursor must filter before order by/take, got:\n{kql}"
         );
+        // Full nanosecond precision: TimeGenerated is 100ns-precise, so a
+        // micros-truncated cursor would skip same-microsecond older rows.
         assert!(
-            kql.contains(r#"datetime("2026-05-19T03:17:43.123456Z")"#),
-            "expected microsecond-precision RFC3339 cursor, got:\n{kql}"
+            kql.contains(r#"datetime("2026-05-19T03:17:43.123456000Z")"#),
+            "expected nanosecond-precision RFC3339 cursor, got:\n{kql}"
         );
+    }
+
+    #[test]
+    fn cursor_preserves_100ns_precision() {
+        // A real Log Analytics timestamp with the full 7 fractional digits
+        // must round-trip into the cursor unchanged — this is the exact case
+        // the old micros-truncated cursor lost rows on.
+        let r = test_resource(ResourceKind::Apim, "apim");
+        let cursor = DateTime::parse_from_rfc3339("2026-05-19T03:17:43.1234567Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_kql(&r, false, Some(cursor)).unwrap();
+        assert!(
+            kql.contains(r#"datetime("2026-05-19T03:17:43.123456700Z")"#),
+            "cursor must not truncate the 100ns digit, got:\n{kql}"
+        );
+    }
+
+    fn line_at(ts: &str) -> LogLine {
+        LogLine {
+            ts: DateTime::parse_from_rfc3339(ts)
+                .unwrap()
+                .with_timezone(&Utc),
+            level: LogLevel::Info,
+            source: "s".into(),
+            message: "m".into(),
+            fields: vec![],
+        }
+    }
+
+    #[test]
+    fn trim_boundary_ties_drops_the_tied_tail() {
+        // The `take` cut mid-way through the 01.5000000Z group: trim both tied
+        // rows so the next `< cursor` page re-fetches the whole group.
+        let mut lines = vec![
+            line_at("2026-01-01T00:00:02Z"),
+            line_at("2026-01-01T00:00:01.5000000Z"),
+            line_at("2026-01-01T00:00:01.5000000Z"),
+        ];
+        trim_boundary_ties(&mut lines);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].ts, line_at("2026-01-01T00:00:02Z").ts);
+    }
+
+    #[test]
+    fn trim_boundary_ties_keeps_untied_pages_and_all_tied_pages() {
+        // Distinct oldest timestamp → only that single row is "tied" with
+        // itself and gets trimmed (it comes back on the next page).
+        let mut lines = vec![
+            line_at("2026-01-01T00:00:02Z"),
+            line_at("2026-01-01T00:00:01Z"),
+        ];
+        trim_boundary_ties(&mut lines);
+        assert_eq!(lines.len(), 1);
+
+        // Pathological all-one-timestamp page: trimming would empty it and
+        // stall pagination, so it must be left alone.
+        let mut lines = vec![
+            line_at("2026-01-01T00:00:01Z"),
+            line_at("2026-01-01T00:00:01Z"),
+        ];
+        trim_boundary_ties(&mut lines);
+        assert_eq!(lines.len(), 2);
+
+        let mut empty: Vec<LogLine> = vec![];
+        trim_boundary_ties(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]

@@ -6,10 +6,11 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::edge_scroll;
 use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
@@ -122,10 +123,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = state.apim.apis_error.get(&svc_id) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[2], theme);
         return;
@@ -173,7 +177,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
             let cursor = state.apim.apis_cursor.min(filtered.len() - 1);
             let visible = rows_area.height as usize;
-            let scroll = scroll_for(cursor, filtered.len(), visible);
+            let scroll = edge_scroll(&state.apim.apis_view_top, cursor, filtered.len(), visible);
 
             // `service url` is the trailing column, so it gets exactly the width
             // left after the marker gutter + the two fixed columns and their
@@ -344,7 +348,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(api_id) = api_id {
                 state.apim.selected_api_id = Some(api_id);
                 state.apim.operations_cursor = 0;
-                state.view_stack.push(state.view);
+                state.apim.operations_filter = tui_input::Input::default();
                 state.view = View::ApimOperations;
             }
             true
@@ -364,16 +368,6 @@ fn truncate_right(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max - 1).collect();
     out.push('…');
     out
-}
-
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
 }
 
 #[cfg(test)]
@@ -510,12 +504,15 @@ mod tests {
                 service_url: Some("https://echo.example.com".into()),
             }],
         );
+        state.apim.operations_filter = tui_input::Input::default().with_value("stale".to_string());
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::ApimOperations);
         assert_eq!(
             state.apim.selected_api_id.as_deref(),
             Some("/svc/myapim/apis/echo")
         );
+        // Drilling in must not carry a stale operations filter along.
+        assert_eq!(state.apim.operations_filter.value(), "");
     }
 
     fn three_apis() -> AppState {

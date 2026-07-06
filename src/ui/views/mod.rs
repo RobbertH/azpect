@@ -46,9 +46,75 @@ pub(crate) fn name_col_width(area_width: u16, fixed_w: u16, n_cols: u16, longest
     longest.min(budget).max(4)
 }
 
+/// Reconcile a persisted viewport top with the cursor under the **edge-scroll**
+/// policy (same as the logs view): the window stays where it was, the cursor
+/// moves freely inside it, and the window only shifts once the cursor pushes
+/// against an edge — up so the cursor lands on the first visible row, down so
+/// it lands on the last. Returns the reconciled top and writes it back to
+/// `top` for the next frame; render is the only place that knows `visible`,
+/// hence the `Cell` (views take `&AppState`). A stale top self-heals here: it
+/// is clamped to the last full window, and a cursor reset to 0 drags it back up
+/// on the next frame.
+pub(crate) fn edge_scroll(
+    top: &std::cell::Cell<usize>,
+    cursor: usize,
+    len: usize,
+    visible: usize,
+) -> usize {
+    if visible == 0 || len <= visible {
+        top.set(0);
+        return 0;
+    }
+    let mut t = top.get().min(len - visible);
+    if cursor < t {
+        t = cursor;
+    } else if cursor >= t + visible {
+        t = cursor + 1 - visible;
+    }
+    top.set(t);
+    t
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{name_col_width, truncate_ellipsis};
+    use super::{edge_scroll, name_col_width, truncate_ellipsis};
+    use std::cell::Cell;
+
+    #[test]
+    fn edge_scroll_stays_put_while_cursor_moves_inside_the_window() {
+        // Window at rows 10..20 of a 100-row list. Moving the cursor anywhere
+        // inside — including off the bottom row back up — must not scroll.
+        let top = Cell::new(10);
+        assert_eq!(edge_scroll(&top, 19, 100, 10), 10); // bottom row
+        assert_eq!(edge_scroll(&top, 18, 100, 10), 10); // up from the bottom
+        assert_eq!(edge_scroll(&top, 10, 100, 10), 10); // top row
+    }
+
+    #[test]
+    fn edge_scroll_shifts_only_at_the_edges() {
+        let top = Cell::new(10);
+        // Cursor pushes past the bottom → window slides down one, cursor on
+        // the last visible row.
+        assert_eq!(edge_scroll(&top, 20, 100, 10), 11);
+        // Cursor pushes past the top → window slides up, cursor on the first.
+        top.set(10);
+        assert_eq!(edge_scroll(&top, 9, 100, 10), 9);
+        // Far jumps (e.g. `G`/`gg`) land the cursor on the nearest edge.
+        assert_eq!(edge_scroll(&top, 99, 100, 10), 90);
+        assert_eq!(edge_scroll(&top, 0, 100, 10), 0);
+    }
+
+    #[test]
+    fn edge_scroll_self_heals_a_stale_top() {
+        // List shrank under a stale high top → clamp to the last full window,
+        // then the cursor (above it) drags the window up onto itself.
+        let top = Cell::new(90);
+        assert_eq!(edge_scroll(&top, 5, 20, 10), 5);
+        // Whole list fits → no scrolling at all, stored top resets.
+        top.set(7);
+        assert_eq!(edge_scroll(&top, 3, 8, 10), 0);
+        assert_eq!(top.get(), 0);
+    }
 
     #[test]
     fn truncate_ellipsis_is_noop_when_it_fits() {

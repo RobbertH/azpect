@@ -3,7 +3,7 @@
 
 #![allow(dead_code, unused_variables)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use tui_input::Input;
@@ -144,6 +144,11 @@ impl Category {
             Category::Apis => {
                 state.resources.clear();
                 state.appgw = AppGatewayBackendsCache::default();
+                // Any in-flight resource fetch is for the old scope; its result
+                // will be dropped by the `ResourcesLoaded` scope guard, so it no
+                // longer owns this flag. Left `true`, the flag would debounce
+                // away the re-fetch for the *new* scope.
+                state.loading_resources = false;
             }
             Category::Storage => {
                 state.storage = StorageCache::default();
@@ -202,9 +207,9 @@ impl Category {
 }
 
 /// Mark `category` as the user's active top-level section, route them to its
-/// root view (if not already inside the chain), reset the root cursor, and
-/// push the previous view onto the back-nav stack. Idempotent inside the
-/// chain so repeated presses don't grow the stack or disrupt drill-in state.
+/// root view (if not already inside the chain), and reset the root cursor.
+/// Idempotent inside the chain so repeated presses don't disrupt drill-in
+/// state.
 ///
 /// Single source of truth for "enter a resource category": called from the
 /// `OpenStorage` / `OpenRegistries` actions and from every category palette
@@ -212,7 +217,6 @@ impl Category {
 /// automatically.
 pub fn enter_category(state: &mut AppState, category: Category) {
     if !category.contains(state.view) {
-        state.view_stack.push(state.view);
         state.view = category.root_view();
         category.reset_root_cursor(state);
     }
@@ -489,6 +493,9 @@ pub struct PrincipalCache {
 #[derive(Clone, Default)]
 pub struct EnvVarsView {
     pub cursor: usize,
+    /// Persisted viewport top for the env-var list, reconciled each render by
+    /// [`crate::ui::views::edge_scroll`] (`Cell`: render takes `&AppState`).
+    pub view_top: Cell<usize>,
     /// `x` toggles this — when `true`, values are shown instead of masked.
     pub revealed: bool,
     /// Horizontal scroll offset (in characters) for long revealed values.
@@ -631,6 +638,9 @@ pub struct ApimCache {
     pub apis_pending: HashSet<String>,
     pub apis_error: HashMap<String, String>,
     pub apis_cursor: usize,
+    /// Persisted viewport top for the APIs list — see
+    /// [`crate::ui::views::edge_scroll`].
+    pub apis_view_top: Cell<usize>,
     /// `/`-search over the APIs list. `/` focuses, Enter commits (value
     /// persists), Esc cancels and clears. Mirrors the storage/registry filters.
     pub apis_filter: Input,
@@ -641,6 +651,9 @@ pub struct ApimCache {
     pub operations_pending: HashSet<String>,
     pub operations_error: HashMap<String, String>,
     pub operations_cursor: usize,
+    /// Persisted viewport top for the operations list — see
+    /// [`crate::ui::views::edge_scroll`].
+    pub operations_view_top: Cell<usize>,
     /// `/`-search over the operations list. Same shape as `apis_filter`.
     pub operations_filter: Input,
     pub operations_filter_active: bool,
@@ -713,6 +726,9 @@ pub struct AppGatewayBackendsCache {
     /// rows + member rows interleaved). Lives here so it survives refresh /
     /// re-entry.
     pub cursor: usize,
+    /// Persisted viewport top for the flattened row list — see
+    /// [`crate::ui::views::edge_scroll`].
+    pub view_top: Cell<usize>,
 }
 
 /// State for the Storage drill-in views. Mirrors `ApimCache`: each level of
@@ -728,6 +744,10 @@ pub struct StorageCache {
     pub accounts_pending: bool,
     pub accounts_error: Option<String>,
     pub accounts_cursor: usize,
+    /// Persisted table scroll offset, written back after render so the window
+    /// only moves when the cursor pushes against an edge (see the table
+    /// views' `TableState` wiring).
+    pub accounts_view_top: Cell<usize>,
     /// Client-side case-insensitive substring filter applied to the accounts
     /// list by name. Mirrors `list_filter` + `list_filter_active` so the input
     /// forwarding code in `app.rs` can route keystrokes to the right buffer.
@@ -752,6 +772,8 @@ pub struct StorageCache {
     pub containers_pending: HashSet<String>,
     pub containers_error: HashMap<String, String>,
     pub containers_cursor: usize,
+    /// Persisted table scroll offset — see `accounts_view_top`.
+    pub containers_view_top: Cell<usize>,
     /// Client-side case-insensitive substring filter applied to the containers
     /// list by name. Mirrors `accounts_filter` + `accounts_filter_active` so
     /// the input forwarding code in `app.rs` can route keystrokes to the right
@@ -768,6 +790,8 @@ pub struct StorageCache {
     pub blobs_pending: HashSet<String>,
     pub blobs_error: HashMap<String, String>,
     pub blobs_cursor: usize,
+    /// Persisted table scroll offset — see `accounts_view_top`.
+    pub blobs_view_top: Cell<usize>,
     /// Client-side case-insensitive substring filter applied to the blobs list
     /// by name. Mirrors `accounts_filter` + `accounts_filter_active` so the
     /// input forwarding code in `app.rs` can route keystrokes to the right
@@ -863,6 +887,8 @@ pub struct RegistryCache {
     pub registries_pending: bool,
     pub registries_error: Option<String>,
     pub registries_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub registries_view_top: Cell<usize>,
     /// Client-side case-insensitive substring filter applied to the registries
     /// list by name. Mirrors the storage filter inputs.
     pub registries_filter: Input,
@@ -875,6 +901,8 @@ pub struct RegistryCache {
     pub repositories_pending: HashSet<String>,
     pub repositories_error: HashMap<String, String>,
     pub repositories_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub repositories_view_top: Cell<usize>,
     pub repositories_filter: Input,
     pub repositories_filter_active: bool,
     /// Pinned repository name the user drilled into.
@@ -885,6 +913,8 @@ pub struct RegistryCache {
     pub tags_pending: HashSet<String>,
     pub tags_error: HashMap<String, String>,
     pub tags_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub tags_view_top: Cell<usize>,
     pub tags_filter: Input,
     pub tags_filter_active: bool,
 }
@@ -959,6 +989,8 @@ pub struct CosmosCache {
     pub accounts_pending: bool,
     pub accounts_error: Option<String>,
     pub accounts_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub accounts_view_top: Cell<usize>,
     pub accounts_filter: Input,
     pub accounts_filter_active: bool,
     /// Pinned account the user drilled into.
@@ -969,6 +1001,8 @@ pub struct CosmosCache {
     pub databases_pending: HashSet<String>,
     pub databases_error: HashMap<String, String>,
     pub databases_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub databases_view_top: Cell<usize>,
     pub databases_filter: Input,
     pub databases_filter_active: bool,
     /// Pinned database name the user drilled into.
@@ -979,6 +1013,8 @@ pub struct CosmosCache {
     pub containers_pending: HashSet<String>,
     pub containers_error: HashMap<String, String>,
     pub containers_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub containers_view_top: Cell<usize>,
     pub containers_filter: Input,
     pub containers_filter_active: bool,
     /// Pinned container name the user drilled into.
@@ -1063,6 +1099,8 @@ pub struct KeyVaultCache {
     pub vaults_pending: bool,
     pub vaults_error: Option<String>,
     pub vaults_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub vaults_view_top: Cell<usize>,
     pub vaults_filter: Input,
     pub vaults_filter_active: bool,
     /// Pinned vault the user drilled into.
@@ -1072,6 +1110,15 @@ pub struct KeyVaultCache {
     /// vault. Toggled with `s` (secrets) / `c` (certificates).
     pub items_kind: crate::azure::key_vault::ItemKind,
 
+    /// Where Esc from the items view should land when the user got there by
+    /// following a Key Vault reference (`x` on a secret-backed env var) rather
+    /// than by drilling in from the vaults list. The semantic parent of
+    /// `KeyVaultItems` is `KeyVaults` — a view a ref-follower never visited
+    /// (and which sits unloaded, showing "press r") — so the ref-jump records
+    /// its origin here and `Action::Back` consumes it. Cleared on a normal
+    /// vaults-list drill-in.
+    pub items_return_view: Option<View>,
+
     /// Keyed by `(vault_id, kind)` via [`Self::items_key`]. Holds both
     /// secrets and certs simultaneously so the kind toggle is instant if the
     /// other side is already cached.
@@ -1079,6 +1126,8 @@ pub struct KeyVaultCache {
     pub items_pending: HashSet<String>,
     pub items_error: HashMap<String, String>,
     pub items_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub items_view_top: Cell<usize>,
     pub items_filter: Input,
     pub items_filter_active: bool,
 
@@ -1166,6 +1215,8 @@ pub struct ServiceBusCache {
     pub namespaces_pending: bool,
     pub namespaces_error: Option<String>,
     pub namespaces_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub namespaces_view_top: Cell<usize>,
     pub namespaces_filter: Input,
     pub namespaces_filter_active: bool,
     /// Pinned namespace the user drilled into.
@@ -1176,6 +1227,8 @@ pub struct ServiceBusCache {
     pub entity_kind: crate::azure::service_bus::EntityKind,
     /// Shared cursor + filter across the queue and topic lists; reset on toggle.
     pub entities_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub entities_view_top: Cell<usize>,
     pub entities_filter: Input,
     pub entities_filter_active: bool,
 
@@ -1197,6 +1250,8 @@ pub struct ServiceBusCache {
     pub subscriptions_pending: HashSet<String>,
     pub subscriptions_error: HashMap<String, String>,
     pub subscriptions_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub subscriptions_view_top: Cell<usize>,
     pub subscriptions_filter: Input,
     pub subscriptions_filter_active: bool,
 }
@@ -1281,6 +1336,8 @@ pub struct SqlCache {
     pub pending: bool,
     pub error: Option<String>,
     pub cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub view_top: Cell<usize>,
     pub filter: Input,
     pub filter_active: bool,
     /// Row the user drilled into — pinned so a background list refresh that
@@ -1419,7 +1476,28 @@ pub struct LogsCache {
     /// anchor is resolved so the kept line lands mid-screen with context above and
     /// below. `Cell` because render holds `&AppState`.
     pub center_pending: Cell<bool>,
+    /// Memoized distinct-source list for the tab-bar / Tab-cycling, paired with
+    /// the buffer fingerprint it was computed from. Recomputing it means cloning
+    /// and sorting every cached line's source on each 250ms redraw — wasted work
+    /// on buffers that scroll-to-load grows to thousands of rows. The buffer
+    /// only changes in `LogsLoaded` (replace or append), so the fingerprint
+    /// (resource id, generation, row count, first/last timestamps) is enough to
+    /// detect staleness. `RefCell` because render holds `&AppState`.
+    pub sources_memo: RefCell<Option<(LogsBufferFingerprint, Vec<String>)>>,
 }
+
+/// Identity of one exact logs-buffer state, used to invalidate
+/// [`LogsCache::sources_memo`]: resource id, fetch generation, row count, and
+/// the first/last rows' timestamps. Appends grow the count and move the last
+/// timestamp; a same-length refresh moves the first (newest) timestamp; scope
+/// changes bump the generation — so any buffer mutation shifts the fingerprint.
+pub type LogsBufferFingerprint = (
+    String,
+    u64,
+    usize,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
 /// Identity of a single log line, used to re-select "the same line" across a
 /// filter/source change. There's no server-side unique id, so we key on the
@@ -1466,6 +1544,16 @@ impl LogsCache {
         self.context_around = None;
         self.pending_anchor = None;
         self.center_pending.set(false);
+        // The cursor / viewport / horizontal offset are equally resource-bound:
+        // left at the previous resource's deep-scroll position, a fresh buffer
+        // renders pinned to its clamped bottom while `k` decrements an index
+        // hundreds of rows past the end — the view looks frozen until the
+        // counter walks back into range. Same idiom as the errors-only toggle
+        // and window-change paths, which zero these whenever the buffer scope
+        // changes.
+        self.scroll = 0;
+        self.view_top.set(0);
+        self.h_offset = 0;
     }
 }
 
@@ -1473,15 +1561,26 @@ impl LogsCache {
 pub struct AppState {
     pub config: Config,
     pub view: View,
-    /// Stack of views the user has navigated through. Pushed on every forward
-    /// transition (e.g. Subs -> List -> Detail -> Logs); `Action::Back` pops.
-    /// Empty stack + Back triggers a quit.
+    /// Return path for the Help overlay — the one view that behaves as a
+    /// modal (`?` from anywhere, Esc goes back to wherever that was). Pushed
+    /// only when Help opens; popped by its Back. All other navigation walks
+    /// the `semantic_parent` breadcrumb tree instead, so nothing else may
+    /// push here: stale entries would leak into Help's return path.
     pub view_stack: Vec<View>,
     /// Which top-level resource category the user was most recently inside.
     /// Sticky across the subscription picker, so switching subscriptions
     /// returns the user to the same category list (under the new scope)
     /// instead of always landing them on apis. Updated by [`enter_category`].
     pub last_category: Category,
+
+    /// Monotonic counter identifying the current subscription scope + signed-in
+    /// identity. Bumped when the user pins a different subscription (or "All")
+    /// and after an in-app `az login`. Every scope-level background fetch
+    /// (resource/account/namespace lists) captures it at spawn time and carries
+    /// it back in its `*Loaded` event; the handlers drop results whose scope no
+    /// longer matches, so a slow in-flight fetch for the previous scope can
+    /// never be displayed as if it were the current one.
+    pub scope_generation: u64,
 
     pub subscriptions: Vec<Subscription>,
     pub selected_subscription: Option<String>,
@@ -1495,6 +1594,10 @@ pub struct AppState {
 
     pub resources: Vec<Resource>,
     pub list_cursor: usize,
+    /// Persisted viewport top for the resource list, reconciled each render by
+    /// [`crate::ui::views::edge_scroll`] so the window only moves when the
+    /// cursor pushes against an edge. `Cell` because render takes `&AppState`.
+    pub list_view_top: Cell<usize>,
     pub list_filter: Input,
     pub list_filter_active: bool,
     pub favorites_only: bool,
@@ -1522,6 +1625,16 @@ pub struct AppState {
     /// Detail-view cursor (over the meta rows) plus the optional Enter modal
     /// payload. Reset on entering Detail from a different view.
     pub detail_view: DetailView,
+
+    /// Max valid vertical scroll offset for the scrollable body currently in
+    /// the foreground (the full-screen detail panes and Enter/reveal modals —
+    /// only one such body is ever on top at a time, so a single slot serves
+    /// them all). Written back by each render pass, the only place that knows
+    /// the wrapped row count and viewport height; read by the key handlers so
+    /// `G`/`j` clamp the *stored* offset instead of parking it at a huge
+    /// sentinel where `k` decrements invisibly for thousands of presses.
+    /// `Cell` because render holds `&AppState`.
+    pub scroll_max: Cell<u16>,
 
     pub metrics: MetricsCache,
     pub health: HealthCache,
@@ -1611,6 +1724,7 @@ impl AppState {
             view: View::List,
             view_stack: Vec::new(),
             last_category: Category::Apis,
+            scope_generation: 0,
             subscriptions: Vec::new(),
             selected_subscription: config.last_subscription_id.clone(),
             subscription_cursor: 0,
@@ -1619,6 +1733,7 @@ impl AppState {
             loading_subscriptions: true,
             resources: Vec::new(),
             list_cursor: 0,
+            list_view_top: Cell::new(0),
             list_filter: Input::default(),
             list_filter_active: false,
             favorites_only: false,
@@ -1628,6 +1743,7 @@ impl AppState {
             env_vars_view: EnvVarsView::default(),
             env_var_edit: None,
             detail_view: DetailView::default(),
+            scroll_max: Cell::new(0),
             metrics: MetricsCache {
                 range,
                 ..Default::default()
@@ -1669,6 +1785,88 @@ impl AppState {
             pending_exec: None,
             input_suspended: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
+        }
+    }
+
+    /// Drop every cache that belongs to the previously signed-in identity:
+    /// the subscription-scoped lists (via [`Category::clear_cache`]) plus all
+    /// per-resource-id caches — metrics, health, logs, app settings and env
+    /// vars, some of which are secret-bearing. Called after a successful
+    /// in-app `az login`: the old identity's data must not stay visible (or
+    /// yankable) under the new login. User preferences that happen to live
+    /// inside the caches (chart window, errors-only toggle) survive.
+    pub fn flush_identity_caches(&mut self) {
+        for category in Category::ALL {
+            category.clear_cache(self);
+        }
+        self.metrics = MetricsCache {
+            range: self.metrics.range,
+            ..Default::default()
+        };
+        self.logs = LogsCache {
+            range: self.logs.range,
+            errors_only: self.logs.errors_only,
+            // Orphan any in-flight fetch: a late page from the old identity
+            // must not repopulate the buffer we just flushed.
+            generation: self.logs.generation.wrapping_add(1),
+            ..Default::default()
+        };
+        self.health = HealthCache::default();
+        self.container_app_overview = ContainerAppOverviewCache::default();
+        self.revision_meta = RevisionMetaCache::default();
+        self.replica_instances = ReplicaInstancesCache::default();
+        self.func_image = FuncImageCache::default();
+        self.func_settings = FuncSettingsCache::default();
+        self.func_triggers = FuncTriggersCache::default();
+        self.principals = PrincipalCache::default();
+        self.apim = ApimCache::default();
+        self.resources_loaded_at = None;
+    }
+
+    /// Progress of the per-row decoration fetches for the *current* resource
+    /// list — health badge for every row, overview for Container Apps, image
+    /// for Function Apps — as `(back, launched)`. These fetches are throttled
+    /// through a shared semaphore to avoid ARM 429s, so on a large
+    /// subscription the list takes a while to settle; the header uses this to
+    /// show that progress instead of leaving the user staring at LOADING
+    /// badges with no sense of how far along the sweep is. `None` once
+    /// nothing is in flight (the indicator should disappear, not stick at
+    /// n/n). Errored fetches that cache no failure marker drop out of
+    /// `launched` when they finish — counts may shrink slightly while
+    /// settling, but they converge and the condition for hiding is exact.
+    pub fn list_fetch_progress(&self) -> Option<(usize, usize)> {
+        use crate::azure::resources::ResourceKind;
+        let mut in_flight = 0usize;
+        let mut back = 0usize;
+        let mut tally = |pending: bool, done: bool| {
+            if pending {
+                in_flight += 1;
+            } else if done {
+                back += 1;
+            }
+        };
+        for r in &self.resources {
+            tally(
+                self.health.pending.contains(&r.id),
+                self.health.by_resource.contains_key(&r.id)
+                    || self.health.failures.contains_key(&r.id),
+            );
+            match r.kind {
+                ResourceKind::ContainerApp => tally(
+                    self.container_app_overview.pending.contains(&r.id),
+                    self.container_app_overview.by_resource.contains_key(&r.id),
+                ),
+                ResourceKind::FunctionApp => tally(
+                    self.func_image.pending.contains(&r.id),
+                    self.func_image.by_resource.contains_key(&r.id),
+                ),
+                _ => {}
+            }
+        }
+        if in_flight == 0 {
+            None
+        } else {
+            Some((back, back + in_flight))
         }
     }
 
@@ -1916,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_category_from_outside_chain_pushes_stack_and_resets_cursor() {
+    fn enter_category_from_outside_chain_resets_cursor() {
         let mut state = AppState::new(Config::default());
         state.view = View::Subscriptions;
         // Pretend an old cursor was lingering from a previous session.
@@ -1924,7 +2122,9 @@ mod tests {
         enter_category(&mut state, Category::Storage);
         assert_eq!(state.view, View::StorageAccounts);
         assert_eq!(state.last_category, Category::Storage);
-        assert_eq!(state.view_stack.last(), Some(&View::Subscriptions));
+        // Back navigation is semantic-parent-based; the Help-only view_stack
+        // must stay untouched by category switches.
+        assert!(state.view_stack.is_empty());
         assert_eq!(
             state.storage.accounts_cursor, 0,
             "root cursor should reset on enter",

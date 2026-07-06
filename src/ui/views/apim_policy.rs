@@ -6,7 +6,7 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
@@ -63,10 +63,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = state.apim.policy_error.get(op_id) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, inner);
         render_footer(frame, chunks[2], theme);
         return;

@@ -11,9 +11,12 @@
 //!    maps 1:1 to what we edit).
 //! 2. Locate the target container (`containers` or `initContainers`, by name +
 //!    init flag) and set/insert the `{name,value}` entry, preserving every other
-//!    entry — including untouched `secretRef` ones.
+//!    entry — including untouched `secretRef` ones. `revisionSuffix` is stripped
+//!    from the template before the write — see [`strip_revision_suffix`].
 //! 3. PATCH the resource with just `{properties:{template}}` so we don't replay
-//!    read-only fields.
+//!    read-only fields, sending `If-Match` with the ETag captured from the GET:
+//!    a deployment landing between our read and write becomes a clean 412
+//!    conflict instead of being silently reverted by our stale template.
 //!
 //! Only plain literal entries are editable. A `secretRef` entry's literal value
 //! lives in `properties.configuration.secrets`, which a template GET never
@@ -23,9 +26,12 @@
 #![allow(dead_code, unused_variables)]
 
 use anyhow::{anyhow, Context};
+use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH};
+use reqwest::StatusCode;
 
-use crate::azure::auth::AzureAuth;
-use crate::azure::client::ArmClient;
+use crate::azure::auth::{AzureAuth, SCOPE_ARM};
+use crate::azure::client::ARM_BASE;
+use crate::azure::cosmos::{build_http, send_with_retry};
 
 /// Microsoft.App API version used for the read + write. Matches the overview
 /// fetch so we never mix template shapes across versions.
@@ -46,33 +52,120 @@ pub struct EnvTarget {
 /// Read the app, apply the edit to its template, and PATCH it back. On success
 /// the new revision is being provisioned (the call returns once ARM accepts the
 /// PATCH, not once the revision is healthy).
+///
+/// Goes through raw reqwest rather than [`crate::azure::client::ArmClient`]
+/// because the read-modify-write needs the GET's `ETag` response header (for
+/// the `If-Match` concurrency guard) and `ArmClient` only surfaces parsed JSON.
+/// Retry policy is the same via [`send_with_retry`]; the PATCH is safe to
+/// replay because `If-Match` makes it conditional.
 pub async fn update(
     auth: &AzureAuth,
     container_app_id: &str,
     target: &EnvTarget,
     new_value: &str,
 ) -> anyhow::Result<()> {
-    let client = ArmClient::new(auth.clone())?;
-    let mut app = client
-        .get(container_app_id, &[("api-version", API_VERSION)])
+    let token = auth
+        .token(SCOPE_ARM)
         .await
-        .with_context(|| format!("fetching container app {container_app_id} for edit"))?;
+        .map_err(|e| anyhow!("token acquisition for container app edit failed: {e}"))?;
+    let bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| anyhow!("bearer token contained invalid header characters"))?;
+    let http = build_http()?;
+    let url = format!("{ARM_BASE}{container_app_id}?api-version={API_VERSION}");
+
+    let resp = send_with_retry(|| {
+        http.get(&url)
+            .header(AUTHORIZATION, bearer.clone())
+            .header(ACCEPT, HeaderValue::from_static("application/json"))
+    })
+    .await
+    .with_context(|| format!("fetching container app {container_app_id} for edit"))?;
+    let status = resp.status();
+    // Capture the ETag before consuming the response; replayed as If-Match on
+    // the PATCH so a concurrent deployment fails cleanly instead of being
+    // reverted. Absent ETag (older API surface) degrades to the old
+    // last-write-wins behaviour rather than blocking the edit.
+    let etag = resp
+        .headers()
+        .get(ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "fetching container app {container_app_id} for edit: azure api error {}: {}",
+            status.as_u16(),
+            truncate_error_body(&body)
+        ));
+    }
+    let mut app: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("parsing container app {container_app_id}"))?;
 
     let template = app
         .pointer_mut("/properties/template")
         .ok_or_else(|| anyhow!("container app {container_app_id} has no properties.template"))?;
     apply_env_edit(template, target, new_value)?;
+    strip_revision_suffix(template);
 
-    let template = template.clone();
-    let body = serde_json::json!({ "properties": { "template": template } });
-    client
-        .patch(
-            &format!("{container_app_id}?api-version={API_VERSION}"),
-            &body,
-        )
-        .await
-        .with_context(|| format!("patching container app {container_app_id}"))?;
+    let body = serde_json::json!({ "properties": { "template": template.clone() } });
+    let resp = send_with_retry(|| {
+        let mut req = http
+            .patch(&url)
+            .header(AUTHORIZATION, bearer.clone())
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .json(&body);
+        if let Some(etag) = &etag {
+            req = req.header(IF_MATCH, etag.as_str());
+        }
+        req
+    })
+    .await
+    .with_context(|| format!("patching container app {container_app_id}"))?;
+    let status = resp.status();
+    if status == StatusCode::PRECONDITION_FAILED || status == StatusCode::CONFLICT {
+        return Err(anyhow!(
+            "the container app changed while this edit was being prepared \
+             (another deployment in flight?) — nothing was written. Reload the \
+             app and retry the edit."
+        ));
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "patching container app {container_app_id}: azure api error {}: {}",
+            status.as_u16(),
+            truncate_error_body(&body)
+        ));
+    }
     Ok(())
+}
+
+/// Remove `revisionSuffix` from a template before replaying it. Apps that pin
+/// a suffix (CI pipelines stamping git SHAs into it) would otherwise fail every
+/// env edit with a revision-name collision — the replayed suffix names the
+/// revision that already exists. The portal and `az containerapp` strip it the
+/// same way, letting the platform generate a fresh suffix for the new revision.
+pub(crate) fn strip_revision_suffix(template: &mut serde_json::Value) {
+    if let Some(obj) = template.as_object_mut() {
+        obj.remove("revisionSuffix");
+    }
+}
+
+/// Cap an error response body for inclusion in the error message — same limit
+/// as `client.rs`'s excerpting.
+fn truncate_error_body(s: &str) -> String {
+    const LIMIT: usize = 1024;
+    if s.len() <= LIMIT {
+        s.to_string()
+    } else {
+        let mut end = LIMIT;
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
 }
 
 /// Set (or insert) the `{name,value}` entry in the targeted container's `env`
@@ -218,5 +311,25 @@ mod tests {
         let mut tpl = json!({ "containers": [ { "name": "app", "env": [] } ] });
         let err = apply_env_edit(&mut tpl, &target("nope", "A"), "1").unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn strip_revision_suffix_drops_pinned_suffix_only() {
+        // A replayed pinned suffix (e.g. a CI git SHA) would collide with the
+        // revision it already names; everything else must survive untouched.
+        let mut tpl = json!({
+            "revisionSuffix": "sha-abc123",
+            "containers": [ { "name": "app", "env": [] } ]
+        });
+        strip_revision_suffix(&mut tpl);
+        assert!(tpl.get("revisionSuffix").is_none());
+        assert!(tpl.get("containers").is_some());
+
+        // No suffix / non-object templates are a no-op, not a panic.
+        let mut bare = json!({ "containers": [] });
+        strip_revision_suffix(&mut bare);
+        assert_eq!(bare, json!({ "containers": [] }));
+        let mut not_obj = json!("x");
+        strip_revision_suffix(&mut not_obj);
     }
 }

@@ -24,10 +24,10 @@
 //!   ACR / Key Vault, all of which need a second token.
 //! - **Read-only**: namespace / queue / topic / subscription enumeration only.
 //!   No send / receive / peek / purge codepaths, even stubs.
-//! - **Single page**: like the rest of the app (see
-//!   [`super::resources`]), these list calls do not follow `nextLink`. The ARM
-//!   list endpoints page at 100 entities; namespaces with more than that will
-//!   show the first page only. A warning is logged when the cap is hit.
+//! - **Paginated**: the ARM list endpoints page at 100 entities, so the queue /
+//!   topic / subscription lists follow `nextLink` until exhausted, capped at
+//!   [`MAX_PAGES`] pages with a `tracing::warn` when the cap is hit (mirrors
+//!   the warn-and-stop precedent in `storage.rs` / `key_vault.rs`).
 
 #![allow(dead_code, unused_variables)]
 
@@ -35,10 +35,15 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 
 use crate::azure::auth::AzureAuth;
-use crate::azure::client::ArmClient;
+use crate::azure::client::{ArmClient, ARM_BASE};
 
 /// API version for the queues / topics / subscriptions control-plane endpoints.
 const SERVICE_BUS_API_VERSION: &str = "2021-11-01";
+
+/// Cap on `nextLink` pages followed per list call. ARM pages at 100 entities,
+/// so this bounds a single list at ~5000 rows — far beyond what the TUI can
+/// usefully show, and it keeps a pathological namespace from stalling a view.
+const MAX_PAGES: usize = 50;
 
 /// One Service Bus namespace discovered via Resource Graph.
 #[derive(Clone, Debug)]
@@ -201,35 +206,38 @@ pub async fn list_namespaces(
     Ok(rows.iter().filter_map(parse_namespace).collect())
 }
 
-/// List queues inside `namespace` via the ARM control plane.
+/// List queues inside `namespace` via the ARM control plane, following
+/// `nextLink` until exhausted (or [`MAX_PAGES`]).
 pub async fn list_queues(
     auth: &AzureAuth,
     namespace: &ServiceBusNamespace,
 ) -> anyhow::Result<Vec<ServiceBusQueue>> {
     let client = ArmClient::new(auth.clone())?;
     let path = format!("{}/queues", namespace.id);
-    let resp = client
-        .get(&path, &[("api-version", SERVICE_BUS_API_VERSION)])
+    let pages = get_all_pages(&client, &path, "queues", &namespace.name)
         .await
         .with_context(|| format!("list service bus queues for {}", namespace.name))?;
-    Ok(parse_queues_json(&resp))
+    Ok(pages.iter().flat_map(parse_queues_json).collect())
 }
 
-/// List topics inside `namespace` via the ARM control plane.
+/// List topics inside `namespace` via the ARM control plane, following
+/// `nextLink` until exhausted (or [`MAX_PAGES`]).
 pub async fn list_topics(
     auth: &AzureAuth,
     namespace: &ServiceBusNamespace,
 ) -> anyhow::Result<Vec<ServiceBusTopic>> {
     let client = ArmClient::new(auth.clone())?;
     let path = format!("{}/topics", namespace.id);
-    let resp = client
-        .get(&path, &[("api-version", SERVICE_BUS_API_VERSION)])
+    let pages = get_all_pages(&client, &path, "topics", &namespace.name)
         .await
         .with_context(|| format!("list service bus topics for {}", namespace.name))?;
-    Ok(parse_topics_json(&resp))
+    Ok(pages.iter().flat_map(parse_topics_json).collect())
 }
 
-/// List subscriptions on `topic_name` inside `namespace`.
+/// List subscriptions on `topic_name` inside `namespace`, following `nextLink`
+/// until exhausted (or [`MAX_PAGES`]). `topic_name` is used verbatim — topic
+/// names may legitimately contain `/`, which ARM accepts as literal path
+/// characters here, exactly as they appear in the topic's resource id.
 pub async fn list_subscriptions(
     auth: &AzureAuth,
     namespace: &ServiceBusNamespace,
@@ -237,8 +245,7 @@ pub async fn list_subscriptions(
 ) -> anyhow::Result<Vec<ServiceBusSubscription>> {
     let client = ArmClient::new(auth.clone())?;
     let path = format!("{}/topics/{}/subscriptions", namespace.id, topic_name);
-    let resp = client
-        .get(&path, &[("api-version", SERVICE_BUS_API_VERSION)])
+    let pages = get_all_pages(&client, &path, "subscriptions", &namespace.name)
         .await
         .with_context(|| {
             format!(
@@ -246,7 +253,58 @@ pub async fn list_subscriptions(
                 namespace.name, topic_name
             )
         })?;
-    Ok(parse_subscriptions_json(&resp))
+    Ok(pages.iter().flat_map(parse_subscriptions_json).collect())
+}
+
+/// GET `first_path` and every `nextLink` page after it, returning the raw page
+/// envelopes (each with its own `value` array). Stops with a `tracing::warn`
+/// at [`MAX_PAGES`] so one huge namespace can't stall the view forever.
+async fn get_all_pages(
+    client: &ArmClient,
+    first_path: &str,
+    what: &str,
+    namespace_name: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut pages = Vec::new();
+    let mut resp = client
+        .get(first_path, &[("api-version", SERVICE_BUS_API_VERSION)])
+        .await?;
+    loop {
+        let next = next_link_path(&resp);
+        pages.push(resp);
+        if pages.len() >= MAX_PAGES && next.is_some() {
+            tracing::warn!(
+                "service bus {what} for {namespace_name}: stopping after {MAX_PAGES} pages; \
+                 more entities exist beyond the cap"
+            );
+            break;
+        }
+        match next {
+            // nextLink embeds the api-version (and skip token) in its query
+            // string, so no extra query params on follow-up requests.
+            Some(path) => resp = client.get(&path, &[]).await?,
+            None => break,
+        }
+    }
+    Ok(pages)
+}
+
+/// Extract a page's `nextLink` as an [`ArmClient`]-relative path (the client
+/// prepends `ARM_BASE`). A `nextLink` pointing at a foreign host would be
+/// re-rooted onto ARM_BASE at best and is not followed; ARM never does this
+/// in practice, so warn-and-stop is the safe reading.
+fn next_link_path(resp: &serde_json::Value) -> Option<String> {
+    let link = resp
+        .get("nextLink")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    match link.strip_prefix(ARM_BASE) {
+        Some(path) => Some(path.to_string()),
+        None => {
+            tracing::warn!("ignoring nextLink not rooted at {ARM_BASE}: {link}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +353,7 @@ pub(crate) fn parse_queues_json(v: &serde_json::Value) -> Vec<ServiceBusQueue> {
 
 fn parse_queue_row(row: &serde_json::Value) -> Option<ServiceBusQueue> {
     let id = row.get("id")?.as_str()?.to_string();
-    let name = entity_name(row)?;
+    let name = entity_name(row, "/queues/")?;
     let props = row.get("properties");
     Some(ServiceBusQueue {
         id,
@@ -318,7 +376,7 @@ pub(crate) fn parse_topics_json(v: &serde_json::Value) -> Vec<ServiceBusTopic> {
 
 fn parse_topic_row(row: &serde_json::Value) -> Option<ServiceBusTopic> {
     let id = row.get("id")?.as_str()?.to_string();
-    let name = entity_name(row)?;
+    let name = entity_name(row, "/topics/")?;
     let props = row.get("properties");
     Some(ServiceBusTopic {
         id,
@@ -339,7 +397,7 @@ pub(crate) fn parse_subscriptions_json(v: &serde_json::Value) -> Vec<ServiceBusS
 
 fn parse_subscription_row(row: &serde_json::Value) -> Option<ServiceBusSubscription> {
     let id = row.get("id")?.as_str()?.to_string();
-    let name = entity_name(row)?;
+    let name = subscription_name(row)?;
     let props = row.get("properties");
     Some(ServiceBusSubscription {
         id,
@@ -380,24 +438,45 @@ fn array_value(v: &serde_json::Value) -> &[serde_json::Value] {
         .unwrap_or(&[])
 }
 
-/// Entity name from the row's `name` field, falling back to the last path
-/// segment of the id. ARM sometimes returns subscription names as `topic/sub`
-/// in the `name` field; the trailing segment is the bare entity name.
-fn entity_name(row: &serde_json::Value) -> Option<String> {
-    let raw = row
+/// Queue/topic name from the row's `name` field, **verbatim** — queue and
+/// topic names legitimately contain `/` (e.g. `orders/v2`), so stripping to
+/// the last path segment would mangle them (and break the subscriptions URL
+/// built from a topic's name). Falls back to the id: everything after the
+/// entity-kind marker (`/queues/` or `/topics/`), again keeping any embedded
+/// slashes intact.
+fn entity_name(row: &serde_json::Value, id_marker: &str) -> Option<String> {
+    if let Some(raw) = row
         .get("name")
         .and_then(|n| n.as_str())
-        .filter(|s| !s.is_empty());
-    if let Some(raw) = raw {
-        return Some(raw.rsplit('/').next().unwrap_or(raw).to_string());
+        .filter(|s| !s.is_empty())
+    {
+        return Some(raw.to_string());
     }
     let id = row.get("id")?.as_str()?;
-    let last = id.rsplit('/').next()?;
-    if last.is_empty() {
+    // rfind: resource ids start with `/subscriptions/{subId}/…`, so the
+    // *last* occurrence of the marker is the one that precedes the name.
+    let start = id.rfind(id_marker)? + id_marker.len();
+    let rest = &id[start..];
+    if rest.is_empty() {
         None
     } else {
-        Some(last.to_string())
+        Some(rest.to_string())
     }
+}
+
+/// Subscription name from the row. ARM returns subscription names as
+/// `topic/sub` in the `name` field; subscription names themselves cannot
+/// contain `/` (only their parent topic's name can), so the trailing segment
+/// is always the bare subscription name.
+fn subscription_name(row: &serde_json::Value) -> Option<String> {
+    if let Some(raw) = row
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(raw.rsplit('/').next().unwrap_or(raw).to_string());
+    }
+    entity_name(row, "/subscriptions/")
 }
 
 fn string_field(v: &serde_json::Value, key: &str) -> String {
@@ -583,6 +662,72 @@ mod tests {
         assert_eq!(s.max_delivery_count, Some(5));
         assert_eq!(s.requires_session, Some(true));
         assert_eq!(s.forward_to.as_deref(), Some("sink-queue"));
+    }
+
+    #[test]
+    fn queue_and_topic_names_with_slashes_stay_verbatim() {
+        // Queue/topic names legitimately contain `/`; truncating to the last
+        // segment displayed the wrong name and broke drill-in URLs.
+        let body = json!({
+            "value": [{
+                "id": "/subs/s/rg/r/providers/Microsoft.ServiceBus/namespaces/ns/queues/orders/v2",
+                "name": "orders/v2",
+                "properties": { "status": "Active" }
+            }]
+        });
+        let queues = parse_queues_json(&body);
+        assert_eq!(queues[0].name, "orders/v2");
+
+        let body = json!({
+            "value": [{
+                "id": "/subs/s/rg/r/providers/Microsoft.ServiceBus/namespaces/ns/topics/orders/v2",
+                "name": "orders/v2",
+                "properties": { "status": "Active" }
+            }]
+        });
+        let topics = parse_topics_json(&body);
+        assert_eq!(topics[0].name, "orders/v2");
+    }
+
+    #[test]
+    fn entity_name_falls_back_to_id_after_kind_marker() {
+        // Missing `name` field: derive from the id, keeping embedded slashes.
+        let row = json!({
+            "id": "/subscriptions/s/resourceGroups/r/providers/Microsoft.ServiceBus/namespaces/ns/queues/orders/v2"
+        });
+        assert_eq!(entity_name(&row, "/queues/").as_deref(), Some("orders/v2"));
+        assert_eq!(entity_name(&row, "/topics/"), None);
+    }
+
+    #[test]
+    fn subscription_under_slash_topic_keeps_bare_sub_name() {
+        // Topic `orders/v2`, subscription `audit`: ARM's name field is the
+        // whole `topic/sub` path; only the trailing segment is the sub name.
+        let body = json!({
+            "value": [{
+                "id": "/subs/s/rg/r/providers/Microsoft.ServiceBus/namespaces/ns/topics/orders/v2/subscriptions/audit",
+                "name": "orders/v2/audit",
+                "properties": { "status": "Active" }
+            }]
+        });
+        let subs = parse_subscriptions_json(&body);
+        assert_eq!(subs[0].name, "audit");
+    }
+
+    #[test]
+    fn next_link_path_strips_arm_base_and_rejects_foreign_hosts() {
+        let resp = json!({
+            "value": [],
+            "nextLink": "https://management.azure.com/x/queues?api-version=2021-11-01&$skipToken=y"
+        });
+        assert_eq!(
+            next_link_path(&resp).as_deref(),
+            Some("/x/queues?api-version=2021-11-01&$skipToken=y")
+        );
+        assert_eq!(next_link_path(&json!({ "value": [] })), None);
+        assert_eq!(next_link_path(&json!({ "nextLink": "" })), None);
+        let foreign = json!({ "nextLink": "https://evil.example.com/x" });
+        assert_eq!(next_link_path(&foreign), None);
     }
 
     #[test]

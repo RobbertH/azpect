@@ -6,10 +6,11 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use super::edge_scroll;
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
@@ -129,10 +130,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = state.apim.operations_error.get(api_id) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, inner);
         render_footer(frame, chunks[2], theme);
         return;
@@ -178,7 +182,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
             let cursor = state.apim.operations_cursor.min(filtered.len() - 1);
             let visible = rows_area.height as usize;
-            let scroll = scroll_for(cursor, filtered.len(), visible);
+            let scroll = edge_scroll(
+                &state.apim.operations_view_top,
+                cursor,
+                filtered.len(),
+                visible,
+            );
 
             // `name` is the trailing column, so it gets exactly the width left
             // after the marker gutter + method + url columns and their gaps —
@@ -388,7 +397,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(op_id) = op_id {
                 state.apim.selected_operation_id = Some(op_id);
                 state.apim.policy_scroll = 0;
-                state.view_stack.push(state.view);
                 state.view = View::ApimPolicy;
             }
             true
@@ -408,16 +416,6 @@ fn truncate_right(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max - 1).collect();
     out.push('…');
     out
-}
-
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
 }
 
 #[cfg(test)]

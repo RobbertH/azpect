@@ -51,6 +51,7 @@ use serde::Deserialize;
 
 use crate::azure::auth::{AzureAuth, SCOPE_KEY_VAULT};
 use crate::azure::client::ArmClient;
+use crate::azure::cosmos::{build_http, send_with_retry};
 
 /// One Key Vault discovered via Resource Graph.
 #[derive(Clone, Debug)]
@@ -238,10 +239,9 @@ pub async fn list_items(
     loop {
         let auth_value = HeaderValue::from_str(&format!("Bearer {bearer}"))
             .map_err(|_| anyhow!("Key Vault bearer contained invalid header characters"))?;
-        let resp = http
-            .get(&url)
-            .header(AUTHORIZATION, auth_value)
-            .send()
+        // Retried: Key Vault throttles list calls (429) and a metadata GET is
+        // safe to replay.
+        let resp = send_with_retry(|| http.get(&url).header(AUTHORIZATION, auth_value.clone()))
             .await
             .map_err(|e| anyhow!("key vault data-plane network error: {e}"))
             .map_err(|e| classify_data_plane_error(&vault.name, &host, e))?;
@@ -314,10 +314,8 @@ pub async fn get_secret_value(
 
     let auth_value = HeaderValue::from_str(&format!("Bearer {bearer}"))
         .map_err(|_| anyhow!("Key Vault bearer contained invalid header characters"))?;
-    let resp = http
-        .get(&url)
-        .header(AUTHORIZATION, auth_value)
-        .send()
+    // Retried: revealing a secret is a plain GET, safe to replay on 429/5xx.
+    let resp = send_with_retry(|| http.get(&url).header(AUTHORIZATION, auth_value.clone()))
         .await
         .map_err(|e| anyhow!("key vault data-plane network error: {e}"))
         .map_err(|e| classify_data_plane_error(&vault.name, &host, e))?;
@@ -350,13 +348,6 @@ pub async fn get_secret_value(
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
-
-fn build_http() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("azpect/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| anyhow!("failed to build reqwest client: {e}"))
-}
 
 /// Render an error response body for display. Key Vault returns its standard
 /// `{"error":{"code":…,"message":…,"innererror":…}}` envelope as JSON; pretty-
@@ -527,7 +518,12 @@ pub fn parse_key_vault_ref(value: &str) -> Option<KeyVaultRef> {
     let mut vault_name = None;
     let mut secret_name = None;
     for part in inner.split(';') {
-        let (k, v) = part.split_once('=')?;
+        // Skip empty or `=`-less parts instead of failing the whole parse —
+        // App Service tolerates a trailing `;`, so a followable reference must
+        // not turn into `None` over one.
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
         match k.trim() {
             "SecretUri" => secret_uri = Some(v.trim().to_string()),
             "VaultName" => vault_name = Some(v.trim().to_string()),
@@ -827,6 +823,22 @@ mod tests {
         );
         assert_eq!(r.secret_name, "orders-db-connection");
         assert!(key_vault_ref_from_secret_uri("not-a-url").is_none());
+    }
+
+    #[test]
+    fn parse_key_vault_ref_tolerates_trailing_semicolon() {
+        // App Service accepts and resolves a reference with a trailing `;`,
+        // so the parser must too (a `=`-less part is skipped, not fatal).
+        let r = parse_key_vault_ref("@Microsoft.KeyVault(VaultName=myvault;SecretName=api-key;)")
+            .expect("trailing semicolon should not break the parse");
+        assert_eq!(r.vault_name, "myvault");
+        assert_eq!(r.secret_name, "api-key");
+
+        let r = parse_key_vault_ref(
+            "@Microsoft.KeyVault(SecretUri=https://v.vault.azure.net/secrets/db-pass;)",
+        )
+        .expect("trailing semicolon after SecretUri should not break the parse");
+        assert_eq!(r.secret_name, "db-pass");
     }
 
     #[test]

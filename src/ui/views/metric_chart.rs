@@ -5,7 +5,7 @@
 //! Both views render the same shape — a stack of metric rows (a label + a
 //! summary line over a sparkline) under one shared time axis — over a
 //! `Vec<MetricSeries>`. The pieces that don't depend on *which* resource the
-//! series came from live here: the value scaling, the nearest-neighbor
+//! series came from live here: the value scaling, the spike-preserving
 //! resample to the chart width, the per-kind colour, the time axis, the
 //! Azure-error → hint translation, and the row renderer itself. The per-view
 //! difference is only the **summary line** (e.g. "total: 1.2k" vs "latest: 40%
@@ -141,19 +141,32 @@ pub(crate) fn floor_nonzero_bars(data: &[u64], max: u64) -> Vec<u64> {
         .collect()
 }
 
-/// Resample `data` so its length matches `width` using nearest-neighbor
-/// indexing. Each output column maps back to `data[i * data.len() / width]`, so
-/// the leftmost output is `data[0]` and the rightmost is the last sample. Works
-/// for both upsampling (sparse data, wide chart) and downsampling (lots of
-/// points, narrow chart).
+/// Resample `data` so its length matches `width`. Upsampling (sparse data,
+/// wide chart) repeats samples nearest-neighbor style: each output column maps
+/// back to `data[i * data.len() / width]`, so the leftmost output is `data[0]`
+/// and the rightmost is the last sample. Downsampling (lots of points, narrow
+/// chart) max-pools each output column over its source bucket range
+/// `[i*len/width, (i+1)*len/width)` instead — nearest-neighbor would *skip*
+/// input buckets (7d = 168 hourly points on a 100-col chart drops ~40% of
+/// them), letting a single-bucket 5xx spike vanish while the summary shows a
+/// nonzero total. Max, not average: these sparklines exist to show spikes.
 pub(crate) fn stretch_to_width(data: &[u64], width: usize) -> Vec<u64> {
     if width == 0 || data.is_empty() {
         return Vec::new();
     }
+    let len = data.len();
+    if len <= width {
+        return (0..width)
+            .map(|i| data[(i * len / width).min(len - 1)])
+            .collect();
+    }
     (0..width)
         .map(|i| {
-            let idx = i * data.len() / width;
-            data[idx.min(data.len() - 1)]
+            let start = i * len / width;
+            // Every bucket is non-empty (len > width ⇒ end > start), but keep
+            // the clamp so an off-by-one can never panic on a slice bound.
+            let end = ((i + 1) * len / width).clamp(start + 1, len);
+            data[start..end].iter().copied().max().unwrap_or(0)
         })
         .collect()
 }
@@ -311,10 +324,31 @@ mod tests {
     }
 
     #[test]
-    fn stretch_to_width_downsamples_data() {
+    fn stretch_to_width_downsamples_by_max_pooling() {
+        // Each output column takes the max of its 2-sample source bucket, so
+        // no input value can be silently skipped.
         let data = vec![10u64, 20, 30, 40, 50, 60, 70, 80];
         let out = stretch_to_width(&data, 4);
-        assert_eq!(out, vec![10, 30, 50, 70]);
+        assert_eq!(out, vec![20, 40, 60, 80]);
+    }
+
+    #[test]
+    fn stretch_to_width_downsampling_preserves_single_spike() {
+        // A lone 5xx spike in a week of hourly buckets must survive any chart
+        // width — nearest-neighbor indexing used to skip ~40% of the buckets
+        // on a 100-col terminal, contradicting the nonzero summary total.
+        for spike_at in [0usize, 47, 100, 167] {
+            let mut data = vec![0u64; 168];
+            data[spike_at] = 5;
+            for width in 1..=200usize {
+                let out = stretch_to_width(&data, width);
+                assert_eq!(
+                    out.iter().copied().max(),
+                    Some(5),
+                    "spike at {spike_at} lost at width {width}"
+                );
+            }
+        }
     }
 
     #[test]

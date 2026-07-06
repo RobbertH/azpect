@@ -2,10 +2,12 @@
 //! theme. Lives under `${XDG_CONFIG_HOME:-~/.config}/azpect/config.toml`.
 //!
 //! The file is created on first run. Missing or unparseable files yield
-//! [`Config::default`] rather than an error so the TUI always boots.
+//! [`Config::default`] rather than an error so the TUI always boots — but an
+//! unparseable file is first moved aside to `config.toml.bak` so the
+//! exit-time [`save`] can't overwrite the user's data with defaults.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use directories::ProjectDirs;
@@ -86,7 +88,9 @@ impl Config {
     }
 }
 
-/// Read config from disk. Missing/bad file → `Config::default()` (logs a warning).
+/// Read config from disk. Missing/bad file → `Config::default()` (logs a
+/// warning). An unparseable file is quarantined to `config.toml.bak` first —
+/// see [`quarantine_corrupt_config`] for why.
 pub fn load() -> anyhow::Result<Config> {
     let path = config_path()?;
     let raw = match fs::read_to_string(&path) {
@@ -101,14 +105,55 @@ pub fn load() -> anyhow::Result<Config> {
     match toml::from_str::<Config>(&raw) {
         Ok(cfg) => Ok(cfg),
         Err(err) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "config file is unparseable; falling back to defaults"
-            );
+            // The TUI saves config unconditionally on clean exit, so leaving
+            // the corrupt file in place would let a hand-edit typo silently
+            // destroy the user's favorites. Move it aside first; the user can
+            // recover their data from the .bak by hand.
+            match quarantine_corrupt_config(&path) {
+                Ok(bak) => tracing::warn!(
+                    path = %path.display(),
+                    backup = %bak.display(),
+                    error = %err,
+                    "config file is unparseable; moved it aside and falling back to defaults"
+                ),
+                Err(io_err) => tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    rename_error = %io_err,
+                    "config file is unparseable and could not be moved aside; \
+                     falling back to defaults (the exit-time save may overwrite it)"
+                ),
+            }
             Ok(Config::default())
         }
     }
+}
+
+/// Move an unparseable config file aside so the exit-time [`save`] can't
+/// overwrite the user's only copy with defaults. Prefers `config.toml.bak`;
+/// an existing backup (an earlier quarantined file the user may not have
+/// recovered yet) is never silently overwritten — we fall back to
+/// `config.toml.bak.1`, `.bak.2`, … instead. Returns the backup path.
+fn quarantine_corrupt_config(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::other(format!("config path has no file name: {}", path.display()))
+    })?;
+    let candidate = |suffix: &str| {
+        let mut n = name.to_os_string();
+        n.push(suffix);
+        path.with_file_name(n)
+    };
+    let mut bak = candidate(".bak");
+    // Bounded probe: after 100 backups something else is wrong, and clobbering
+    // the last candidate beats looping forever or losing the *current* file.
+    for i in 1..=100u32 {
+        if !bak.exists() {
+            break;
+        }
+        bak = candidate(&format!(".bak.{i}"));
+    }
+    fs::rename(path, &bak)?;
+    Ok(bak)
 }
 
 /// Write config to disk, creating the parent directory if needed.
@@ -190,6 +235,30 @@ mod tests {
         assert!(!added_again, "second toggle should remove the favorite");
         assert!(!cfg.is_favorite(id));
         assert!(cfg.favorites.is_empty());
+    }
+
+    #[test]
+    fn quarantine_moves_corrupt_file_and_preserves_existing_backups() {
+        let dir =
+            std::env::temp_dir().join(format!("azpect-quarantine-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create test dir");
+        let cfg = dir.join("config.toml");
+
+        // First corruption: file moves to the plain .bak name.
+        fs::write(&cfg, "not valid toml [").unwrap();
+        let bak = quarantine_corrupt_config(&cfg).expect("quarantine once");
+        assert_eq!(bak, dir.join("config.toml.bak"));
+        assert!(!cfg.exists(), "corrupt file must be gone from its old path");
+        assert_eq!(fs::read_to_string(&bak).unwrap(), "not valid toml [");
+
+        // Second corruption: the existing .bak must not be clobbered.
+        fs::write(&cfg, "still bad {").unwrap();
+        let bak2 = quarantine_corrupt_config(&cfg).expect("quarantine twice");
+        assert_eq!(bak2, dir.join("config.toml.bak.1"));
+        assert_eq!(fs::read_to_string(&bak).unwrap(), "not valid toml [");
+        assert_eq!(fs::read_to_string(&bak2).unwrap(), "still bad {");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -36,6 +36,7 @@ use serde::Deserialize;
 
 use crate::azure::auth::{AzureAuth, SCOPE_ARM};
 use crate::azure::client::ArmClient;
+use crate::azure::cosmos::{build_http, send_with_retry};
 
 /// One container registry discovered via Resource Graph.
 #[derive(Clone, Debug)]
@@ -268,13 +269,15 @@ async fn acquire_acr_access_token(
         ("service", host),
         ("access_token", aad.as_str()),
     ];
-    let exchange_resp = http
-        .post(&exchange_url)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .form(&exchange_body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("acr oauth2/exchange network error: {e}"))?;
+    // Retried: token exchange is side-effect free and ACR fronts it with the
+    // same throttling as the rest of the data plane.
+    let exchange_resp = send_with_retry(|| {
+        http.post(&exchange_url)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(&exchange_body)
+    })
+    .await
+    .map_err(|e| anyhow!("acr oauth2/exchange network error: {e}"))?;
     let status = exchange_resp.status();
     if !status.is_success() {
         let body = exchange_resp.text().await.unwrap_or_default();
@@ -297,13 +300,13 @@ async fn acquire_acr_access_token(
         ("scope", scope),
         ("refresh_token", exchange.refresh_token.as_str()),
     ];
-    let token_resp = http
-        .post(&token_url)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .form(&token_body)
-        .send()
-        .await
-        .map_err(|e| anyhow!("acr oauth2/token network error: {e}"))?;
+    let token_resp = send_with_retry(|| {
+        http.post(&token_url)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .form(&token_body)
+    })
+    .await
+    .map_err(|e| anyhow!("acr oauth2/token network error: {e}"))?;
     let status = token_resp.status();
     if !status.is_success() {
         let body = token_resp.text().await.unwrap_or_default();
@@ -360,10 +363,8 @@ async fn fetch_with_bearer(
 ) -> anyhow::Result<RawResponse> {
     let value = HeaderValue::from_str(&format!("Bearer {bearer}"))
         .map_err(|_| anyhow!("ACR bearer contained invalid header characters"))?;
-    let resp = http
-        .get(url)
-        .header(AUTHORIZATION, value)
-        .send()
+    // Retried: catalog/tags listing is a plain GET, safe to replay on 429/5xx.
+    let resp = send_with_retry(|| http.get(url).header(AUTHORIZATION, value.clone()))
         .await
         .map_err(|e| anyhow!("acr data-plane network error: {e}"))?;
     let status = resp.status();
@@ -384,13 +385,6 @@ async fn fetch_with_bearer(
         json: text,
         headers,
     })
-}
-
-fn build_http() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("azpect/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| anyhow!("failed to build reqwest client: {e}"))
 }
 
 /// Pull a `Link: <next>; rel="next"` next-page URL out of the response headers,

@@ -26,16 +26,16 @@ use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str = "j/k scroll  g/G top/bottom  Esc back  r refresh  y yank  ? help  q quit";
 const HALF_PAGE: u16 = 10;
-/// Hard upper bound on the scroll counter — must leave headroom below u16::MAX
-/// so ratatui 0.29's Paragraph (which adds `scroll + area.height` without
-/// saturating, see paragraph.rs:483) never overflows. Mirrors the sentinel in
-/// [`super::logs_detail`].
-const GOTO_BOTTOM_SENTINEL: u16 = 10_000;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Global breadcrumb (rendered by app::dispatch_view) replaces the old
     // in-view "Storage account / container / blob" header strip — body +
     // footer only here.
+    //
+    // Assume no scrollable content until the text-preview branch measures
+    // some — keeps j/G no-ops (via the handler's `scroll_max` clamp) on the
+    // placeholder / error / binary branches.
+    state.scroll_max.set(0);
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
 
     let block = Block::default()
@@ -87,13 +87,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             )));
             frame.render_widget(p, inner);
         }
-        Some(preview) => render_preview(
-            frame,
-            inner,
-            preview,
-            state.storage.blob_preview_scroll,
-            theme,
-        ),
+        Some(preview) => render_preview(frame, inner, preview, state, theme),
     }
 
     render_footer(frame, chunks[1], theme);
@@ -103,7 +97,7 @@ fn render_preview(
     frame: &mut Frame,
     area: Rect,
     preview: &BlobPreview,
-    scroll: u16,
+    state: &AppState,
     theme: &Theme,
 ) {
     // Header block: 6 metadata lines + 1 blank separator. Always rendered at
@@ -127,9 +121,20 @@ fn render_preview(
                 .lines()
                 .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg))))
                 .collect();
-            let total = body_lines.len() as u16;
-            let max_scroll = total.saturating_sub(parts[1].height.max(1).saturating_sub(1));
-            let clamped = scroll.min(max_scroll);
+            // Ceiling in *wrapped* rows minus the viewport — an unwrapped
+            // count leaves the tail of long wrapped lines unreachable.
+            // Published through `scroll_max` so the key handler clamps the
+            // stored offset too; G used to park it at a sentinel where `k`
+            // stayed dead for thousands of presses.
+            let total: usize = s
+                .lines()
+                .map(|l| super::detail::wrapped_line_count(l, parts[1].width))
+                .sum();
+            let max_scroll = total
+                .saturating_sub(parts[1].height.max(1) as usize)
+                .min(u16::MAX as usize) as u16;
+            state.scroll_max.set(max_scroll);
+            let clamped = state.storage.blob_preview_scroll.min(max_scroll);
             let p = Paragraph::new(body_lines)
                 .scroll((clamped, 0))
                 .wrap(Wrap { trim: false });
@@ -210,17 +215,26 @@ fn human_bytes(n: u64) -> String {
 }
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // Every mutation clamps to the render-published `scroll_max` so the stored
+    // offset never parks past the content. G used to store a 10_000 sentinel
+    // (render clamped it for display only), which left `k` decrementing
+    // invisibly for thousands of presses before the view moved.
+    let max_scroll = state.scroll_max.get();
     match action {
         Action::MoveDown => {
             state.storage.blob_preview_scroll = state
                 .storage
                 .blob_preview_scroll
                 .saturating_add(1)
-                .min(GOTO_BOTTOM_SENTINEL);
+                .min(max_scroll);
             true
         }
         Action::MoveUp => {
-            state.storage.blob_preview_scroll = state.storage.blob_preview_scroll.saturating_sub(1);
+            state.storage.blob_preview_scroll = state
+                .storage
+                .blob_preview_scroll
+                .min(max_scroll)
+                .saturating_sub(1);
             true
         }
         Action::HalfPageDown => {
@@ -228,12 +242,15 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .storage
                 .blob_preview_scroll
                 .saturating_add(HALF_PAGE)
-                .min(GOTO_BOTTOM_SENTINEL);
+                .min(max_scroll);
             true
         }
         Action::HalfPageUp => {
-            state.storage.blob_preview_scroll =
-                state.storage.blob_preview_scroll.saturating_sub(HALF_PAGE);
+            state.storage.blob_preview_scroll = state
+                .storage
+                .blob_preview_scroll
+                .min(max_scroll)
+                .saturating_sub(HALF_PAGE);
             true
         }
         Action::GotoTop => {
@@ -241,8 +258,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::GotoBottom => {
-            // Render path clamps this to the actual content height.
-            state.storage.blob_preview_scroll = GOTO_BOTTOM_SENTINEL;
+            state.storage.blob_preview_scroll = max_scroll;
             true
         }
         _ => false,
@@ -413,14 +429,17 @@ mod tests {
     }
 
     #[test]
-    fn handle_scrolls_clamped_at_sentinel() {
+    fn handle_scrolls_clamped_at_max() {
         let mut state = fixture();
+        // Handlers clamp to the render-published max; simulate a rendered
+        // preview with content below the fold.
+        state.scroll_max.set(40);
         assert!(handle(Action::MoveDown, &mut state));
         assert_eq!(state.storage.blob_preview_scroll, 1);
         assert!(handle(Action::HalfPageDown, &mut state));
         assert_eq!(state.storage.blob_preview_scroll, 1 + HALF_PAGE);
         assert!(handle(Action::GotoBottom, &mut state));
-        assert_eq!(state.storage.blob_preview_scroll, GOTO_BOTTOM_SENTINEL);
+        assert_eq!(state.storage.blob_preview_scroll, 40);
         assert!(handle(Action::GotoTop, &mut state));
         assert_eq!(state.storage.blob_preview_scroll, 0);
         assert!(handle(Action::MoveUp, &mut state));
@@ -440,10 +459,36 @@ mod tests {
             .storage
             .blob_preview
             .insert(key, preview_text("line\nline\n"));
-        for s in [GOTO_BOTTOM_SENTINEL, u16::MAX] {
+        for s in [10_000, u16::MAX] {
             state.storage.blob_preview_scroll = s;
             term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         }
+    }
+
+    #[test]
+    fn goto_bottom_then_move_up_responds_immediately() {
+        // Regression: G stored a 10_000 sentinel while only the renderer
+        // clamped it for display, so `k` decremented invisibly for thousands
+        // of presses. After a render, G must land exactly on the content's
+        // max scroll and the very next `k` must move the view.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let key = StorageCache::blob_preview_key("acct1", "logs", "hello.txt");
+        let body: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        state.storage.blob_preview.insert(key, preview_text(&body));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+
+        assert!(handle(Action::GotoBottom, &mut state));
+        let max = state.scroll_max.get();
+        assert!(
+            max > 0 && max < 40,
+            "expected a small real max scroll, got {max}"
+        );
+        assert_eq!(state.storage.blob_preview_scroll, max);
+        assert!(handle(Action::MoveUp, &mut state));
+        assert_eq!(state.storage.blob_preview_scroll, max - 1);
     }
 
     #[test]

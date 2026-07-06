@@ -96,7 +96,10 @@ impl Theme {
             critical: Color::Red,
             unknown: Color::DarkGray,
             border: Color::DarkGray,
-            selection_bg: Color::Rgb(0x33, 0x33, 0x33),
+            // Indexed, not RGB: this theme exists for terminals *without*
+            // truecolor, where an RGB background renders wrong (or not at
+            // all) and BOLD alone would have to mark the cursor row.
+            selection_bg: Color::DarkGray,
         }
     }
 
@@ -115,7 +118,9 @@ impl Theme {
             critical: Color::Red,
             unknown: Color::Gray,
             border: Color::Gray,
-            selection_bg: Color::Rgb(0xe0, 0xe0, 0xe0),
+            // Indexed, not RGB, for the same non-truecolor reason as `dark`;
+            // ANSI light-gray keeps black text readable on light terminals.
+            selection_bg: Color::Gray,
         }
     }
 

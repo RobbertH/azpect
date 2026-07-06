@@ -341,7 +341,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::OpenSelected => {
             if state.storage.selected_account.is_some() {
                 state.storage.containers_cursor = 0;
-                state.view_stack.push(state.view);
+                state.storage.containers_filter = tui_input::Input::default();
                 state.view = View::StorageContainers;
             }
             true
@@ -538,6 +538,8 @@ mod tests {
     #[test]
     fn enter_drills_into_containers() {
         let mut state = fixture();
+        state.storage.containers_filter =
+            tui_input::Input::default().with_value("stale".to_string());
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::StorageContainers);
         assert_eq!(
@@ -548,6 +550,8 @@ mod tests {
                 .map(|a| a.name.as_str()),
             Some("myacct"),
         );
+        // Drilling in must not carry a stale containers filter along.
+        assert_eq!(state.storage.containers_filter.value(), "");
     }
 
     #[test]

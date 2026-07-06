@@ -16,6 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use super::edge_scroll;
 use crate::azure::appgw_backends::BackendPool;
 use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
@@ -183,7 +184,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             }
             let cursor = state.appgw.cursor.min(flat.len() - 1);
             let visible = inner.height as usize;
-            let scroll = scroll_for(cursor, flat.len(), visible);
+            let scroll = edge_scroll(&state.appgw.view_top, cursor, flat.len(), visible);
 
             let lines: Vec<Line> = flat
                 .iter()
@@ -327,16 +328,6 @@ pub fn yank_text(state: &AppState) -> Option<String> {
         Row::Address { value, .. } => Some(value.clone()),
         Row::NicRef { full_id, .. } => Some(full_id.clone()),
     }
-}
-
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
 }
 
 #[cfg(test)]

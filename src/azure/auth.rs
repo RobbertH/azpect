@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
@@ -104,6 +105,12 @@ impl fmt::Debug for CachedToken {
 pub struct AzureAuth {
     credential: Option<Arc<DefaultAzureCredential>>,
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
+    /// Cache epoch, bumped by [`Self::clear_cache`]. An acquisition snapshots
+    /// it before the `get_token` round-trip and skips the cache insert when it
+    /// changed underneath — otherwise a token minted for the *previous*
+    /// identity (a `clear_cache` after `az login` raced the round-trip) would
+    /// be re-cached and served for up to an hour.
+    epoch: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for AzureAuth {
@@ -116,20 +123,22 @@ impl fmt::Debug for AzureAuth {
 }
 
 impl AzureAuth {
-    /// Construct the credential chain. Surfaces a single error that lists which
-    /// chain links were attempted, so the user can diagnose `az login`-vs-env
-    /// confusion quickly.
+    /// Construct the credential chain. Surfaces a single error naming the
+    /// chain links actually probed (see the module contract: azure_identity
+    /// 0.27's chain is CLI-only), so the fix the message suggests is the fix
+    /// that works.
     pub async fn new() -> anyhow::Result<Self> {
         let credential = DefaultAzureCredential::new().map_err(|e| {
             anyhow!(
-                "failed to initialize Azure credential chain (env, workload identity, \
-                 managed identity, Azure CLI, Azure Developer CLI): {e}. \
-                 Try running `az login` or setting AZURE_* environment variables."
+                "failed to initialize Azure credential chain (Azure CLI, \
+                 Azure Developer CLI): {e}. \
+                 Run `az login` (or `azd auth login`) and retry."
             )
         })?;
         Ok(Self {
             credential: Some(credential),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -141,6 +150,7 @@ impl AzureAuth {
         Self {
             credential: None,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -153,6 +163,10 @@ impl AzureAuth {
     /// next request acquires a fresh token reflecting the new identity/tenant
     /// instead of returning the previous user's still-valid bearer.
     pub async fn clear_cache(&self) {
+        // Bump the epoch BEFORE clearing: an acquisition already past its
+        // snapshot then sees the change and skips its insert. The other order
+        // would leave a window where a stale token lands after the clear.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.cache.write().await.clear();
     }
 
@@ -181,6 +195,11 @@ impl AzureAuth {
         // concurrent requests for *different* scopes aren't serialized. Bound
         // the call so a hung `az account get-access-token` can't wedge the UI
         // indefinitely — see [`TOKEN_ACQUISITION_TIMEOUT`].
+        //
+        // Snapshot the cache epoch first: if `clear_cache` runs while we're
+        // in-flight (the user just re-ran `az login`), this token may belong
+        // to the previous identity and must not be re-cached.
+        let epoch = self.epoch.load(Ordering::SeqCst);
         let access_token = match tokio::time::timeout(
             TOKEN_ACQUISITION_TIMEOUT,
             credential.get_token(&[scope], None),
@@ -205,6 +224,12 @@ impl AzureAuth {
         let expires_at = offset_datetime_to_chrono(access_token.expires_on);
 
         let mut cache = self.cache.write().await;
+        // Epoch changed while we awaited the round-trip: the cache was cleared
+        // for a new identity, so serve this (possibly stale-identity) token to
+        // the caller that asked for it but don't let it repopulate the cache.
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return Ok(token_string);
+        }
         // Re-check: another task may have populated the cache while we awaited
         // the network round-trip. Prefer the freshest entry.
         if let Some(existing) = cache.get(scope) {
@@ -268,6 +293,7 @@ mod tests {
                     expires_at: Utc::now(),
                 },
             )]))),
+            epoch: Arc::new(AtomicU64::new(0)),
         };
         let rendered = format!("{auth:?}");
         assert!(!rendered.contains("leak-me-if-you-can"));
@@ -280,6 +306,7 @@ mod tests {
             let real = AzureAuth {
                 credential: Some(credential),
                 cache: Arc::new(RwLock::new(HashMap::new())),
+                epoch: Arc::new(AtomicU64::new(0)),
             };
             assert!(!real.is_demo());
         }
@@ -295,6 +322,29 @@ mod tests {
                 "scope {scope} must fail closed in demo mode"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn clear_cache_bumps_epoch_and_drops_entries() {
+        let auth = AzureAuth::demo();
+        auth.cache.write().await.insert(
+            SCOPE_ARM.to_string(),
+            CachedToken {
+                token: "old-identity-token".to_string(),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+        );
+        let before = auth.epoch.load(Ordering::SeqCst);
+        auth.clear_cache().await;
+        // The epoch bump is what tells an in-flight acquisition (snapshot taken
+        // before the round-trip) to skip its cache insert.
+        assert_eq!(auth.epoch.load(Ordering::SeqCst), before + 1);
+        assert!(auth.cache.read().await.is_empty());
+        // Clones share the epoch, so a clear through one handle is visible to
+        // an acquisition running on another.
+        let clone = auth.clone();
+        clone.clear_cache().await;
+        assert_eq!(auth.epoch.load(Ordering::SeqCst), before + 2);
     }
 
     #[test]

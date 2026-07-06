@@ -6,8 +6,8 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::azure::storage::StorageAccount;
@@ -95,10 +95,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     if let Some(err) = state.storage.accounts_error.as_deref() {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -175,9 +178,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.storage.accounts_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.storage.accounts_view_top.set(ts.offset());
         }
     }
 
@@ -460,7 +466,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(account) = account {
                 state.storage.selected_account = Some(account);
                 state.storage.containers_cursor = 0;
-                state.view_stack.push(state.view);
+                state.storage.containers_filter = tui_input::Input::default();
                 // Drill into the per-account overview panel first; Enter from
                 // there opens the containers list. See `View::StorageAccountOverview`.
                 state.view = View::StorageAccountOverview;
@@ -928,6 +934,8 @@ mod tests {
         let mut state = fixture();
         let acct = account("acct1");
         state.storage.accounts = Some(vec![acct.clone()]);
+        state.storage.containers_filter =
+            tui_input::Input::default().with_value("stale".to_string());
         assert!(handle(Action::OpenSelected, &mut state));
         assert_eq!(state.view, View::StorageAccountOverview);
         assert_eq!(
@@ -938,6 +946,8 @@ mod tests {
                 .map(|a| a.name.as_str()),
             Some("acct1")
         );
+        // Drilling in must not carry a stale containers filter along.
+        assert_eq!(state.storage.containers_filter.value(), "");
     }
 
     #[test]

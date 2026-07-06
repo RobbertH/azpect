@@ -27,7 +27,10 @@ use std::io::{self, Write};
 
 /// Maximum number of *raw* bytes we attempt to copy. Larger payloads are
 /// truncated with a "…[truncated]" marker because most terminals reject them.
-pub const MAX_PAYLOAD: usize = 64 * 1024;
+/// The cap is on the raw bytes but the terminal's ~75 KB limit applies to the
+/// *encoded* write, and base64 expands 4/3: 54 KiB raw (plus the marker)
+/// encodes to ≈73.8 KB, leaving headroom for the OSC52 escape envelope.
+pub const MAX_PAYLOAD: usize = 54 * 1024;
 
 const OSC52_PREFIX: &str = "\x1b]52;c;";
 const OSC52_SUFFIX: &str = "\x07";
@@ -201,6 +204,22 @@ mod tests {
         // No partial UTF-8 char before the marker.
         let stem = truncated.trim_end_matches("…[truncated]");
         assert!(stem.is_char_boundary(stem.len()));
+    }
+
+    #[test]
+    fn truncated_payload_encodes_under_osc52_cap() {
+        // The ~75 KB terminal limit applies to the whole *encoded* escape
+        // sequence, not the raw text — a cap that only bounds raw bytes lets
+        // base64's 4/3 expansion blow past it and the terminal silently drops
+        // the copy while we report success.
+        let s = "a".repeat(MAX_PAYLOAD * 2);
+        let mut buf = Vec::new();
+        copy_to(&mut buf, &s).unwrap();
+        assert!(
+            buf.len() < 75_000,
+            "encoded OSC52 write must stay under the ~75 KB cap, got {}",
+            buf.len()
+        );
     }
 
     #[test]

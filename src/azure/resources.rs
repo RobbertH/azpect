@@ -165,40 +165,64 @@ Resources
 | order by name asc
 "#;
 
+/// Upper bound on `$skipToken` continuation pages. Resource Graph returns at
+/// most 1000 rows per page, so this caps the list at ~5000 resources — plenty
+/// for a TUI list while keeping a runaway tenant from stalling startup.
+const MAX_PAGES: usize = 5;
+
 /// Query Resource Graph. Empty `subscription_ids` means "all subscriptions the
 /// credential can see" — the caller should resolve that via [`super::subscriptions::list`] first.
+///
+/// Follows `$skipToken` continuations (Resource Graph pages at 1000 rows) up
+/// to [`MAX_PAGES`] pages, so tenants past the single-page limit aren't
+/// silently truncated.
 pub async fn list(auth: &AzureAuth, subscription_ids: &[String]) -> anyhow::Result<Vec<Resource>> {
     let client = ArmClient::new(auth.clone())?;
 
-    let body = if subscription_ids.is_empty() {
-        serde_json::json!({ "query": KQL })
-    } else {
-        serde_json::json!({
-            "subscriptions": subscription_ids,
-            "query": KQL,
-        })
-    };
+    let mut resources: Vec<Resource> = Vec::new();
+    let mut skip_token: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut body = if subscription_ids.is_empty() {
+            serde_json::json!({ "query": KQL })
+        } else {
+            serde_json::json!({
+                "subscriptions": subscription_ids,
+                "query": KQL,
+            })
+        };
+        if let Some(token) = &skip_token {
+            body["options"] = serde_json::json!({ "$skipToken": token });
+        }
 
-    let resp = client
-        .post(
-            "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01",
-            &body,
-        )
-        .await?;
+        let resp = client
+            .post(
+                "/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01",
+                &body,
+            )
+            .await?;
 
-    let rows = resp
-        .get("data")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("resource graph response missing 'data' array"))?;
+        let rows = resp
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("resource graph response missing 'data' array"))?;
+        resources.extend(rows.iter().filter_map(parse_resource));
 
-    if rows.len() >= 1000 {
+        skip_token = resp
+            .get("$skipToken")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if skip_token.is_none() {
+            break;
+        }
+    }
+    if skip_token.is_some() {
         tracing::warn!(
-            "resource graph returned {} rows; pagination not implemented in v1",
-            rows.len()
+            "resource graph listing hit the {MAX_PAGES}-page cap ({} rows); list is truncated",
+            resources.len()
         );
     }
 
-    let resources: Vec<Resource> = rows.iter().filter_map(parse_resource).collect();
     Ok(resources)
 }
 

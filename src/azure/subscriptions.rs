@@ -18,19 +18,44 @@ pub struct Subscription {
     pub tenant_id: String,
 }
 
+/// Upper bound on `nextLink` pages followed. At the service's page size this
+/// covers thousands of subscriptions; the cap only exists so a buggy/looping
+/// continuation link can't spin forever.
+const MAX_PAGES: usize = 20;
+
 /// List every subscription the credential can see. Sorted by display name.
+/// Follows `nextLink` pagination — large tenants page this endpoint, and
+/// reading only the first page would silently truncate the list.
 pub async fn list(auth: &AzureAuth) -> anyhow::Result<Vec<Subscription>> {
     let client = ArmClient::new(auth.clone())?;
-    let resp = client
+    let mut resp = client
         .get("/subscriptions", &[("api-version", "2022-12-01")])
         .await?;
 
-    let value = resp
-        .get("value")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("subscriptions response missing 'value' array"))?;
+    let mut subs: Vec<Subscription> = Vec::new();
+    let mut pages = 1;
+    loop {
+        let value = resp
+            .get("value")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow!("subscriptions response missing 'value' array"))?;
+        subs.extend(value.iter().filter_map(parse_subscription));
 
-    let mut subs: Vec<Subscription> = value.iter().filter_map(parse_subscription).collect();
+        let next = resp
+            .get("nextLink")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let Some(next) = next else { break };
+        if pages >= MAX_PAGES {
+            tracing::warn!(
+                "subscriptions listing hit the {MAX_PAGES}-page cap; list may be truncated"
+            );
+            break;
+        }
+        pages += 1;
+        resp = client.get_url(&next).await?;
+    }
 
     subs.sort_by(|a, b| {
         a.display_name

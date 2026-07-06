@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event as CtEvent, KeyCode, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event as CtEvent, KeyCode, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -55,6 +57,9 @@ const CHORD_TIMEOUT: Duration = Duration::from_millis(1000);
 /// fan-out hit ARM/Monitor with a burst that throttled (429s) on large
 /// subscriptions and made the badges *slower* to settle. A modest cap smooths the
 /// burst — and matters more now that auto-refresh re-fires it on a timer.
+/// The same gate covers the other per-resource list decorations (Container App
+/// overview + replicas, Function App `config/web`) — they ride the same list
+/// load / auto-refresh fan-out and were the remaining source of 429 bursts.
 const HEALTH_FETCH_CONCURRENCY: usize = 8;
 
 /// Process-wide gate limiting concurrent health fetches to [`HEALTH_FETCH_CONCURRENCY`].
@@ -79,7 +84,10 @@ impl TerminalGuard {
         // Don't capture mouse events: we don't react to them anywhere, and
         // capturing them breaks native click-and-drag text selection in the
         // terminal emulator (so users can't copy error messages).
-        execute!(stdout(), EnterAlternateScreen)?;
+        // Bracketed paste IS captured: it turns a paste into one `Event::Paste`
+        // instead of a burst of key events, so stray pastes can't fire
+        // keybindings (see `handle_paste`).
+        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         Ok(Self { active: true })
     }
 
@@ -90,7 +98,7 @@ impl TerminalGuard {
         self.active = false;
         // Best-effort restore. Log but don't propagate — we're probably already
         // unwinding and the terminal will be in a bad state regardless.
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 
@@ -109,7 +117,7 @@ impl TerminalGuard {
             return Ok(());
         }
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         self.active = true;
         Ok(())
     }
@@ -144,6 +152,20 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
     let theme = Theme::by_name(&cfg.theme);
     let mut state = AppState::new(cfg);
 
+    // Restore the terminal *before* the default panic hook prints. The hook
+    // fires while the alternate screen is still active, so without this its
+    // message (and any RUST_BACKTRACE) lands on the alternate buffer and is
+    // wiped the moment `TerminalGuard::drop` switches back — a panic then
+    // looks like a silent exit into a clean shell. The guard's own restore
+    // stays in place for non-panic exits; re-running these escape codes on
+    // unwind is harmless (they're idempotent).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        default_hook(info);
+    }));
+
     // Set up terminal *before* we spawn anything that might print to stderr —
     // tracing is configured to write to stderr in main.rs, which is fine in alt
     // screen but the user only sees the TUI surface anyway.
@@ -161,7 +183,7 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
     spawn_ticker(tx.clone());
 
     // Kick off subscriptions load.
-    spawn_load_subscriptions(auth.clone(), tx.clone());
+    spawn_load_subscriptions(auth.clone(), state.scope_generation, tx.clone());
 
     let result = event_loop(
         &mut terminal,
@@ -242,6 +264,9 @@ async fn event_loop(
             }
             AppEvent::Resize { .. } => {
                 // ratatui re-measures on next draw. Nothing to do.
+            }
+            AppEvent::Paste(text) => {
+                handle_paste(state, &text, auth, tx);
             }
             AppEvent::Key(key) => {
                 // Only react to *press* events. Some terminals (kitty, win-pty)
@@ -364,161 +389,12 @@ async fn event_loop(
                         }
                     }
                 }
-                // When the list filter input has focus, forward raw keystrokes
-                // into the `tui_input::Input` widget. `Esc` and `Enter` still
-                // flow through the action dispatcher so they can cancel/apply.
-                if should_forward_to_filter(state, key) {
-                    state.list_filter.handle_event(&CtEvent::Key(key));
-                    // Filter contents may shrink; keep the cursor in range.
-                    state.list_cursor = 0;
-                    continue;
-                }
-                // Same shape for the logs less-style search input.
-                if should_forward_to_logs_search(state, key) {
-                    state.logs.search_input.handle_event(&CtEvent::Key(key));
-                    continue;
-                }
-                // Storage blobs name filter shares the same carve-out shape.
-                // Reset the cursor so a shrinking match list never points past
-                // the end of `filtered_blobs()`.
-                if should_forward_to_blobs_filter(state, key) {
-                    state.storage.blobs_filter.handle_event(&CtEvent::Key(key));
-                    state.storage.blobs_cursor = 0;
-                    continue;
-                }
-                // Storage containers name filter shares the same carve-out shape.
-                // Reset the cursor so a shrinking match list never points past
-                // the end of `filtered_containers()`.
-                if should_forward_to_containers_filter(state, key) {
-                    state
-                        .storage
-                        .containers_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.storage.containers_cursor = 0;
-                    continue;
-                }
-                // Storage accounts name filter shares the same carve-out shape.
-                // Reset the cursor so a shrinking match list never points past
-                // the end of `filtered_accounts()`.
-                if should_forward_to_accounts_filter(state, key) {
-                    state
-                        .storage
-                        .accounts_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.storage.accounts_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_registries_filter(state, key) {
-                    state
-                        .registry
-                        .registries_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.registry.registries_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_repositories_filter(state, key) {
-                    state
-                        .registry
-                        .repositories_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.registry.repositories_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_tags_filter(state, key) {
-                    state.registry.tags_filter.handle_event(&CtEvent::Key(key));
-                    state.registry.tags_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_cosmos_accounts_filter(state, key) {
-                    state
-                        .cosmos
-                        .accounts_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.cosmos.accounts_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_cosmos_databases_filter(state, key) {
-                    state
-                        .cosmos
-                        .databases_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.cosmos.databases_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_cosmos_containers_filter(state, key) {
-                    state
-                        .cosmos
-                        .containers_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.cosmos.containers_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_sql_filter(state, key) {
-                    state.sql.filter.handle_event(&CtEvent::Key(key));
-                    state.sql.cursor = 0;
-                    continue;
-                }
-                if should_forward_to_key_vaults_filter(state, key) {
-                    state
-                        .key_vault
-                        .vaults_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.key_vault.vaults_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_key_vault_items_filter(state, key) {
-                    state
-                        .key_vault
-                        .items_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.key_vault.items_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_sb_namespaces_filter(state, key) {
-                    state
-                        .service_bus
-                        .namespaces_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.service_bus.namespaces_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_sb_entities_filter(state, key) {
-                    state
-                        .service_bus
-                        .entities_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.service_bus.entities_cursor = 0;
-                    continue;
-                }
-                if should_forward_to_sb_subscriptions_filter(state, key) {
-                    state
-                        .service_bus
-                        .subscriptions_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.service_bus.subscriptions_cursor = 0;
-                    continue;
-                }
-                // Subscription picker `/`-search box.
-                if should_forward_to_subscriptions_filter(state, key) {
-                    state.subscription_filter.handle_event(&CtEvent::Key(key));
-                    state.subscription_cursor = 0;
-                    continue;
-                }
-                // APIM APIs name filter shares the same carve-out shape.
-                // Reset the cursor so a shrinking match list never points past
-                // the end of `filtered_apis()`.
-                if should_forward_to_apim_apis_filter(state, key) {
-                    state.apim.apis_filter.handle_event(&CtEvent::Key(key));
-                    state.apim.apis_cursor = 0;
-                    continue;
-                }
-                // APIM operations name filter — same carve-out shape as APIs.
-                if should_forward_to_apim_operations_filter(state, key) {
-                    state
-                        .apim
-                        .operations_filter
-                        .handle_event(&CtEvent::Key(key));
-                    state.apim.operations_cursor = 0;
+                // When one of the text inputs (list filters, search boxes, the
+                // subscription picker) has focus, forward the raw keystroke
+                // into its `tui_input::Input` widget instead of dispatching an
+                // action. Shared with `handle_paste`, which feeds pasted text
+                // through the same focus rules one character at a time.
+                if forward_to_focused_text_input(state, key) {
                     continue;
                 }
                 let action = decide_action(&mut input, key, state);
@@ -527,9 +403,16 @@ async fn event_loop(
                 }
                 drain_fetch_more_requested(state, auth, tx);
             }
-            AppEvent::SubscriptionsLoaded(res) => {
+            AppEvent::SubscriptionsLoaded { scope, result } => {
+                // A fetch issued under a previous scope (the user re-logged-in
+                // while it was in flight) describes the old identity; drop it
+                // wholesale. The login path spawned a fresh fetch that owns the
+                // loading flag.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.loading_subscriptions = false;
-                match res {
+                match result {
                     Ok(subs) => {
                         let was_empty = subs.is_empty();
                         state.subscriptions = subs;
@@ -573,9 +456,17 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::ResourcesLoaded(res) => {
+            AppEvent::ResourcesLoaded { scope, result } => {
+                // Stale scope: the user switched subscription (or re-logged-in)
+                // after this fetch was issued. Its rows belong to the previous
+                // scope — applying them would display the wrong subscription's
+                // resources under the new title. Drop wholesale; the loading
+                // flag was already reset when the scope changed.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.loading_resources = false;
-                match res {
+                match result {
                     Ok(rs) => {
                         // `list_cursor` indexes into `filtered_resources()`, not
                         // the full `resources` vec, so the cursor restore/clamp
@@ -612,10 +503,19 @@ async fn event_loop(
             }
             AppEvent::MetricsLoaded {
                 resource_id,
+                range,
                 result,
             } => {
                 state.metrics.pending.remove(&resource_id);
-                state.metrics.loading = false;
+                state.metrics.loading = !state.metrics.pending.is_empty();
+                // Stale window: the user switched the chart range while this
+                // fetch was in flight. The pending bookkeeping above still
+                // applies (the fetch IS finished), but its series must not be
+                // rendered under the new range's axis — the force-respawned
+                // fetch for the current range owns the cache entry.
+                if range != state.metrics.range {
+                    continue;
+                }
                 match result {
                     Ok(r) => {
                         state.metrics.failures.remove(&resource_id);
@@ -918,9 +818,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::StorageAccountsLoaded(res) => {
+            AppEvent::StorageAccountsLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.storage.accounts_pending = false;
-                match res {
+                match result {
                     Ok(accounts) => {
                         state.storage.accounts_error = None;
                         // Clamp cursor if the previous list was longer than the
@@ -988,9 +892,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::RegistriesLoaded(res) => {
+            AppEvent::RegistriesLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.registry.registries_pending = false;
-                match res {
+                match result {
                     Ok(rows) => {
                         state.registry.registries_error = None;
                         if !rows.is_empty() && state.registry.registries_cursor >= rows.len() {
@@ -1033,9 +941,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::CosmosAccountsLoaded(res) => {
+            AppEvent::CosmosAccountsLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.cosmos.accounts_pending = false;
-                match res {
+                match result {
                     Ok(rows) => {
                         state.cosmos.accounts_error = None;
                         if !rows.is_empty() && state.cosmos.accounts_cursor >= rows.len() {
@@ -1088,9 +1000,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::SqlResourcesLoaded(res) => {
+            AppEvent::SqlResourcesLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.sql.pending = false;
-                match res {
+                match result {
                     Ok(rows) => {
                         state.sql.error = None;
                         if !rows.is_empty() && state.sql.cursor >= rows.len() {
@@ -1106,9 +1022,14 @@ async fn event_loop(
             }
             AppEvent::SqlMetricsLoaded {
                 resource_id,
+                range,
                 result,
             } => {
                 state.sql.metrics_pending.remove(&resource_id);
+                // Same stale-window rule as `MetricsLoaded` above.
+                if range != state.sql.metrics_range {
+                    continue;
+                }
                 match result {
                     Ok(r) => {
                         state.sql.metrics_failures.remove(&resource_id);
@@ -1129,9 +1050,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::KeyVaultsLoaded(res) => {
+            AppEvent::KeyVaultsLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.key_vault.vaults_pending = false;
-                match res {
+                match result {
                     Ok(rows) => {
                         state.key_vault.vaults_error = None;
                         if !rows.is_empty() && state.key_vault.vaults_cursor >= rows.len() {
@@ -1175,9 +1100,13 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::ServiceBusNamespacesLoaded(res) => {
+            AppEvent::ServiceBusNamespacesLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
                 state.service_bus.namespaces_pending = false;
-                match res {
+                match result {
                     Ok(rows) => {
                         state.service_bus.namespaces_error = None;
                         if !rows.is_empty() && state.service_bus.namespaces_cursor >= rows.len() {
@@ -1298,6 +1227,16 @@ async fn run_pending_login(
     tx: &UnboundedSender<AppEvent>,
     req: PendingLogin,
 ) {
+    // Park the input-reader thread before handing the terminal over — same
+    // reasoning as `run_pending_exec`: recent `az login` versions prompt
+    // interactively (subscription/tenant selection) on stdin, and a reader
+    // still polling the terminal would steal those keystrokes (replaying them
+    // as TUI actions on resume) or get the process SIGTTIN-stopped once az
+    // becomes the foreground process group. The brief wait lets the reader
+    // finish any in-flight `poll` and park.
+    state.input_suspended.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
     guard.suspend();
 
     // Surface what we're about to do on the parent shell so the user sees
@@ -1333,6 +1272,8 @@ async fn run_pending_login(
         return;
     }
     let _ = terminal.clear();
+    // Resume input only after the terminal is ours again.
+    state.input_suspended.store(false, Ordering::SeqCst);
 
     match outcome {
         Ok(()) => {
@@ -1342,9 +1283,15 @@ async fn run_pending_login(
             // refetch subscriptions or any other ARM call would still go out
             // under the old identity.
             auth.clear_cache().await;
+            // New identity ⇒ new scope: orphan every in-flight fetch (their
+            // results describe the old identity) and drop every cache — the
+            // old identity's resources, metrics, and secret-bearing settings
+            // must not stay visible or yankable under the new login.
+            state.scope_generation = state.scope_generation.wrapping_add(1);
+            state.flush_identity_caches();
             state.loading_subscriptions = true;
             state.subscriptions.clear();
-            spawn_load_subscriptions(auth.clone(), tx.clone());
+            spawn_load_subscriptions(auth.clone(), state.scope_generation, tx.clone());
             state.set_status("logged in via az");
         }
         Err(e) => {
@@ -1417,6 +1364,228 @@ async fn run_pending_exec(
         Ok(()) => state.set_status("shell session ended"),
         Err(e) => state.set_status(format!("shell: {e}")),
     }
+}
+
+/// Route `key` into whichever text input currently has focus, if any. One
+/// branch per input, each mirroring the old inline carve-outs in the event
+/// loop: forward the keystroke into the `tui_input::Input` widget and, for
+/// filters, reset the matching cursor so a shrinking match list never points
+/// past its end. Returns `true` when the key was consumed by an input.
+/// Reused by `handle_paste` so pasted text follows the exact same focus rules.
+fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::KeyEvent) -> bool {
+    if should_forward_to_filter(state, key) {
+        state.list_filter.handle_event(&CtEvent::Key(key));
+        state.list_cursor = 0;
+        return true;
+    }
+    // The logs less-style search input is the one carve-out with no cursor to
+    // reset — search steers the scroll position on Enter, not a filtered list.
+    if should_forward_to_logs_search(state, key) {
+        state.logs.search_input.handle_event(&CtEvent::Key(key));
+        return true;
+    }
+    if should_forward_to_blobs_filter(state, key) {
+        state.storage.blobs_filter.handle_event(&CtEvent::Key(key));
+        state.storage.blobs_cursor = 0;
+        return true;
+    }
+    if should_forward_to_containers_filter(state, key) {
+        state
+            .storage
+            .containers_filter
+            .handle_event(&CtEvent::Key(key));
+        state.storage.containers_cursor = 0;
+        return true;
+    }
+    if should_forward_to_accounts_filter(state, key) {
+        state
+            .storage
+            .accounts_filter
+            .handle_event(&CtEvent::Key(key));
+        state.storage.accounts_cursor = 0;
+        return true;
+    }
+    if should_forward_to_registries_filter(state, key) {
+        state
+            .registry
+            .registries_filter
+            .handle_event(&CtEvent::Key(key));
+        state.registry.registries_cursor = 0;
+        return true;
+    }
+    if should_forward_to_repositories_filter(state, key) {
+        state
+            .registry
+            .repositories_filter
+            .handle_event(&CtEvent::Key(key));
+        state.registry.repositories_cursor = 0;
+        return true;
+    }
+    if should_forward_to_tags_filter(state, key) {
+        state.registry.tags_filter.handle_event(&CtEvent::Key(key));
+        state.registry.tags_cursor = 0;
+        return true;
+    }
+    if should_forward_to_cosmos_accounts_filter(state, key) {
+        state
+            .cosmos
+            .accounts_filter
+            .handle_event(&CtEvent::Key(key));
+        state.cosmos.accounts_cursor = 0;
+        return true;
+    }
+    if should_forward_to_cosmos_databases_filter(state, key) {
+        state
+            .cosmos
+            .databases_filter
+            .handle_event(&CtEvent::Key(key));
+        state.cosmos.databases_cursor = 0;
+        return true;
+    }
+    if should_forward_to_cosmos_containers_filter(state, key) {
+        state
+            .cosmos
+            .containers_filter
+            .handle_event(&CtEvent::Key(key));
+        state.cosmos.containers_cursor = 0;
+        return true;
+    }
+    if should_forward_to_sql_filter(state, key) {
+        state.sql.filter.handle_event(&CtEvent::Key(key));
+        state.sql.cursor = 0;
+        return true;
+    }
+    if should_forward_to_key_vaults_filter(state, key) {
+        state
+            .key_vault
+            .vaults_filter
+            .handle_event(&CtEvent::Key(key));
+        state.key_vault.vaults_cursor = 0;
+        return true;
+    }
+    if should_forward_to_key_vault_items_filter(state, key) {
+        state
+            .key_vault
+            .items_filter
+            .handle_event(&CtEvent::Key(key));
+        state.key_vault.items_cursor = 0;
+        return true;
+    }
+    if should_forward_to_sb_namespaces_filter(state, key) {
+        state
+            .service_bus
+            .namespaces_filter
+            .handle_event(&CtEvent::Key(key));
+        state.service_bus.namespaces_cursor = 0;
+        return true;
+    }
+    if should_forward_to_sb_entities_filter(state, key) {
+        state
+            .service_bus
+            .entities_filter
+            .handle_event(&CtEvent::Key(key));
+        state.service_bus.entities_cursor = 0;
+        return true;
+    }
+    if should_forward_to_sb_subscriptions_filter(state, key) {
+        state
+            .service_bus
+            .subscriptions_filter
+            .handle_event(&CtEvent::Key(key));
+        state.service_bus.subscriptions_cursor = 0;
+        return true;
+    }
+    // Subscription picker `/`-search box.
+    if should_forward_to_subscriptions_filter(state, key) {
+        state.subscription_filter.handle_event(&CtEvent::Key(key));
+        state.subscription_cursor = 0;
+        return true;
+    }
+    if should_forward_to_apim_apis_filter(state, key) {
+        state.apim.apis_filter.handle_event(&CtEvent::Key(key));
+        state.apim.apis_cursor = 0;
+        return true;
+    }
+    if should_forward_to_apim_operations_filter(state, key) {
+        state
+            .apim
+            .operations_filter
+            .handle_event(&CtEvent::Key(key));
+        state.apim.operations_cursor = 0;
+        return true;
+    }
+    false
+}
+
+/// Feed a bracketed paste into the focused text input, one synthesized
+/// keystroke per character. Anywhere else the paste is swallowed whole —
+/// dispatching pasted characters as keybindings is exactly the failure
+/// bracketed paste exists to prevent. Modals are stricter still: their
+/// non-typing phases interpret plain characters as commit/cancel shortcuts
+/// (`y` confirms an env-var write, menu keys start a login), so pasting is
+/// only allowed where the modal is actually reading text.
+fn handle_paste(
+    state: &mut AppState,
+    text: &str,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    // None of the inputs are multi-line and control characters would confuse
+    // `tui_input`; strip rather than reject so pasting a value with a trailing
+    // newline (the common copy-from-terminal shape) still works.
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.is_empty() {
+        return;
+    }
+    // Auth modal: only the tenant-id capture step reads text; the menu treats
+    // characters as shortcuts.
+    if state.auth_prompt != AuthPrompt::Hidden {
+        if state.auth_prompt == AuthPrompt::TenantInput {
+            for key in synthesized_keys(&clean) {
+                handle_auth_prompt_key(state, key);
+            }
+        }
+        return;
+    }
+    if state.quit_confirm {
+        return;
+    }
+    // Env-var editor: typing only lands in the fields during `Editing` (and
+    // never while a write is in flight); `Confirming` reads `y`/`n`.
+    if let Some(edit) = state.env_var_edit.as_ref() {
+        if edit.phase == EnvVarEditPhase::Editing && !edit.in_flight {
+            for key in synthesized_keys(&clean) {
+                handle_env_var_edit_key(state, key, auth, tx);
+            }
+        }
+        return;
+    }
+    if state.command_active {
+        state.command_tab_cycle = None;
+        for key in synthesized_keys(&clean) {
+            if should_forward_to_command(state, key) {
+                state.command_input.handle_event(&CtEvent::Key(key));
+            }
+        }
+        return;
+    }
+    for key in synthesized_keys(&clean) {
+        if !forward_to_focused_text_input(state, key) {
+            // No input focused: drop the paste. (Checked per character only
+            // because focus never changes while typing plain chars; bailing on
+            // the first miss keeps a stray paste from doing anything at all.)
+            return;
+        }
+    }
+}
+
+/// Plain no-modifier key presses for each character of `s` — the shape every
+/// input-forwarding helper already accepts, so pasted text can reuse the
+/// keystroke path instead of each input growing a paste API.
+fn synthesized_keys(s: &str) -> impl Iterator<Item = crossterm::event::KeyEvent> + '_ {
+    s.chars().map(|ch| {
+        crossterm::event::KeyEvent::new(KeyCode::Char(ch), crossterm::event::KeyModifiers::NONE)
+    })
 }
 
 /// True when the list filter is active *and* the key is something the input
@@ -1843,7 +2012,6 @@ fn run_command(state: &mut AppState, cmd: &str) {
     match trimmed {
         "subscriptions" | "subs" => {
             if state.view != View::Subscriptions {
-                state.view_stack.push(state.view);
                 state.view = View::Subscriptions;
                 state.subscription_filter.reset();
                 state.subscription_filter_active = false;
@@ -2238,7 +2406,10 @@ fn open_key_vault_ref_from_env_var(
         status: SecretRevealStatus::Loading,
         scroll: 0,
     });
-    state.view_stack.push(state.view);
+    // Record where the jump came from so Esc returns here instead of walking
+    // to KeyVaultItems' semantic parent (a KeyVaults list the user never
+    // visited). See `KeyVaultCache::items_return_view`.
+    state.key_vault.items_return_view = Some(state.view);
     state.view = View::KeyVaultItems;
     spawn_load_key_vault_secret_value(auth.clone(), vault, parsed.secret_name, tx.clone());
 }
@@ -2825,6 +2996,14 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
                     return true;
                 }
             }
+            // Followed a Key Vault reference (env vars → items view): return
+            // to the origin instead of the items view's semantic parent.
+            if state.view == View::KeyVaultItems {
+                if let Some(origin) = state.key_vault.items_return_view.take() {
+                    state.view = origin;
+                    return true;
+                }
+            }
             match semantic_parent(state.view) {
                 Some(parent) => state.view = parent,
                 None => {
@@ -2844,7 +3023,6 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
         }
         Action::SwitchSubscription => {
             if state.view != View::Subscriptions {
-                state.view_stack.push(state.view);
                 state.view = View::Subscriptions;
                 // Open the picker on the full list (drop any stale `/`-search).
                 state.subscription_filter.reset();
@@ -2926,8 +3104,23 @@ fn after_action(
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek => {
-            let force = matches!(state.view, View::Logs | View::LogDetail);
+            // Chart windows force too: the view handler dropped the cached
+            // series for the new range, and a fetch for the *old* range still
+            // in flight would otherwise debounce the respawn away — the range
+            // tag on `MetricsLoaded` / `SqlMetricsLoaded` discards that stale
+            // result, so forcing is safe (mirrors the logs generation guard).
+            let force = matches!(
+                state.view,
+                View::Logs | View::LogDetail | View::Detail | View::SqlDetail
+            );
             kick_off_loads_for_view(state, auth, tx, force);
+        }
+        // Opening logs always starts a fresh newest-end fetch; force past the
+        // global `logs.loading` debounce so switching to resource B while
+        // resource A's fetch is still in flight doesn't leave B's view empty
+        // (the generation bump in the Logs kick orphans A's result).
+        Action::OpenLogs if state.view == View::Logs => {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
         // The view handler likely transitioned `state.view`. Kick off loads
         // appropriate to whatever the new view is.
@@ -2999,6 +3192,22 @@ fn maybe_auto_refresh(
     }
 }
 
+/// Subscription ids defining the current fetch scope: the pinned subscription
+/// if one is selected, else every subscription the credential can see. `None`
+/// while the tenant's subscription list is still unknown (startup, or right
+/// after a re-login): an "all subscriptions" fetch issued with an empty list
+/// would come back empty, and that empty result would stick until the next
+/// manual refresh because the non-force kicks debounce on "already loaded".
+/// The `SubscriptionsLoaded` handler re-kicks the active view once the list
+/// lands, so deferring here loses nothing.
+fn scope_sub_ids(state: &AppState) -> Option<Vec<String>> {
+    match &state.selected_subscription {
+        Some(id) => Some(vec![id.clone()]),
+        None if state.subscriptions.is_empty() => None,
+        None => Some(state.subscriptions.iter().map(|s| s.id.clone()).collect()),
+    }
+}
+
 fn kick_off_loads_for_view(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -3009,17 +3218,16 @@ fn kick_off_loads_for_view(
         View::Subscriptions => {
             if force || (!state.loading_subscriptions && state.subscriptions.is_empty()) {
                 state.loading_subscriptions = true;
-                spawn_load_subscriptions(auth.clone(), tx.clone());
+                spawn_load_subscriptions(auth.clone(), state.scope_generation, tx.clone());
             }
         }
         View::List => {
             if force || (!state.loading_resources && state.resources.is_empty()) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 state.loading_resources = true;
-                spawn_load_resources(auth.clone(), sub_ids, tx.clone());
+                spawn_load_resources(auth.clone(), state.scope_generation, sub_ids, tx.clone());
                 if force {
                     // Refresh per-row badges + Container App overview *in place*:
                     // re-fetch without dropping the current values, so rows
@@ -3054,7 +3262,12 @@ fn kick_off_loads_for_view(
                     principal_to_resolve(by.as_deref(), ty.as_deref()).map(|s| s.to_string())
                 })
                 .collect();
-                if force || !state.metrics.loading {
+                // Debounce per resource, not on the global loading flag: a
+                // fetch still in flight for resource A must not block the
+                // first fetch for resource B when the user navigates Detail
+                // A → back → Detail B (B would render blank until a manual
+                // refresh otherwise).
+                if force || !state.metrics.pending.contains(&resource.id) {
                     if force {
                         state.metrics.failures.remove(&resource.id);
                     }
@@ -3162,6 +3375,12 @@ fn kick_off_loads_for_view(
                     // clean (otherwise a stale `more_available = false` would
                     // suppress fetch-more on the new dataset).
                     state.logs.more_available.remove(&resource.id);
+                    // Any in-flight fetch (initial or fetch-more, possibly for
+                    // a *different* resource) is stale by definition: this
+                    // fresh fetch replaces the buffer and owns the loading
+                    // flags. Bump the generation so the old result is dropped
+                    // instead of clearing flags out from under us.
+                    state.logs.generation = state.logs.generation.wrapping_add(1);
                     state.logs.loading = true;
                     // A pending context jump fetches an unfiltered window
                     // centered on the error; otherwise the newest-rows window for
@@ -3260,16 +3479,20 @@ fn kick_off_loads_for_view(
             let cached = state.storage.accounts.is_some();
             let in_flight = state.storage.accounts_pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.storage.accounts = None;
                     state.storage.accounts_error = None;
                 }
                 state.storage.accounts_pending = true;
-                spawn_load_storage_accounts(auth.clone(), sub_ids, tx.clone());
+                spawn_load_storage_accounts(
+                    auth.clone(),
+                    state.scope_generation,
+                    sub_ids,
+                    tx.clone(),
+                );
             }
         }
         View::StorageAccountOverview => {
@@ -3352,16 +3575,15 @@ fn kick_off_loads_for_view(
             let cached = state.registry.registries.is_some();
             let in_flight = state.registry.registries_pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.registry.registries = None;
                     state.registry.registries_error = None;
                 }
                 state.registry.registries_pending = true;
-                spawn_load_registries(auth.clone(), sub_ids, tx.clone());
+                spawn_load_registries(auth.clone(), state.scope_generation, sub_ids, tx.clone());
             }
         }
         View::RegistryRepositories => {
@@ -3403,32 +3625,35 @@ fn kick_off_loads_for_view(
             let cached = state.cosmos.accounts.is_some();
             let in_flight = state.cosmos.accounts_pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.cosmos.accounts = None;
                     state.cosmos.accounts_error = None;
                 }
                 state.cosmos.accounts_pending = true;
-                spawn_load_cosmos_accounts(auth.clone(), sub_ids, tx.clone());
+                spawn_load_cosmos_accounts(
+                    auth.clone(),
+                    state.scope_generation,
+                    sub_ids,
+                    tx.clone(),
+                );
             }
         }
         View::SqlResources => {
             let cached = state.sql.resources.is_some();
             let in_flight = state.sql.pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.sql.resources = None;
                     state.sql.error = None;
                 }
                 state.sql.pending = true;
-                spawn_load_sql_resources(auth.clone(), sub_ids, tx.clone());
+                spawn_load_sql_resources(auth.clone(), state.scope_generation, sub_ids, tx.clone());
             }
         }
         View::SqlDetail => {
@@ -3501,16 +3726,15 @@ fn kick_off_loads_for_view(
             let cached = state.key_vault.vaults.is_some();
             let in_flight = state.key_vault.vaults_pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.key_vault.vaults = None;
                     state.key_vault.vaults_error = None;
                 }
                 state.key_vault.vaults_pending = true;
-                spawn_load_key_vaults(auth.clone(), sub_ids, tx.clone());
+                spawn_load_key_vaults(auth.clone(), state.scope_generation, sub_ids, tx.clone());
             }
         }
         View::KeyVaultItems => {
@@ -3533,16 +3757,15 @@ fn kick_off_loads_for_view(
             let cached = state.service_bus.namespaces.is_some();
             let in_flight = state.service_bus.namespaces_pending;
             if force || (!cached && !in_flight) {
-                let sub_ids = match &state.selected_subscription {
-                    Some(id) => vec![id.clone()],
-                    None => state.subscriptions.iter().map(|s| s.id.clone()).collect(),
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
                 };
                 if force {
                     state.service_bus.namespaces = None;
                     state.service_bus.namespaces_error = None;
                 }
                 state.service_bus.namespaces_pending = true;
-                spawn_load_sb_namespaces(auth.clone(), sub_ids, tx.clone());
+                spawn_load_sb_namespaces(auth.clone(), state.scope_generation, sub_ids, tx.clone());
             }
         }
         View::ServiceBusEntities => {
@@ -3980,11 +4203,12 @@ fn handle_auth_prompt_key(state: &mut AppState, key: crossterm::event::KeyEvent)
 
 /// The concrete payload handed to [`spawn_env_var_write`].
 enum EnvWrite {
-    /// Function App: the FULL post-edit settings list (the PUT replaces the
-    /// whole collection, so every existing key must be present).
-    FunctionApp {
-        settings: Vec<crate::azure::env_vars::EnvVar>,
-    },
+    /// Function App: just the edited entry. The PUT replaces the whole
+    /// collection, but `function_app_settings::update` re-reads the live map
+    /// and applies this single upsert on top — sending a cached snapshot from
+    /// here would silently revert keys changed server-side since the view
+    /// last fetched.
+    FunctionApp { name: String, value: String },
     /// Container App: the targeted template entry plus its new literal value;
     /// the spawn does the GET-modify-PATCH against the raw template.
     ContainerApp {
@@ -4125,18 +4349,10 @@ fn commit_env_var_edit(
     };
 
     let write = match edit.resource_kind {
-        ResourceKind::FunctionApp => {
-            // Full-replace: we MUST send every existing setting, so refuse if the
-            // current set isn't cached (a blind write would delete the rest).
-            let Some(current) = state.func_settings.by_resource.get(&edit.resource_id) else {
-                edit.error = Some("settings not loaded — can't safely write".into());
-                state.env_var_edit = Some(edit);
-                return;
-            };
-            let mut settings = current.clone();
-            upsert_env(&mut settings, &name, &value);
-            EnvWrite::FunctionApp { settings }
-        }
+        ResourceKind::FunctionApp => EnvWrite::FunctionApp {
+            name: name.clone(),
+            value: value.clone(),
+        },
         ResourceKind::ContainerApp => {
             let Some(container) = edit.container.clone() else {
                 edit.error = Some("no target container resolved".into());
@@ -4185,8 +4401,9 @@ fn spawn_env_var_write(
     let resource_id = applied.resource_id.clone();
     tokio::spawn(async move {
         let result = match write {
-            EnvWrite::FunctionApp { settings } => {
-                crate::azure::function_app_settings::update(&auth, &resource_id, &settings).await
+            EnvWrite::FunctionApp { name, value } => {
+                crate::azure::function_app_settings::update(&auth, &resource_id, &name, &value)
+                    .await
             }
             EnvWrite::ContainerApp { target, value } => {
                 crate::azure::container_app_env_update::update(&auth, &resource_id, &target, &value)
@@ -4513,6 +4730,11 @@ fn spawn_input_reader(tx: UnboundedSender<AppEvent>, suspended: Arc<AtomicBool>)
                             break;
                         }
                     }
+                    Ok(CtEvent::Paste(s)) => {
+                        if tx.send(AppEvent::Paste(s)).is_err() {
+                            break;
+                        }
+                    }
                     Ok(CtEvent::Resize(w, h)) => {
                         if tx
                             .send(AppEvent::Resize {
@@ -4560,33 +4782,40 @@ fn spawn_ticker(tx: UnboundedSender<AppEvent>) {
 // refuses every scope in demo mode, so a path missed here fails closed
 // instead of reaching a live tenant.
 
-fn spawn_load_subscriptions(auth: AzureAuth, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_subscriptions(auth: AzureAuth, scope: u64, tx: UnboundedSender<AppEvent>) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::SubscriptionsLoaded(Ok(
-            crate::azure::demo::subscriptions(),
-        )));
+        let _ = tx.send(AppEvent::SubscriptionsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::subscriptions()),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::subscriptions::list(&auth)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::SubscriptionsLoaded(result));
+        let _ = tx.send(AppEvent::SubscriptionsLoaded { scope, result });
     });
 }
 
-fn spawn_load_resources(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_resources(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::ResourcesLoaded(Ok(
-            crate::azure::demo::resources(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::ResourcesLoaded {
+            scope,
+            result: Ok(crate::azure::demo::resources(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::resources::list(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::ResourcesLoaded(result));
+        let _ = tx.send(AppEvent::ResourcesLoaded { scope, result });
     });
 }
 
@@ -4599,6 +4828,7 @@ fn spawn_load_metrics(
     if auth.is_demo() {
         let _ = tx.send(AppEvent::MetricsLoaded {
             resource_id: resource.id.clone(),
+            range,
             result: Ok(crate::azure::demo::metrics(&resource, range)),
         });
         return;
@@ -4610,6 +4840,7 @@ fn spawn_load_metrics(
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::MetricsLoaded {
             resource_id,
+            range,
             result,
         });
     });
@@ -4731,6 +4962,11 @@ fn spawn_load_container_app_overview(
         return;
     }
     tokio::spawn(async move {
+        // Same gate as `spawn_load_health`: this fetch fans out per matching
+        // resource (and auto-refresh re-fires it every interval), so ungated
+        // it recreates exactly the ARM 429 burst the semaphore exists to
+        // smooth.
+        let _permit = health_fetch_gate().acquire_owned().await;
         let result = crate::azure::container_app_overview::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
@@ -4756,6 +4992,10 @@ fn spawn_load_container_app_replicas(
         return;
     }
     tokio::spawn(async move {
+        // Gated like the overview fetch: every health fan-out re-emits
+        // `ContainerAppRevisionMetaLoaded`, whose handler re-spawns this per
+        // app — on the auto-refresh timer that's another per-resource burst.
+        let _permit = health_fetch_gate().acquire_owned().await;
         let result =
             crate::azure::container_app_replicas::fetch(&auth, &resource_id, &revision_name)
                 .await
@@ -4781,6 +5021,9 @@ fn spawn_load_function_app_image(
         return;
     }
     tokio::spawn(async move {
+        // Gated like the overview fetch: one `config/web` GET per Function App
+        // on every list load *and* every auto-refresh tick.
+        let _permit = health_fetch_gate().acquire_owned().await;
         let result = crate::azure::function_app_config::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
@@ -5026,20 +5269,22 @@ fn spawn_load_appgw_backends(auth: AzureAuth, resource_id: String, tx: Unbounded
 
 fn spawn_load_storage_accounts(
     auth: AzureAuth,
+    scope: u64,
     sub_ids: Vec<String>,
     tx: UnboundedSender<AppEvent>,
 ) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::StorageAccountsLoaded(Ok(
-            crate::azure::demo::storage_accounts(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::StorageAccountsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::storage_accounts(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::storage::list_accounts(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::StorageAccountsLoaded(result));
+        let _ = tx.send(AppEvent::StorageAccountsLoaded { scope, result });
     });
 }
 
@@ -5150,18 +5395,24 @@ fn spawn_load_storage_blob_preview(
     });
 }
 
-fn spawn_load_registries(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_registries(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::RegistriesLoaded(Ok(
-            crate::azure::demo::registries(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::RegistriesLoaded {
+            scope,
+            result: Ok(crate::azure::demo::registries(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::registries::list_registries(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::RegistriesLoaded(result));
+        let _ = tx.send(AppEvent::RegistriesLoaded { scope, result });
     });
 }
 
@@ -5210,18 +5461,24 @@ fn spawn_load_tags(
     });
 }
 
-fn spawn_load_sql_resources(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_sql_resources(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::SqlResourcesLoaded(Ok(
-            crate::azure::demo::sql_resources(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::SqlResourcesLoaded {
+            scope,
+            result: Ok(crate::azure::demo::sql_resources(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::sql::list_sql_resources(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::SqlResourcesLoaded(result));
+        let _ = tx.send(AppEvent::SqlResourcesLoaded { scope, result });
     });
 }
 
@@ -5234,6 +5491,7 @@ fn spawn_load_sql_metrics(
     if auth.is_demo() {
         let _ = tx.send(AppEvent::SqlMetricsLoaded {
             resource_id: resource_id.clone(),
+            range,
             result: Ok(crate::azure::demo::sql_metrics(&resource_id, range)),
         });
         return;
@@ -5244,6 +5502,7 @@ fn spawn_load_sql_metrics(
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::SqlMetricsLoaded {
             resource_id,
+            range,
             result,
         });
     });
@@ -5251,20 +5510,22 @@ fn spawn_load_sql_metrics(
 
 fn spawn_load_cosmos_accounts(
     auth: AzureAuth,
+    scope: u64,
     sub_ids: Vec<String>,
     tx: UnboundedSender<AppEvent>,
 ) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::CosmosAccountsLoaded(Ok(
-            crate::azure::demo::cosmos_accounts(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::CosmosAccountsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::cosmos_accounts(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::cosmos::list_accounts(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::CosmosAccountsLoaded(result));
+        let _ = tx.send(AppEvent::CosmosAccountsLoaded { scope, result });
     });
 }
 
@@ -5332,18 +5593,24 @@ fn spawn_load_cosmos_items(
     });
 }
 
-fn spawn_load_key_vaults(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_key_vaults(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::KeyVaultsLoaded(Ok(
-            crate::azure::demo::key_vaults(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::KeyVaultsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::key_vaults(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::key_vault::list_vaults(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::KeyVaultsLoaded(result));
+        let _ = tx.send(AppEvent::KeyVaultsLoaded { scope, result });
     });
 }
 
@@ -5398,18 +5665,24 @@ fn spawn_load_key_vault_secret_value(
     });
 }
 
-fn spawn_load_sb_namespaces(auth: AzureAuth, sub_ids: Vec<String>, tx: UnboundedSender<AppEvent>) {
+fn spawn_load_sb_namespaces(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
     if auth.is_demo() {
-        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded(Ok(
-            crate::azure::demo::sb_namespaces(&sub_ids),
-        )));
+        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded {
+            scope,
+            result: Ok(crate::azure::demo::sb_namespaces(&sub_ids)),
+        });
         return;
     }
     tokio::spawn(async move {
         let result = crate::azure::service_bus::list_namespaces(&auth, &sub_ids)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded(result));
+        let _ = tx.send(AppEvent::ServiceBusNamespacesLoaded { scope, result });
     });
 }
 
@@ -6050,7 +6323,9 @@ mod tests {
         state.view = View::List;
         run_command(&mut state, "storage");
         assert_eq!(state.view, View::StorageAccounts);
-        assert_eq!(state.view_stack, vec![View::List]);
+        // Category navigation is semantic-parent-based; the Help-only
+        // view_stack must not grow.
+        assert!(state.view_stack.is_empty());
         assert!(state.status_message.is_none());
     }
 
@@ -6072,7 +6347,7 @@ mod tests {
         state.view = View::List;
         run_command(&mut state, "cosmos");
         assert_eq!(state.view, View::CosmosAccounts);
-        assert_eq!(state.view_stack, vec![View::List]);
+        assert!(state.view_stack.is_empty());
         assert!(state.status_message.is_none());
     }
 
@@ -6341,7 +6616,9 @@ mod tests {
             &mut state,
         ));
         assert_eq!(state.view, View::List);
-        assert_eq!(state.view_stack, vec![View::Subscriptions]);
+        // Forward navigation no longer records history — Back is
+        // semantic-parent-based and the view_stack is Help-only.
+        assert!(state.view_stack.is_empty());
 
         // The subs handler clears resources to force a fresh load — re-seed for
         // the next forward step.
@@ -6353,7 +6630,7 @@ mod tests {
             &mut state
         ));
         assert_eq!(state.view, View::Detail);
-        assert_eq!(state.view_stack, vec![View::Subscriptions, View::List]);
+        assert!(state.view_stack.is_empty());
 
         // Back from Detail: view-local handler must NOT consume it; semantic
         // parent of Detail is List.

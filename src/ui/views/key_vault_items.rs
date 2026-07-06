@@ -186,9 +186,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.key_vault.items_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.key_vault.items_view_top.set(ts.offset());
         }
     }
 
@@ -307,9 +310,12 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 }
             }
             Action::GotoBottom => {
+                // Land exactly on the render-published max — storing u16::MAX
+                // and letting the renderer clamp for display only left `k`
+                // decrementing invisibly for thousands of presses.
+                let max_scroll = state.scroll_max.get();
                 if let Some(m) = state.key_vault.secret_modal.as_mut() {
-                    // Clamped by the renderer against the wrapped line count.
-                    m.scroll = u16::MAX;
+                    m.scroll = max_scroll;
                 }
             }
             Action::Yank => yank_secret_value(state),
@@ -396,14 +402,16 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
 }
 
-/// Nudge the open modal's vertical scroll by `delta` rows, saturating at the
-/// ends. The renderer clamps the upper bound against the wrapped line count.
+/// Nudge the open modal's vertical scroll by `delta` rows, clamped on both
+/// ends against the render-published `scroll_max` so the stored offset can
+/// never park past the wrapped content (where `k` would look dead).
 fn bump_modal_scroll(state: &mut AppState, delta: i32) {
+    let max_scroll = state.scroll_max.get();
     if let Some(m) = state.key_vault.secret_modal.as_mut() {
         m.scroll = if delta >= 0 {
-            m.scroll.saturating_add(delta as u16)
+            m.scroll.saturating_add(delta as u16).min(max_scroll)
         } else {
-            m.scroll.saturating_sub((-delta) as u16)
+            m.scroll.min(max_scroll).saturating_sub((-delta) as u16)
         };
     }
 }
@@ -487,6 +495,10 @@ pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
         height: 1,
     };
 
+    // Assume no scrollable body until the Loaded arm measures one — keeps
+    // j/G no-ops (via the handler's `scroll_max` clamp) while the value is
+    // still fetching or errored.
+    state.scroll_max.set(0);
     let (body, hint): (Paragraph, &str) = match &modal.status {
         SecretRevealStatus::Loading => (
             Paragraph::new(Line::from(Span::styled(
@@ -504,9 +516,15 @@ pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             "Esc close",
         ),
         SecretRevealStatus::Loaded(value) => {
-            // Estimate the wrapped line count so GotoBottom / over-scroll can't
-            // drag the body into blank space below the value.
-            let max_scroll = wrapped_line_estimate(value, body_area.width).saturating_sub(1);
+            // Wrapped row count so GotoBottom / over-scroll can't drag the
+            // body into blank space below the value. Published through
+            // `scroll_max` so the key handler clamps the stored offset too —
+            // G used to park it at u16::MAX where `k` looked dead.
+            let total = super::detail::wrapped_line_count(value, body_area.width);
+            let max_scroll = total
+                .saturating_sub(body_area.height as usize)
+                .min(u16::MAX as usize) as u16;
+            state.scroll_max.set(max_scroll);
             let scroll = modal.scroll.min(max_scroll);
             (
                 Paragraph::new(Text::styled(value.clone(), Style::default().fg(theme.fg)))
@@ -524,24 +542,6 @@ pub fn render_modal(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     )))
     .alignment(Alignment::Center);
     frame.render_widget(hint_p, hint_area);
-}
-
-/// Rough count of rows a value occupies once wrapped to `width` — the sum over
-/// hard newlines of each line's `ceil(len / width)`. Used only to clamp scroll,
-/// so an approximation (char count, not display width) is fine.
-fn wrapped_line_estimate(value: &str, width: u16) -> u16 {
-    if width == 0 {
-        return 1;
-    }
-    let w = width as usize;
-    value
-        .split('\n')
-        .map(|l| {
-            let chars = l.chars().count();
-            ((chars / w) + 1) as u16
-        })
-        .sum::<u16>()
-        .max(1)
 }
 
 #[cfg(test)]
@@ -723,6 +723,9 @@ mod tests {
         state.key_vault.items_cursor = 0;
         state.key_vault.secret_modal =
             Some(open_modal("a", SecretRevealStatus::Loaded("x".repeat(500))));
+        // Handlers clamp to the render-published max; simulate a rendered
+        // modal whose value wraps below the fold.
+        state.scroll_max.set(10);
 
         // j scrolls the modal, not the list.
         assert!(handle(Action::MoveDown, &mut state));
@@ -735,6 +738,36 @@ mod tests {
         // Esc closes the modal (and does not navigate away).
         assert!(handle(Action::Back, &mut state));
         assert!(state.key_vault.secret_modal.is_none());
+    }
+
+    #[test]
+    fn modal_goto_bottom_then_move_up_responds_immediately() {
+        // Regression: G stored u16::MAX while only the renderer clamped it for
+        // display, so `k` decremented invisibly for thousands of presses.
+        // After a render, G must land exactly on the wrapped content's max
+        // scroll and the very next `k` must move the view.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(60, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // A long secret that wraps into many rows inside the ~40-col modal.
+        state.key_vault.secret_modal =
+            Some(open_modal("a", SecretRevealStatus::Loaded("x".repeat(600))));
+        term.draw(|f| render_modal(f, f.area(), &state, &theme))
+            .unwrap();
+
+        assert!(handle(Action::GotoBottom, &mut state));
+        let max = state.scroll_max.get();
+        assert!(
+            max > 0 && max < 100,
+            "expected a small real max scroll, got {max}"
+        );
+        assert_eq!(state.key_vault.secret_modal.as_ref().unwrap().scroll, max);
+        assert!(handle(Action::MoveUp, &mut state));
+        assert_eq!(
+            state.key_vault.secret_modal.as_ref().unwrap().scroll,
+            max - 1
+        );
     }
 
     #[test]

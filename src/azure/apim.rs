@@ -4,6 +4,11 @@
 //!
 //! All three calls share an `api-version` (`2024-05-01`); pinned here so the
 //! UI never has to think about it.
+//!
+//! The list endpoints follow `nextLink` until exhausted (APIM defaults to
+//! paging APIs/operations well below what a real gateway hosts), capped at
+//! [`MAX_PAGES`] pages with a `tracing::warn` when the cap is hit — same
+//! treatment as `service_bus.rs`.
 
 #![allow(dead_code)]
 
@@ -11,9 +16,13 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 
 use crate::azure::auth::AzureAuth;
-use crate::azure::client::ArmClient;
+use crate::azure::client::{ArmClient, ARM_BASE};
 
 const API_VERSION: &str = "2024-05-01";
+
+/// Cap on `nextLink` pages followed per list call — bounds a pathological
+/// service to a few thousand rows instead of stalling the view.
+const MAX_PAGES: usize = 50;
 
 /// A single API hosted by an APIM service. `path` is the gateway prefix
 /// (e.g. `echo`) that all of this API's operations sit under.
@@ -44,36 +53,89 @@ pub struct Operation {
     pub url_template: String,
 }
 
-/// `GET {service_id}/apis?api-version=…`. Returns APIs in the order APIM hands
-/// them back, then sorts by display name so the list view is deterministic.
+/// `GET {service_id}/apis?api-version=…`, following `nextLink` until
+/// exhausted. Sorts by display name so the list view is deterministic.
 pub async fn list_apis(auth: &AzureAuth, service_id: &str) -> anyhow::Result<Vec<Api>> {
     let client = ArmClient::new(auth.clone())?;
     let path = format!("{service_id}/apis");
-    let resp = client
-        .get(&path, &[("api-version", API_VERSION)])
+    let pages = get_all_pages(&client, &path)
         .await
         .with_context(|| format!("list APIs on {service_id}"))?;
-    let mut apis = parse_apis(&resp)?;
+    let mut apis = Vec::new();
+    for page in &pages {
+        apis.extend(parse_apis(page)?);
+    }
     apis.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     Ok(apis)
 }
 
-/// `GET {api_id}/operations?api-version=…`. Sorted by (path, method) so the
-/// route list reads in a stable order regardless of upstream pagination.
+/// `GET {api_id}/operations?api-version=…`, following `nextLink` until
+/// exhausted. Sorted by (path, method) so the route list reads in a stable
+/// order regardless of upstream page boundaries.
 pub async fn list_operations(auth: &AzureAuth, api_id: &str) -> anyhow::Result<Vec<Operation>> {
     let client = ArmClient::new(auth.clone())?;
     let path = format!("{api_id}/operations");
-    let resp = client
-        .get(&path, &[("api-version", API_VERSION)])
+    let pages = get_all_pages(&client, &path)
         .await
         .with_context(|| format!("list operations on {api_id}"))?;
-    let mut ops = parse_operations(&resp)?;
+    let mut ops = Vec::new();
+    for page in &pages {
+        ops.extend(parse_operations(page)?);
+    }
     ops.sort_by(|a, b| {
         a.url_template
             .cmp(&b.url_template)
             .then_with(|| a.method.cmp(&b.method))
     });
     Ok(ops)
+}
+
+/// GET `first_path` and every `nextLink` page after it, returning the raw page
+/// envelopes. Warn-and-stop at [`MAX_PAGES`]. Same shape as the helper in
+/// `service_bus.rs` (duplicated by design — the azure modules stay
+/// self-contained).
+async fn get_all_pages(
+    client: &ArmClient,
+    first_path: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut pages = Vec::new();
+    let mut resp = client
+        .get(first_path, &[("api-version", API_VERSION)])
+        .await?;
+    loop {
+        let next = next_link_path(&resp);
+        pages.push(resp);
+        if pages.len() >= MAX_PAGES && next.is_some() {
+            tracing::warn!(
+                "apim list {first_path}: stopping after {MAX_PAGES} pages; \
+                 more rows exist beyond the cap"
+            );
+            break;
+        }
+        match next {
+            // nextLink embeds the api-version and skip token in its query
+            // string, so no extra query params on follow-up requests.
+            Some(path) => resp = client.get(&path, &[]).await?,
+            None => break,
+        }
+    }
+    Ok(pages)
+}
+
+/// Extract a page's `nextLink` as an [`ArmClient`]-relative path. A link not
+/// rooted at ARM (never seen in practice) is not followed.
+fn next_link_path(resp: &serde_json::Value) -> Option<String> {
+    let link = resp
+        .get("nextLink")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    match link.strip_prefix(ARM_BASE) {
+        Some(path) => Some(path.to_string()),
+        None => {
+            tracing::warn!("ignoring nextLink not rooted at {ARM_BASE}: {link}");
+            None
+        }
+    }
 }
 
 /// Fetched policy text for one operation, or `None` if APIM reports no policy
@@ -277,5 +339,22 @@ mod tests {
         let payload = json!({ "items": [] });
         assert!(parse_apis(&payload).is_err());
         assert!(parse_operations(&payload).is_err());
+    }
+
+    #[test]
+    fn next_link_path_strips_arm_base_and_rejects_foreign_hosts() {
+        let resp = json!({
+            "value": [],
+            "nextLink": "https://management.azure.com/svc/apis?api-version=2024-05-01&$skip=100"
+        });
+        assert_eq!(
+            next_link_path(&resp).as_deref(),
+            Some("/svc/apis?api-version=2024-05-01&$skip=100")
+        );
+        assert_eq!(next_link_path(&json!({ "value": [] })), None);
+        assert_eq!(
+            next_link_path(&json!({ "nextLink": "https://evil.example.com/x" })),
+            None
+        );
     }
 }

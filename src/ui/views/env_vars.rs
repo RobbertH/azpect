@@ -20,6 +20,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, EnvVarEdit, EnvVarEditMode, EnvVarEditPhase, EnvVarField};
 use crate::ui::theme::Theme;
 use crate::ui::views::detail::env_vars_for;
+use crate::ui::views::edge_scroll;
 
 const FOOTER: &str =
     "x reveal/hide  Enter open kv ref  ^E edit  ^N add  h/l scroll  y yank  j/k move  Esc back  q quit";
@@ -126,7 +127,7 @@ fn render_body(
     let cursor = state.env_vars_view.cursor.min(vars.len() - 1);
     let revealed = state.env_vars_view.revealed;
     let visible = area.height as usize;
-    let scroll = scroll_for(cursor, vars.len(), visible);
+    let scroll = edge_scroll(&state.env_vars_view.view_top, cursor, vars.len(), visible);
 
     // The owning-container column exists for Container Apps (every exploded row
     // carries its container label); Function App settings are flat and carry
@@ -392,16 +393,6 @@ fn selected_env_len(state: &AppState) -> usize {
         .and_then(|r| env_vars_for(state, &r.id, r.kind))
         .map(|v| v.len())
         .unwrap_or(0)
-}
-
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
 }
 
 fn truncate_right(s: &str, max: usize) -> String {

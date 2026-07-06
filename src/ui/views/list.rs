@@ -9,6 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use super::edge_scroll;
 use crate::azure::health::{derive, HealthStatus};
 use crate::azure::logs::supports_logs;
 use crate::azure::resources::{Resource, ResourceKind};
@@ -83,6 +84,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         title_spans.push(Span::styled(
             format!("· updated {} ", format_ago(loaded.elapsed())),
             Style::default().fg(theme.muted),
+        ));
+    }
+    // Per-row fetch sweep: the badges/versions arrive from throttled
+    // background calls that can take 10s+ on a large subscription, so show
+    // how many are back out of how many were launched while any is in
+    // flight. Live-updates off the 250ms tick; disappears once settled.
+    if let Some((back, launched)) = state.list_fetch_progress() {
+        title_spans.push(Span::styled(
+            format!("· fetches {back}/{launched} "),
+            Style::default().fg(theme.accent),
         ));
     }
     if state.favorites_only {
@@ -196,7 +207,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
         let cursor = state.list_cursor.min(filtered.len() - 1);
         let visible = body_area.height as usize;
-        let scroll = scroll_for(cursor, filtered.len(), visible);
+        let scroll = edge_scroll(&state.list_view_top, cursor, filtered.len(), visible);
 
         // Sampled once per frame so every CREATED / MODIFIED cell tints against
         // the same "now" (see `date_cell`).
@@ -678,16 +689,6 @@ fn clip_spans_to_width(
     out
 }
 
-fn scroll_for(cursor: usize, len: usize, visible: usize) -> usize {
-    if visible == 0 || len <= visible {
-        return 0;
-    }
-    if cursor < visible {
-        return 0;
-    }
-    (cursor + 1).saturating_sub(visible).min(len - visible)
-}
-
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let filtered_len = state.filtered_resources().len();
 
@@ -771,7 +772,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 let id = selected.id.clone();
                 let kind = selected.kind;
                 state.config.last_resource_id = Some(id);
-                state.view_stack.push(state.view);
                 state.view = match kind {
                     ResourceKind::AppGateway => {
                         state.appgw.cursor = 0;
@@ -797,7 +797,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                     // Drop the previous resource's source/search filters so the
                     // new app's logs aren't hidden behind a stale filter.
                     state.logs.reset_view_filters();
-                    state.view_stack.push(state.view);
                     state.view = View::Logs;
                 } else {
                     state.set_status("logs are not supported for this resource type");
@@ -859,6 +858,47 @@ mod tests {
     }
 
     #[test]
+    fn window_scrolls_only_when_cursor_pushes_an_edge() {
+        let theme = Theme::catppuccin_mocha();
+        // Short terminal so the list overflows the viewport.
+        let backend = TestBackend::new(180, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.resources = (0..50)
+            .map(|i| {
+                r(
+                    &format!("/r/{i}"),
+                    &format!("res-{i:02}"),
+                    ResourceKind::FunctionApp,
+                )
+            })
+            .collect();
+
+        // First frame pins the window to the top.
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        assert_eq!(state.list_view_top.get(), 0);
+
+        // Drive the cursor past the bottom edge: the window follows it down.
+        for _ in 0..30 {
+            handle(Action::MoveDown, &mut state);
+        }
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let top = state.list_view_top.get();
+        assert!(top > 0, "window should have scrolled down, top={top}");
+
+        // Stepping back up from the bottom edge must NOT scroll — the cursor
+        // moves freely inside the window until it pushes against the top.
+        handle(Action::MoveUp, &mut state);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        assert_eq!(state.list_view_top.get(), top);
+
+        // Jumping to the top pushes the edge → window follows back to row 0.
+        handle(Action::GotoTop, &mut state);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        assert_eq!(state.list_view_top.get(), 0);
+    }
+
+    #[test]
     fn renders_without_panic() {
         let theme = Theme::catppuccin_mocha();
         // Wide enough for all columns (NAME…CREATED, incl. the SUBSCRIPTION and
@@ -880,6 +920,37 @@ mod tests {
         );
         // CREATED header column shipped — even if every row's date is empty.
         assert!(s.contains("CREATED"), "expected CREATED header in {s}");
+    }
+
+    #[test]
+    fn title_shows_fetch_progress_while_sweep_in_flight() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(180, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        // Sweep mid-flight: one health result back (a failure counts — the
+        // fetch IS finished), two still pending, plus the Container App's
+        // overview pending → 1 back of 4 launched.
+        state
+            .health
+            .failures
+            .insert("/r/one".into(), "denied".into());
+        state.health.pending.insert("/r/two".into());
+        state.health.pending.insert("/r/three".into());
+        state
+            .container_app_overview
+            .pending
+            .insert("/r/three".into());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("fetches 1/4"), "expected fetch progress in {s}");
+
+        // Everything landed: the indicator must disappear, not stick at n/n.
+        state.health.pending.clear();
+        state.container_app_overview.pending.clear();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(!s.contains("fetches"), "indicator should hide once settled");
     }
 
     /// Build a metrics vec with `traffic` requests and zero errors across the

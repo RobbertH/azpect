@@ -37,6 +37,30 @@ pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 /// Backoff schedule for retries on 429/5xx (in addition to any `Retry-After`).
 const BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000];
 
+/// Upper bound honoured for a server-supplied `Retry-After`. Azure throttling
+/// windows can be long (86400s has been seen in the wild) and the header is
+/// attacker/typo-shaped input; sleeping that long parks the fetch task for the
+/// rest of the session, and an unbounded value overflows the millisecond
+/// conversion. Better to retry sooner and eat another 429.
+const MAX_RETRY_AFTER_SECS: u64 = 60;
+
+/// Connect timeout for every outbound request. reqwest sets no default, so a
+/// black-holed endpoint (e.g. an unroutable IPv6 address — the same failure
+/// mode `auth.rs` bounds for token acquisition) would otherwise hang a fetch
+/// forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Overall per-request deadline for the JSON control-plane clients (ARM,
+/// Resource Graph, Log Analytics, Microsoft Graph). Generous enough for a slow
+/// KQL query; small enough that a stalled response surfaces as a retryable
+/// error instead of wedging the UI.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall per-request deadline for blob data-plane transfers. Larger than
+/// [`REQUEST_TIMEOUT`]: enumeration pages and ranged blob previews are bounded
+/// in size but can be slow on a thin link.
+const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Maximum number of bytes from an error response body included in the error message.
 const ERROR_BODY_EXCERPT: usize = 4096;
 
@@ -53,8 +77,14 @@ pub struct LogsClient {
 }
 
 fn build_http() -> anyhow::Result<reqwest::Client> {
+    build_http_with_timeout(REQUEST_TIMEOUT)
+}
+
+fn build_http_with_timeout(timeout: Duration) -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
         .build()
         .map_err(|e| anyhow!("failed to build reqwest client: {e}"))
 }
@@ -66,11 +96,14 @@ fn should_retry(status: StatusCode) -> bool {
 
 /// Pull a `Retry-After: <seconds>` header (we only honour the integer-seconds
 /// form; the HTTP-date form is rare in Azure responses and not worth the deps).
+/// Clamped to [`MAX_RETRY_AFTER_SECS`] so a huge server value can't park the
+/// task for hours or overflow the millisecond math at the call sites.
 fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
 }
 
 /// Read up to `ERROR_BODY_EXCERPT` chars of the body to attach to error messages.
@@ -193,6 +226,17 @@ impl ArmClient {
             .collect();
         send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
             http.request(Method::GET, &url).query(&query_owned)
+        })
+        .await
+    }
+
+    /// `GET {url}` where `url` is a full ARM URL. Used to follow `nextLink`
+    /// pagination continuations, which arrive as absolute URLs with the
+    /// continuation token already encoded in the query string.
+    pub async fn get_url(&self, url: &str) -> anyhow::Result<serde_json::Value> {
+        let url_owned = url.to_string();
+        send_with_retry(&self.http, &self.auth, SCOPE_ARM, |http| {
+            http.request(Method::GET, &url_owned)
         })
         .await
     }
@@ -432,7 +476,9 @@ impl StorageClient {
     pub fn new(auth: AzureAuth) -> anyhow::Result<Self> {
         Ok(Self {
             auth,
-            http: build_http()?,
+            // Data-plane transfers get the longer deadline — see
+            // [`STORAGE_REQUEST_TIMEOUT`].
+            http: build_http_with_timeout(STORAGE_REQUEST_TIMEOUT)?,
         })
     }
 
@@ -480,7 +526,9 @@ impl StorageClient {
 
     /// `GET {url}` with a `Range:` header set, returning the raw bytes. Caller
     /// is responsible for forming a valid HTTP range expression (e.g.
-    /// `"bytes=0-1023"`).
+    /// `"bytes=0-1023"`). Note the whole request shares
+    /// [`STORAGE_REQUEST_TIMEOUT`]; callers requesting very large ranges
+    /// should size them accordingly.
     pub async fn get_bytes_range(&self, url: &str, range: &str) -> anyhow::Result<Vec<u8>> {
         let url_owned = url.to_string();
         let range_owned = range.to_string();
@@ -501,5 +549,49 @@ impl StorageClient {
         )
         .await?;
         Ok(resp.body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn retry_after_parses_integer_seconds() {
+        assert_eq!(retry_after_secs(&headers_with_retry_after("5")), Some(5));
+        assert_eq!(
+            retry_after_secs(&headers_with_retry_after(" 12 ")),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn retry_after_clamps_huge_values() {
+        // A day-long throttle window must not park the fetch task for a day,
+        // and u64::MAX must not overflow the *1000 conversion at the call site.
+        assert_eq!(
+            retry_after_secs(&headers_with_retry_after("86400")),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+        let max = u64::MAX.to_string();
+        assert_eq!(
+            retry_after_secs(&headers_with_retry_after(&max)),
+            Some(MAX_RETRY_AFTER_SECS)
+        );
+    }
+
+    #[test]
+    fn retry_after_ignores_http_date_form() {
+        // We only honour integer seconds; the HTTP-date form parses as None
+        // and the caller falls back to the plain backoff schedule.
+        let h = headers_with_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+        assert_eq!(retry_after_secs(&h), None);
+        assert_eq!(retry_after_secs(&HeaderMap::new()), None);
     }
 }

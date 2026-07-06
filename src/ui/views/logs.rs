@@ -5,7 +5,7 @@
 #![allow(dead_code, unused_variables)]
 
 use chrono::Offset;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
@@ -32,6 +32,15 @@ const TIME_COL: u16 = 19;
 const LVL_COL: u16 = 5;
 const SOURCE_COL: u16 = 32;
 const COLUMN_SPACING: u16 = 2;
+/// Column constraints shared by the Table and the wrap-width math in
+/// [`render_table`] — the two must stay identical, or the declared row
+/// heights drift from the cells the Table actually draws.
+const COLUMN_CONSTRAINTS: [Constraint; 4] = [
+    Constraint::Length(TIME_COL),
+    Constraint::Length(LVL_COL),
+    Constraint::Length(SOURCE_COL),
+    Constraint::Min(20),
+];
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let selected = state.selected_resource();
@@ -358,10 +367,20 @@ fn render_table(
     // available data rows occupy `area.height - 1` cells of vertical space.
     let data_height = (area.height as usize).saturating_sub(1).max(1);
 
-    // Width available for the message column after fixed columns and spacing.
-    let used = TIME_COL + LVL_COL + SOURCE_COL + 3 * COLUMN_SPACING;
-    let msg_w = (area.width.saturating_sub(used)).max(20) as usize;
-    let source_w = SOURCE_COL as usize;
+    // Wrap widths must match the column cells the Table below actually lays
+    // out. Under ~82 total columns the layout solver shrinks the columns past
+    // their constraints, so assuming a fixed `SOURCE_COL` / a `width - 62`
+    // message floor over-states the cell widths: declared row heights come
+    // out too small, wrapped tails get clipped, and the which-rows-fit
+    // bookkeeping (`visible_range`) disagrees with what's drawn. Run the same
+    // layout the Table runs (same constraints, spacing, and its default
+    // `Flex::Start`) and measure the resulting rects instead.
+    let [_time_col, _lvl_col, source_col, msg_col] = Layout::horizontal(COLUMN_CONSTRAINTS)
+        .spacing(COLUMN_SPACING)
+        .flex(Flex::Start)
+        .areas(Rect::new(0, 0, area.width, 1));
+    let source_w = source_col.width as usize;
+    let msg_w = msg_col.width as usize;
 
     // Pick the slice of rows to render under the edge-scroll policy: the window
     // stays put at the persisted `view_top` and only moves once the cursor
@@ -427,29 +446,21 @@ fn render_table(
         .collect();
 
     let time_header = format!("time ({})", local_tz_label());
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(TIME_COL),
-            Constraint::Length(LVL_COL),
-            Constraint::Length(SOURCE_COL),
-            Constraint::Min(20),
-        ],
-    )
-    .header(
-        Row::new(vec![
-            time_header,
-            "lvl".to_string(),
-            "source".to_string(),
-            "message".to_string(),
-        ])
-        .style(
-            Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .column_spacing(COLUMN_SPACING);
+    let table = Table::new(rows, COLUMN_CONSTRAINTS)
+        .header(
+            Row::new(vec![
+                time_header,
+                "lvl".to_string(),
+                "source".to_string(),
+                "message".to_string(),
+            ])
+            .style(
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .column_spacing(COLUMN_SPACING);
     frame.render_widget(table, area);
 }
 
@@ -1111,7 +1122,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             // Enter opens the per-line detail view. Only meaningful when at
             // least one log line is rendered.
             if lines_len > 0 {
-                state.view_stack.push(crate::ui::state::View::Logs);
                 state.view = crate::ui::state::View::LogDetail;
                 state.logs.detail_scroll = 0;
                 state.logs.visual_anchor = None;
@@ -1214,16 +1224,31 @@ fn cycle_source_filter(state: &mut AppState, direction: i32) {
 }
 
 /// Distinct `LogLine::source` values in the cached buffer for `id`, sorted for a
-/// stable cycle/tab order. Shared by the cycle handler and the header tab-bar.
+/// stable cycle/tab order. Shared by the cycle handler and the tab-bar, which
+/// calls this on every 250ms redraw — so the result is memoized in
+/// `logs.sources_memo` keyed on the buffer fingerprint. Recomputing per frame
+/// clones and sorts every cached line's source, and scroll-to-load grows the
+/// buffer to thousands of rows.
 fn distinct_sources(state: &AppState, id: &str) -> Vec<String> {
-    let mut sources: Vec<String> = state
-        .logs
-        .by_resource
-        .get(id)
+    let lines = state.logs.by_resource.get(id);
+    let fingerprint: crate::ui::state::LogsBufferFingerprint = (
+        id.to_string(),
+        state.logs.generation,
+        lines.map(|v| v.len()).unwrap_or(0),
+        lines.and_then(|v| v.first()).map(|l| l.ts),
+        lines.and_then(|v| v.last()).map(|l| l.ts),
+    );
+    if let Some((cached_for, cached)) = state.logs.sources_memo.borrow().as_ref() {
+        if *cached_for == fingerprint {
+            return cached.clone();
+        }
+    }
+    let mut sources: Vec<String> = lines
         .map(|lines| lines.iter().map(|l| l.source.clone()).collect())
         .unwrap_or_default();
     sources.sort();
     sources.dedup();
+    *state.logs.sources_memo.borrow_mut() = Some((fingerprint, sources.clone()));
     sources
 }
 
@@ -2261,6 +2286,69 @@ mod tests {
         assert!(
             s.contains("Id=385960"),
             "expected wrapped content, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn renders_wrapped_message_tail_on_narrow_terminal() {
+        // Regression: below ~82 columns the Table layout shrinks the columns
+        // past their constraints, but the wrap widths were computed from the
+        // fixed-width assumption — declared row heights came out too small
+        // and the wrapped tail was clipped. The wrap math now runs the same
+        // layout the Table runs, so the tail must survive at any width.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(60, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state.logs.wrap = true;
+        state.logs.by_resource.insert(
+            "/r/one".into(),
+            vec![line(
+                1,
+                LogLevel::Error,
+                "FunctionAppLogs/FunctionAppLogs",
+                "Executed Functions.http_app_func failed TAIL_MARKER_END",
+            )],
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("MARKER_END"),
+            "wrapped tail must be visible on a 60-col terminal, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn distinct_sources_memoizes_and_invalidates_on_buffer_change() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![
+                line(1, LogLevel::Info, "reports", "a"),
+                line(2, LogLevel::Info, "http-auth", "b"),
+            ],
+        );
+        assert_eq!(distinct_sources(&state, &id), ["http-auth", "reports"]);
+        assert!(
+            state.logs.sources_memo.borrow().is_some(),
+            "first computation must populate the memo"
+        );
+
+        // Unchanged buffer → served from the memo (same result).
+        assert_eq!(distinct_sources(&state, &id), ["http-auth", "reports"]);
+
+        // A page append (new row count / tail timestamp) must invalidate.
+        state
+            .logs
+            .by_resource
+            .get_mut(&id)
+            .unwrap()
+            .push(line(3, LogLevel::Info, "worker", "c"));
+        assert_eq!(
+            distinct_sources(&state, &id),
+            ["http-auth", "reports", "worker"],
+            "memo must be recomputed once the buffer grows"
         );
     }
 }

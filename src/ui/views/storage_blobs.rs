@@ -14,8 +14,8 @@
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::ui::events::Action;
@@ -105,10 +105,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let key = StorageCache::blobs_key(&acc.name, cont);
 
     if let Some(err) = state.storage.blobs_error.get(&key) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -195,9 +198,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.storage.blobs_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.storage.blobs_view_top.set(ts.offset());
         }
     }
 
@@ -331,7 +337,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(name) = blob_name {
                 state.storage.selected_blob = Some(name);
                 state.storage.blob_preview_scroll = 0;
-                state.view_stack.push(state.view);
                 state.view = View::StorageBlobDetail;
             }
             true

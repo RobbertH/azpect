@@ -6,10 +6,11 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::{name_col_width, truncate_ellipsis};
 use crate::azure::cosmos::CosmosContainer;
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, CosmosCache, View};
@@ -89,10 +90,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     };
 
     if let Some(err) = state.cosmos.containers_error.get(&key) {
-        let p = Paragraph::new(Line::from(Span::styled(
+        // `Text` keeps any line breaks from a pretty-printed JSON error body;
+        // `wrap` folds long lines so nothing runs off the right edge.
+        let p = Paragraph::new(Text::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        )));
+        ))
+        .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -130,12 +134,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             frame.render_widget(p, body_area);
         }
         Some(_) => {
-            let name_w = filtered
+            // CONTAINER absorbs the leftover width; on a narrow terminal it
+            // caps to the budget and truncates with an ellipsis rather than
+            // pushing the partition-key/TTL columns off-screen. `fixed_w` sums
+            // the non-NAME widths below (the Min(20) counts its minimum); keep
+            // the two in sync. Floor at 9 so the "CONTAINER" header always
+            // reads.
+            let fixed_w: u16 = 20 + 7 + 10 + 8;
+            let longest = filtered
                 .iter()
                 .map(|c| c.name.chars().count() as u16)
                 .max()
-                .unwrap_or(0)
-                .max(9);
+                .unwrap_or(0);
+            let name_w = name_col_width(body_area.width, fixed_w, 5, longest).max(9);
 
             let widths = [
                 Constraint::Length(name_w), // NAME
@@ -169,7 +180,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     let indexing = c.indexing_mode.as_deref().unwrap_or("—").to_string();
                     let ttl = format_ttl(c.default_ttl);
                     Row::new(vec![
-                        Cell::from(c.name.as_str()).style(Style::default().fg(theme.fg)),
+                        Cell::from(truncate_ellipsis(&c.name, name_w as usize))
+                            .style(Style::default().fg(theme.fg)),
                         Cell::from(pk).style(Style::default().fg(theme.muted)),
                         Cell::from(pk_kind).style(Style::default().fg(theme.muted)),
                         Cell::from(indexing).style(Style::default().fg(theme.muted)),
@@ -185,9 +197,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .highlight_symbol("▍ ")
                 .column_spacing(2);
 
-            let mut ts = TableState::default();
+            // Offset persisted across frames so the window only scrolls when the
+            // cursor pushes against an edge (ratatui reconciles it during render).
+            let mut ts = TableState::default().with_offset(state.cosmos.containers_view_top.get());
             ts.select(Some(cursor));
             frame.render_stateful_widget(table, body_area, &mut ts);
+            state.cosmos.containers_view_top.set(ts.offset());
         }
     }
 
@@ -295,7 +310,6 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(name) = coll {
                 state.cosmos.selected_container = Some(name);
                 state.cosmos.items_scroll = 0;
-                state.view_stack.push(state.view);
                 state.view = View::CosmosItem;
             }
             true

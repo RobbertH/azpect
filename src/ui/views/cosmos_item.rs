@@ -19,13 +19,12 @@ use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str = "j/k scroll  g/G top/bottom  Esc back  r refresh  y yank  ? help  q quit";
 const HALF_PAGE: u16 = 10;
-/// Hard upper bound on the scroll counter — must leave headroom below
-/// `u16::MAX` so ratatui 0.29's `Paragraph` (which adds `scroll + area.height`
-/// without saturating) never overflows. Mirrors the sentinel in
-/// `storage_blob_detail` / `logs_detail`.
-const GOTO_BOTTOM_SENTINEL: u16 = 10_000;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    // Assume no scrollable content until `render_items` measures some — keeps
+    // j/G no-ops (via the handler's `scroll_max` clamp) on the placeholder /
+    // error / empty branches below.
+    state.scroll_max.set(0);
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
 
     let (Some(acc), Some(db), Some(coll)) = (
@@ -108,7 +107,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             )));
             frame.render_widget(para, inner);
         }
-        Some(preview) => render_items(frame, inner, preview, state.cosmos.items_scroll, theme),
+        Some(preview) => render_items(frame, inner, preview, state, theme),
     }
 
     render_footer(frame, chunks[1], theme);
@@ -118,7 +117,7 @@ fn render_items(
     frame: &mut Frame,
     area: Rect,
     preview: &CosmosItemPreview,
-    scroll: u16,
+    state: &AppState,
     theme: &Theme,
 ) {
     let text = format_items_text(&preview.items);
@@ -129,7 +128,13 @@ fn render_items(
     // line above the window on every frame (cost ∝ offset), which pegged a CPU
     // when scrolling up from `G`. Slicing keeps render cost O(viewport).
     let max_scroll = all.len().saturating_sub(view_h);
-    let start = (scroll as usize).min(max_scroll);
+    // Publish the real ceiling so the key handler clamps the stored offset —
+    // G must land on the last window, not park at a sentinel that leaves `k`
+    // apparently dead until the counter walks back into range.
+    state
+        .scroll_max
+        .set(max_scroll.min(u16::MAX as usize) as u16);
+    let start = (state.cosmos.items_scroll as usize).min(max_scroll);
     let end = (start + view_h).min(all.len());
     let lines: Vec<Line> = all[start..end]
         .iter()
@@ -163,17 +168,18 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
 }
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // Every mutation clamps to the render-published `scroll_max` so the stored
+    // offset never parks past the content. G used to store a 10_000 sentinel
+    // (render clamped it for display only), which left `k` decrementing
+    // invisibly for thousands of presses before the window moved.
+    let max_scroll = state.scroll_max.get();
     match action {
         Action::MoveDown => {
-            state.cosmos.items_scroll = state
-                .cosmos
-                .items_scroll
-                .saturating_add(1)
-                .min(GOTO_BOTTOM_SENTINEL);
+            state.cosmos.items_scroll = state.cosmos.items_scroll.saturating_add(1).min(max_scroll);
             true
         }
         Action::MoveUp => {
-            state.cosmos.items_scroll = state.cosmos.items_scroll.saturating_sub(1);
+            state.cosmos.items_scroll = state.cosmos.items_scroll.min(max_scroll).saturating_sub(1);
             true
         }
         Action::HalfPageDown => {
@@ -181,11 +187,15 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .cosmos
                 .items_scroll
                 .saturating_add(HALF_PAGE)
-                .min(GOTO_BOTTOM_SENTINEL);
+                .min(max_scroll);
             true
         }
         Action::HalfPageUp => {
-            state.cosmos.items_scroll = state.cosmos.items_scroll.saturating_sub(HALF_PAGE);
+            state.cosmos.items_scroll = state
+                .cosmos
+                .items_scroll
+                .min(max_scroll)
+                .saturating_sub(HALF_PAGE);
             true
         }
         Action::GotoTop => {
@@ -193,7 +203,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::GotoBottom => {
-            state.cosmos.items_scroll = GOTO_BOTTOM_SENTINEL;
+            state.cosmos.items_scroll = max_scroll;
             true
         }
         _ => false,
@@ -279,6 +289,36 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("alpha"), "item content should render");
         assert!(buf.contains("2.34 RU"), "RU charge should appear in title");
+    }
+
+    #[test]
+    fn goto_bottom_then_move_up_responds_immediately() {
+        // Regression: G stored a 10_000 sentinel while only the renderer
+        // clamped it for display, so `k` decremented invisibly for thousands
+        // of presses. After a render, G must land exactly on the last window
+        // and the very next `k` must move the view.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(60, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let key = CosmosCache::items_key("/subs/x/rg/y/da/acc", "orders", "items");
+        let items: Vec<serde_json::Value> = (0..10).map(|i| json!({ "id": i })).collect();
+        state.cosmos.items.insert(
+            key,
+            CosmosItemPreview {
+                items,
+                request_charge: None,
+                partial: false,
+            },
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+
+        assert!(handle(Action::GotoBottom, &mut state));
+        let max = state.scroll_max.get();
+        assert!(max > 0, "fixture must overflow the viewport");
+        assert_eq!(state.cosmos.items_scroll, max);
+        assert!(handle(Action::MoveUp, &mut state));
+        assert_eq!(state.cosmos.items_scroll, max - 1);
     }
 
     #[test]

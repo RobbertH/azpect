@@ -52,21 +52,34 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if let Some(line) = selected_line(state) {
         let body = build_body(line, theme);
-        // Clamp scroll to keep the last logical row aligned with the bottom of
+        // Clamp scroll to keep the last wrapped row aligned with the bottom of
         // the panel. ratatui 0.29's Paragraph overflows when `scroll.0 +
-        // area.height` exceeds u16::MAX (paragraph.rs:483), so we must cap
-        // detail_scroll at a sane value before passing it in. `body.len()` is
-        // an unwrapped lower bound on wrapped line count; using it as the
-        // ceiling lets the user scroll a little past the content but never
-        // anywhere near u16::MAX.
-        let total = body.len() as u16;
-        let max_scroll = total.saturating_sub(inner.height.max(1).saturating_sub(1));
+        // area.height` exceeds u16::MAX (paragraph.rs:483), so the ceiling
+        // doubles as the overflow guard. Rows are counted post-wrap — long
+        // stack-trace lines span several rows each, and an unwrapped count
+        // would leave the tail unreachable. The max is also published through
+        // `scroll_max` so the key handler clamps the *stored* offset; G used
+        // to park it at a sentinel where `k` stayed dead for thousands of
+        // presses.
+        let total: usize = body
+            .iter()
+            .map(|l| {
+                let plain: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                super::detail::wrapped_line_count(&plain, inner.width)
+            })
+            .sum();
+        let max_scroll = total
+            .saturating_sub(inner.height.max(1) as usize)
+            .min(u16::MAX as usize) as u16;
+        state.scroll_max.set(max_scroll);
         let scroll = state.logs.detail_scroll.min(max_scroll);
         let p = Paragraph::new(body)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(p, inner);
     } else if inner.height > 0 {
+        // No scrollable body on screen — pin the clamp so j/G stay no-ops.
+        state.scroll_max.set(0);
         let p = Paragraph::new(Line::from(Span::styled(
             "no log line selected.",
             Style::default().fg(theme.muted),
@@ -200,29 +213,35 @@ pub fn yank_text(line: &LogLine) -> String {
     s
 }
 
-/// Sentinel "go to bottom" value. Must be small enough that
-/// `scroll + terminal_height` does not overflow u16 (ratatui 0.29's Paragraph
-/// adds them without saturation), and large enough to exceed any realistic
-/// log-detail body. A log row's body is at most a few hundred lines even with
-/// long stack traces, so 10_000 leaves comfortable headroom on both sides.
-const GOTO_BOTTOM_SENTINEL: u16 = 10_000;
-
 pub fn handle(action: Action, state: &mut AppState) -> bool {
+    // Every mutation clamps to the render-published `scroll_max` so the stored
+    // offset never parks past the content. G used to store a 10_000 sentinel
+    // (render clamped it for display only), which left `k` decrementing
+    // invisibly for thousands of presses before the view moved.
+    let max_scroll = state.scroll_max.get();
     match action {
         Action::MoveDown => {
-            state.logs.detail_scroll = state.logs.detail_scroll.saturating_add(1);
+            state.logs.detail_scroll = state.logs.detail_scroll.saturating_add(1).min(max_scroll);
             true
         }
         Action::MoveUp => {
-            state.logs.detail_scroll = state.logs.detail_scroll.saturating_sub(1);
+            state.logs.detail_scroll = state.logs.detail_scroll.min(max_scroll).saturating_sub(1);
             true
         }
         Action::HalfPageDown => {
-            state.logs.detail_scroll = state.logs.detail_scroll.saturating_add(HALF_PAGE);
+            state.logs.detail_scroll = state
+                .logs
+                .detail_scroll
+                .saturating_add(HALF_PAGE)
+                .min(max_scroll);
             true
         }
         Action::HalfPageUp => {
-            state.logs.detail_scroll = state.logs.detail_scroll.saturating_sub(HALF_PAGE);
+            state.logs.detail_scroll = state
+                .logs
+                .detail_scroll
+                .min(max_scroll)
+                .saturating_sub(HALF_PAGE);
             true
         }
         Action::GotoTop => {
@@ -230,9 +249,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::GotoBottom => {
-            // Render clamps this to the actual content height so the bottom
-            // row aligns with the bottom of the panel.
-            state.logs.detail_scroll = GOTO_BOTTOM_SENTINEL;
+            state.logs.detail_scroll = max_scroll;
             true
         }
         _ => false,
@@ -333,9 +350,9 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         let mut state = fixture();
         state.logs.by_resource.insert("/r/one".into(), vec![line()]);
-        // Both the sentinel value and the historical overflow value must be
-        // safe to render.
-        for s in [GOTO_BOTTOM_SENTINEL, u16::MAX] {
+        // Both the historical sentinel value and the overflow value must be
+        // safe to render even if they somehow end up stored.
+        for s in [10_000, u16::MAX] {
             state.logs.detail_scroll = s;
             term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         }
@@ -344,6 +361,9 @@ mod tests {
     #[test]
     fn handle_scrolls() {
         let mut s = fixture();
+        // Handlers clamp to the render-published max; simulate a rendered
+        // panel with plenty of content below the fold.
+        s.scroll_max.set(100);
         assert!(handle(Action::MoveDown, &mut s));
         assert_eq!(s.logs.detail_scroll, 1);
         assert!(handle(Action::HalfPageDown, &mut s));
@@ -352,5 +372,29 @@ mod tests {
         assert_eq!(s.logs.detail_scroll, 0);
         assert!(handle(Action::MoveUp, &mut s));
         assert_eq!(s.logs.detail_scroll, 0); // saturates at 0
+    }
+
+    #[test]
+    fn goto_bottom_then_move_up_responds_immediately() {
+        // Regression: G stored a 10_000 sentinel while only the renderer
+        // clamped it for display, so `k` decremented invisibly for thousands
+        // of presses. After a render, G must land exactly on the content's
+        // max scroll and the very next `k` must move the view.
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.logs.by_resource.insert("/r/one".into(), vec![line()]);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+
+        assert!(handle(Action::GotoBottom, &mut state));
+        let max = state.scroll_max.get();
+        assert!(
+            max > 0 && max < 100,
+            "expected a small real max scroll, got {max}"
+        );
+        assert_eq!(state.logs.detail_scroll, max);
+        assert!(handle(Action::MoveUp, &mut state));
+        assert_eq!(state.logs.detail_scroll, max - 1);
     }
 }
