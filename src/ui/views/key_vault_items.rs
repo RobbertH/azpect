@@ -21,11 +21,11 @@ use ratatui::Frame;
 
 use crate::azure::key_vault::{ItemKind, KeyVaultItem};
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, KeyVaultCache, SecretRevealStatus};
+use crate::ui::state::{AppState, KeyVaultCache, SecretRevealStatus, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter/x reveal  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
+    "j/k move  Enter/x reveal  l access log  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 /// Items expiring within this window are flagged red. Matches typical secret
@@ -391,11 +391,39 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.key_vault.items_filter.reset();
+            state.key_vault.items_cursor = 0;
             state.key_vault.items_filter_active = true;
             true
         }
         Action::NextPanel | Action::PrevPanel => {
             toggle_kind(state);
+            true
+        }
+        Action::OpenLogs => {
+            // `l` on an item row: the vault's access log, pre-scoped to
+            // exactly this secret / certificate.
+            let scope = state
+                .key_vault
+                .selected_vault
+                .as_ref()
+                .map(|v| v.id.clone())
+                .and_then(|vault_id| {
+                    state
+                        .key_vault
+                        .filtered_items(&vault_id)
+                        .get(state.key_vault.items_cursor)
+                        .map(|item| crate::azure::key_vault_logs::ItemScope {
+                            kind_segment: item.kind.path_segment().to_string(),
+                            name: item.name.clone(),
+                        })
+                });
+            if let Some(scope) = scope {
+                state
+                    .key_vault
+                    .enter_access_view(Some(scope), View::KeyVaultItems);
+                state.view = View::KeyVaultAccessLogs;
+            }
             true
         }
         _ => false,

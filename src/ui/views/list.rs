@@ -817,6 +817,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.list_filter.reset();
+            state.list_cursor = 0;
             state.list_filter_active = true;
             true
         }
@@ -1505,6 +1507,17 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains(">"));
+    }
+
+    #[test]
+    fn start_search_discards_committed_filter() {
+        let mut state = fixture();
+        state.list_filter = "alpha".into();
+        state.list_cursor = 1;
+        assert!(handle(Action::StartSearch, &mut state));
+        assert!(state.list_filter_active);
+        assert_eq!(state.list_filter.value(), "");
+        assert_eq!(state.list_cursor, 0);
     }
 
     #[test]

@@ -44,6 +44,7 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("7", "window 7d"),
             ("w", "wrap (logs)"),
             ("e", "errors only (logs) / env vars (detail)"),
+            ("E", "jump to next error, fetching older rows (logs)"),
             ("Tab / S-Tab", "cycle source filter (logs)"),
             ("s", "shell into container (Container App detail/logs)"),
             ("x", "reveal / hide env var values (env vars)"),
@@ -52,6 +53,20 @@ const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("n / N", "next / prev match (logs)"),
             ("V", "visual-line select for yank (logs)"),
             ("l", "open logs (detail)"),
+        ],
+    ),
+    (
+        "Key vault access log (l on a vault or item)",
+        &[
+            (
+                "l",
+                "access log — who accessed what, when (vault-wide or one item)",
+            ),
+            ("0 / 1 / 7", "window 1h / 1d / 7d"),
+            ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
+            ("m", "hide your own accesses (your user / sign-in IP)"),
+            ("Tab / S-Tab", "cycle operation filter (SecretGet, …)"),
+            ("y", "yank row (incl. full managed-identity id)"),
         ],
     ),
     (

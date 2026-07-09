@@ -233,6 +233,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.cosmos.databases_filter.reset();
+            state.cosmos.databases_cursor = 0;
             state.cosmos.databases_filter_active = true;
             true
         }

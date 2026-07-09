@@ -387,6 +387,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.sql.filter.reset();
+            state.sql.cursor = 0;
             state.sql.filter_active = true;
             true
         }

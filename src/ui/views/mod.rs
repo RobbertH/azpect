@@ -177,6 +177,7 @@ pub mod detail;
 pub mod env_var_edit;
 pub mod env_vars;
 pub mod help;
+pub mod key_vault_access;
 pub mod key_vault_items;
 pub mod key_vaults;
 pub mod list;

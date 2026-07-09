@@ -141,6 +141,7 @@ dependencies = [
  "anyhow",
  "azure_core",
  "azure_identity",
+ "base64",
  "chrono",
  "clap",
  "crossterm",

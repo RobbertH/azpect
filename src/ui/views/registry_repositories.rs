@@ -245,6 +245,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.registry.repositories_filter.reset();
+            state.registry.repositories_cursor = 0;
             state.registry.repositories_filter_active = true;
             true
         }

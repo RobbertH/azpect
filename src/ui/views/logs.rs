@@ -147,6 +147,31 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Style::default().fg(theme.accent),
             ));
         }
+        // Background fetch-and-seek chips. Both run across multiple chained
+        // fetches, so the user needs to see that rows are still streaming in
+        // and that Esc aborts the seek.
+        if state.logs.error_hunt {
+            header_spans.push(Span::styled(
+                "· fetching… searching for next error (Esc cancels) ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(anchor) = &state.logs.pending_anchor {
+            if state.logs.loading || state.logs.loading_more {
+                let stamp = anchor
+                    .ts
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+                    .to_string();
+                header_spans.push(Span::styled(
+                    format!("· fetching rows to reach {stamp}… (Esc cancels) "),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
         // Active source is normally shown by the dedicated tab-bar row; only
         // fall back to a header chip when that row is suppressed (≤1 source).
         if !show_tabs {
@@ -1011,6 +1036,22 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
     }
 
+    // An in-flight error hunt or anchor chase owns Esc: cancel the background
+    // fetch-and-seek instead of popping the view. Only while one is actually
+    // running — otherwise `Back` falls through as usual.
+    if action == Action::Back {
+        if state.logs.error_hunt {
+            state.logs.error_hunt = false;
+            state.set_status("error search cancelled");
+            return true;
+        }
+        if state.logs.pending_anchor.is_some() && (state.logs.loading || state.logs.loading_more) {
+            state.logs.pending_anchor = None;
+            state.set_status("jump cancelled");
+            return true;
+        }
+    }
+
     // Visual-line mode: `Esc` cancels the selection (and is consumed here so it
     // doesn't pop the view stack), mirroring vim. Only when a selection is
     // active — otherwise `Back` must fall through to the global breadcrumb
@@ -1057,6 +1098,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.logs.scroll = 0;
             state.logs.view_top.set(0);
             state.logs.visual_anchor = None;
+            state.logs.error_hunt = false;
             true
         }
         // Source cycling, bound to Tab / Shift+Tab in this view.
@@ -1107,7 +1149,12 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.logs.search_input.reset();
             state.logs.search_active = true;
+            true
+        }
+        Action::JumpToError => {
+            start_error_hunt(state);
             true
         }
         Action::NextMatch => {
@@ -1319,6 +1366,79 @@ fn find_next_match(
     }
 }
 
+/// Move the cursor to the first error-level line strictly below it in the
+/// visible buffer and center it. Returns whether one was found. Strictly-below
+/// (not at-or-below) so repeated `E` presses step through successive errors,
+/// mirroring `n` for search matches.
+fn jump_to_next_error(state: &mut AppState, resource_id: &str) -> bool {
+    let target = {
+        let lines = state.visible_log_lines(resource_id);
+        if lines.is_empty() {
+            return false;
+        }
+        let cursor = state.logs.scroll.min(lines.len() - 1);
+        lines[cursor + 1..]
+            .iter()
+            .position(|l| l.level == LogLevel::Error)
+            .map(|off| cursor + 1 + off)
+    };
+    let Some(idx) = target else {
+        return false;
+    };
+    state.logs.scroll = idx;
+    state.logs.center_pending.set(true);
+    true
+}
+
+/// `E`: seek the next error below the cursor. Resolves immediately when one is
+/// already buffered; otherwise arms `error_hunt` and chains older-than fetches
+/// — the event loop calls [`advance_error_hunt`] as each page lands. The header
+/// shows a "searching…" chip while the hunt runs, and Esc cancels it.
+fn start_error_hunt(state: &mut AppState) {
+    let Some(id) = state.selected_resource().map(|r| r.id.clone()) else {
+        return;
+    };
+    if jump_to_next_error(state, &id) {
+        return;
+    }
+    if state.logs.more_available.get(&id).copied().unwrap_or(false) {
+        state.logs.error_hunt = true;
+        request_fetch_more(state);
+    } else {
+        state.set_status("no error below the cursor in this window");
+    }
+}
+
+/// Continue an armed error hunt after a logs page landed: jump if the new rows
+/// contain an error below the cursor, chain another fetch while older rows
+/// remain, or end the hunt at the window boundary. Called from the event
+/// loop's `LogsLoaded` handling.
+pub(crate) fn advance_error_hunt(state: &mut AppState, resource_id: &str) {
+    if !state.logs.error_hunt {
+        return;
+    }
+    // A page for a different resource neither resolves nor cancels the hunt.
+    if state.selected_resource().map(|r| r.id.clone()).as_deref() != Some(resource_id) {
+        return;
+    }
+    if jump_to_next_error(state, resource_id) {
+        state.logs.error_hunt = false;
+        return;
+    }
+    if state
+        .logs
+        .more_available
+        .get(resource_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        request_fetch_more(state);
+    } else {
+        state.logs.error_hunt = false;
+        state.set_status("no error found — reached the end of the window");
+    }
+}
+
 /// Signal the event loop to fetch an older page for the currently-selected
 /// resource. Guarded by `more_available` so we don't spam the workspace once
 /// the user has reached the bottom of the window, and by `loading_more` so a
@@ -1353,6 +1473,7 @@ fn set_window(state: &mut AppState, range: TimeRange) -> bool {
     state.logs.scroll = 0;
     state.logs.view_top.set(0);
     state.logs.visual_anchor = None;
+    state.logs.error_hunt = false;
     true
 }
 
@@ -1451,6 +1572,145 @@ mod tests {
         assert!(handle(Action::CycleSourceFilter, &mut state));
         assert_eq!(state.logs.source_filter.as_deref(), Some("http-auth"));
         assert_eq!(state.selected_log_line().unwrap().message, "beta");
+    }
+
+    #[test]
+    fn jump_to_error_moves_to_next_error_below_cursor() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.by_resource.insert(
+            id,
+            vec![
+                line(1, LogLevel::Error, "app", "top error"),
+                line(2, LogLevel::Info, "app", "hello"),
+                line(3, LogLevel::Error, "app", "boom"),
+            ],
+        );
+        state.logs.scroll = 0;
+
+        // Strictly below the cursor: skips the error the cursor sits on.
+        assert!(handle(Action::JumpToError, &mut state));
+        assert_eq!(state.logs.scroll, 2);
+        assert!(state.logs.center_pending.get());
+        assert!(!state.logs.error_hunt, "resolved in-buffer, no hunt needed");
+    }
+
+    #[test]
+    fn jump_to_error_arms_hunt_and_chains_fetch_when_not_buffered() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state
+            .logs
+            .by_resource
+            .insert(id.clone(), vec![line(1, LogLevel::Info, "app", "hello")]);
+        state.logs.more_available.insert(id, true);
+
+        assert!(handle(Action::JumpToError, &mut state));
+        assert!(state.logs.error_hunt);
+        assert!(state.logs.fetch_more_requested);
+        assert_eq!(state.logs.scroll, 0, "cursor stays until an error lands");
+    }
+
+    #[test]
+    fn jump_to_error_reports_when_window_complete() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state
+            .logs
+            .by_resource
+            .insert(id.clone(), vec![line(1, LogLevel::Info, "app", "hello")]);
+        state.logs.more_available.insert(id, false);
+
+        assert!(handle(Action::JumpToError, &mut state));
+        assert!(!state.logs.error_hunt);
+        assert!(!state.logs.fetch_more_requested);
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn esc_cancels_error_hunt_without_leaving_view() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        state.logs.error_hunt = true;
+        // Consumed by the hunt cancel — must NOT fall through to the global
+        // Back handler (which would pop the view).
+        assert!(handle(Action::Back, &mut state));
+        assert!(!state.logs.error_hunt);
+    }
+
+    #[test]
+    fn esc_cancels_pending_anchor_chase_while_fetching() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let err = line(5, LogLevel::Error, "app", "boom");
+        state.logs.pending_anchor = Some(LineAnchor::of(&err));
+        state.logs.loading_more = true;
+        assert!(handle(Action::Back, &mut state));
+        assert!(state.logs.pending_anchor.is_none());
+        // Without an in-flight fetch the anchor is inert; Esc falls through.
+        state.logs.loading_more = false;
+        state.logs.pending_anchor = Some(LineAnchor::of(&err));
+        assert!(!handle(Action::Back, &mut state));
+        assert!(state.logs.pending_anchor.is_some());
+    }
+
+    #[test]
+    fn advance_error_hunt_jumps_when_appended_page_has_error() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.error_hunt = true;
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![
+                line(1, LogLevel::Info, "app", "hello"),
+                line(2, LogLevel::Error, "app", "boom"),
+            ],
+        );
+        advance_error_hunt(&mut state, &id);
+        assert!(!state.logs.error_hunt);
+        assert_eq!(state.logs.scroll, 1);
+        assert!(state.logs.center_pending.get());
+    }
+
+    #[test]
+    fn advance_error_hunt_chains_or_ends_at_window_boundary() {
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state.logs.error_hunt = true;
+        state
+            .logs
+            .by_resource
+            .insert(id.clone(), vec![line(1, LogLevel::Info, "app", "hello")]);
+
+        // Older rows remain: keep hunting, chain another fetch.
+        state.logs.more_available.insert(id.clone(), true);
+        advance_error_hunt(&mut state, &id);
+        assert!(state.logs.error_hunt);
+        assert!(state.logs.fetch_more_requested);
+
+        // Window exhausted: end the hunt and tell the user.
+        state.logs.fetch_more_requested = false;
+        state.logs.more_available.insert(id.clone(), false);
+        advance_error_hunt(&mut state, &id);
+        assert!(!state.logs.error_hunt);
+        assert!(!state.logs.fetch_more_requested);
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn error_hunt_renders_searching_chip() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture(ResourceKind::ContainerApp);
+        let id = state.resources[0].id.clone();
+        state
+            .logs
+            .by_resource
+            .insert(id, vec![line(1, LogLevel::Info, "app", "hello")]);
+        state.logs.error_hunt = true;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("searching for next error"), "chip missing: {s}");
+        assert!(s.contains("Esc cancels"));
     }
 
     #[test]

@@ -332,6 +332,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.registry.registries_filter.reset();
+            state.registry.registries_cursor = 0;
             state.registry.registries_filter_active = true;
             true
         }

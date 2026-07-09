@@ -449,6 +449,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.service_bus.entities_filter.reset();
+            state.service_bus.entities_cursor = 0;
             state.service_bus.entities_filter_active = true;
             true
         }

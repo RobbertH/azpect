@@ -352,6 +352,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 
     match action {
         Action::StartSearch => {
+            state.apim.operations_filter.reset();
+            state.apim.operations_cursor = 0;
             state.apim.operations_filter_active = true;
             true
         }

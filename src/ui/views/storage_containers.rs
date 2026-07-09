@@ -309,6 +309,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.storage.containers_filter.reset();
+            state.storage.containers_cursor = 0;
             state.storage.containers_filter_active = true;
             true
         }

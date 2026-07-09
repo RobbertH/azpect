@@ -251,6 +251,18 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        View::KeyVaultAccessLogs => {
+            let mut s = vec![subscription_segment(state), "key vaults".to_string()];
+            if let Some(v) = state.key_vault.selected_vault.as_ref() {
+                s.push(v.name.clone());
+            }
+            if let Some(scope) = state.key_vault.access_scope.as_ref() {
+                s.push(scope.path());
+            }
+            s.push("access log".to_string());
+            s
+        }
+
         View::ServiceBusNamespaces => {
             vec![subscription_segment(state), "service bus".to_string()]
         }

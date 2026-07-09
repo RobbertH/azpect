@@ -283,6 +283,14 @@ pub enum AppEvent {
         name: String,
         result: Result<String, String>,
     },
+    /// Background load completion: one page of Key Vault `AuditEvent` rows
+    /// for the access-logs view. `generation` mirrors
+    /// `KeyVaultCache::access_generation` — a page fetched under an older
+    /// query scope (window / item / exclude-me) is discarded on landing.
+    KeyVaultAccessLoaded {
+        generation: u64,
+        result: Result<crate::azure::key_vault_logs::AccessPage, String>,
+    },
     /// Background load completion: list of Service Bus namespaces for the
     /// current subscription scope. Resource Graph control-plane call. `scope` —
     /// see [`AppEvent::SubscriptionsLoaded`].
@@ -349,6 +357,16 @@ pub enum Action {
     /// in the logs view; no-op elsewhere.
     NextMatch,
     PrevMatch,
+    /// Jump the logs cursor to the next error-level line below it, fetching
+    /// older pages as needed until one is found, the window is exhausted, or
+    /// the user cancels with Esc. Only meaningful in the logs view.
+    JumpToError,
+    /// Key Vault access-logs view: toggle the server-side "exclude me" filter
+    /// (your UPN / sign-in IP, decoded from the bearer token's claims).
+    ToggleExcludeSelf,
+    /// Key Vault access-logs view: focus the free-form window input so the
+    /// user can type a custom range like "6m" or "1y".
+    SetCustomWindow,
     SwitchSubscription,
     /// Cycle the logs view's client-side source filter through the distinct
     /// `LogLine::source` values in the cached buffer (all → A → B → … → all).
@@ -496,11 +514,11 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // action keeps `after_action` from treating it like a panel switch and
         // refetching the log buffer on every keystroke.
         KeyCode::Tab => match view {
-            View::Logs => Action::CycleSourceFilter,
+            View::Logs | View::KeyVaultAccessLogs => Action::CycleSourceFilter,
             _ => Action::NextPanel,
         },
         KeyCode::BackTab => match view {
-            View::Logs => Action::CycleSourceFilterBack,
+            View::Logs | View::KeyVaultAccessLogs => Action::CycleSourceFilterBack,
             _ => Action::PrevPanel,
         },
 
@@ -513,7 +531,11 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // a universal alias for muscle memory.
         KeyCode::Char('l') if !ctrl => match view {
             // Horizontal nav in views that use it; elsewhere `l` opens logs.
-            View::Logs | View::LogDetail | View::EnvVars => Action::MoveRight,
+            // (In the KV access view it's inert — pressing `l` again inside
+            // the log you just opened shouldn't re-enter it.)
+            View::Logs | View::LogDetail | View::EnvVars | View::KeyVaultAccessLogs => {
+                Action::MoveRight
+            }
             _ => Action::OpenLogs,
         },
         KeyCode::Char('L') => Action::OpenLogs,
@@ -523,6 +545,21 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::Logs | View::LogDetail => Action::ToggleErrorsOnly,
             View::Detail => Action::OpenEnvVars,
             _ => Action::ToggleErrorsOnly,
+        },
+        // `E` seeks the next error line, auto-fetching older pages; scoped to
+        // the logs view so it can't shadow future bindings elsewhere.
+        KeyCode::Char('E') => match view {
+            View::Logs => Action::JumpToError,
+            _ => Action::Noop,
+        },
+        // Access-logs-only keys, scoped so they stay free elsewhere.
+        KeyCode::Char('m') => match view {
+            View::KeyVaultAccessLogs => Action::ToggleExcludeSelf,
+            _ => Action::Noop,
+        },
+        KeyCode::Char('t') => match view {
+            View::KeyVaultAccessLogs => Action::SetCustomWindow,
+            _ => Action::Noop,
         },
         KeyCode::Char('x') => Action::DecodeSecret,
         KeyCode::Char('f') => Action::ToggleFavorite,

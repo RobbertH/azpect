@@ -253,6 +253,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.subscription_filter.reset();
+            state.subscription_cursor = 0;
             state.subscription_filter_active = true;
             true
         }

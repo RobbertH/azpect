@@ -283,6 +283,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.cosmos.accounts_filter.reset();
+            state.cosmos.accounts_cursor = 0;
             state.cosmos.accounts_filter_active = true;
             true
         }

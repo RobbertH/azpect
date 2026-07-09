@@ -451,6 +451,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.storage.accounts_filter.reset();
+            state.storage.accounts_cursor = 0;
             state.storage.accounts_filter_active = true;
             true
         }

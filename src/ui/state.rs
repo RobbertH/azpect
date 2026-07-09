@@ -111,14 +111,15 @@ impl Category {
                     | View::CosmosDatabases
                     | View::CosmosContainers
                     | View::CosmosItem,
-            ) | (Category::KeyVaults, View::KeyVaults | View::KeyVaultItems,)
-                | (
-                    Category::ServiceBus,
-                    View::ServiceBusNamespaces
-                        | View::ServiceBusEntities
-                        | View::ServiceBusSubscriptions,
-                )
-                | (Category::Sql, View::SqlResources | View::SqlDetail)
+            ) | (
+                Category::KeyVaults,
+                View::KeyVaults | View::KeyVaultItems | View::KeyVaultAccessLogs,
+            ) | (
+                Category::ServiceBus,
+                View::ServiceBusNamespaces
+                    | View::ServiceBusEntities
+                    | View::ServiceBusSubscriptions,
+            ) | (Category::Sql, View::SqlResources | View::SqlDetail)
         )
     }
 
@@ -306,6 +307,11 @@ pub enum View {
     /// the signed-in identity to have a `list`-permitting role (RBAC) or
     /// access policy on the vault. Press `s`/`c` to toggle between kinds.
     KeyVaultItems,
+    /// Access (audit) log for the pinned vault — who touched what, when, from
+    /// where — read from `AzureDiagnostics` `AuditEvent` rows. Opened with `l`
+    /// from `KeyVaults` (vault-wide) or from `KeyVaultItems` (pre-scoped to
+    /// the selected secret / certificate).
+    KeyVaultAccessLogs,
     /// Top-level "Service Bus" mode entry point — lists namespaces across the
     /// selected subscriptions. Opened via the `:servicebus` / `:sb` palette
     /// command (no keybind).
@@ -641,8 +647,10 @@ pub struct ApimCache {
     /// Persisted viewport top for the APIs list — see
     /// [`crate::ui::views::edge_scroll`].
     pub apis_view_top: Cell<usize>,
-    /// `/`-search over the APIs list. `/` focuses, Enter commits (value
-    /// persists), Esc cancels and clears. Mirrors the storage/registry filters.
+    /// `/`-search over the APIs list. `/` focuses on an empty input (a
+    /// previously committed value is discarded, vim-style), Enter commits
+    /// (value persists until the next `/`), Esc cancels and clears. Mirrors
+    /// the storage/registry filters.
     pub apis_filter: Input,
     pub apis_filter_active: bool,
 
@@ -1136,6 +1144,45 @@ pub struct KeyVaultCache {
     /// spinner, the decoded value, or an error — and so the plaintext never
     /// touches the list cache. Cleared on Esc / close.
     pub secret_modal: Option<SecretModal>,
+
+    // -- access-logs view (`l` on a vault or on a specific item) -----------
+    /// Fetched `AuditEvent` rows for the pinned vault under the *current*
+    /// query scope (window / item / exclude-me). Dropped whenever that scope
+    /// changes — the scope is part of the query, not a client-side filter.
+    pub access_events: Option<Vec<crate::azure::key_vault_logs::AccessEvent>>,
+    pub access_pending: bool,
+    pub access_error: Option<String>,
+    pub access_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub access_view_top: Cell<usize>,
+    /// Monotonic fetch-scope token, same idea as `LogsCache::generation`: a
+    /// landing page whose generation is stale is discarded, so rapid filter
+    /// toggles stay deterministic.
+    pub access_generation: u64,
+    /// Query time window; `0`/`1`/`7` keys plus a free-form custom entry
+    /// (`t`, e.g. "6m" / "1y").
+    pub access_window: crate::azure::key_vault_logs::AccessWindow,
+    /// Server-side "exclude me" (your UPN / sign-in IP from the token
+    /// claims). Toggled with `m`.
+    pub access_exclude_self: bool,
+    /// Who the current page actually hid (returned by the fetch), for the
+    /// header chip.
+    pub access_hidden: Option<crate::azure::key_vault_logs::SelfIdentity>,
+    /// Scope the query to one secret / certificate — set when the view was
+    /// opened with `l` on an item row rather than on the vault.
+    pub access_scope: Option<crate::azure::key_vault_logs::ItemScope>,
+    /// Client-side `OperationName` filter (`SecretGet`, …), cycled with
+    /// Tab / Shift+Tab through the distinct operations in the fetched page.
+    pub access_operation: Option<String>,
+    /// The page came back at the row cap — older rows in the window exist.
+    pub access_truncated: bool,
+    /// Where Esc should land: `KeyVaultItems` when opened from an item row,
+    /// `KeyVaults` when opened from the vaults list.
+    pub access_return_view: Option<View>,
+    /// Free-form custom-window input (`t`), e.g. "6m". While active, raw
+    /// keystrokes flow into it; Enter parses + applies, Esc cancels.
+    pub access_window_input: Input,
+    pub access_window_input_active: bool,
 }
 
 /// Payload for the secret-value reveal modal. The value is fetched on demand
@@ -1197,6 +1244,59 @@ impl KeyVaultCache {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Access events with the client-side `access_operation` filter applied —
+    /// the view the access-logs table (and its cursor) indexes into.
+    pub fn visible_access_events(&self) -> Vec<&crate::azure::key_vault_logs::AccessEvent> {
+        match self.access_events.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|e| {
+                    self.access_operation
+                        .as_deref()
+                        .is_none_or(|op| e.operation == op)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Distinct `OperationName` values in the fetched page, sorted — the Tab
+    /// cycle order for the operation filter.
+    pub fn access_operations(&self) -> Vec<String> {
+        let mut ops: Vec<String> = self
+            .access_events
+            .iter()
+            .flatten()
+            .map(|e| e.operation.clone())
+            .collect();
+        ops.sort();
+        ops.dedup();
+        ops
+    }
+
+    /// Reset the access-logs view for entering it fresh on `vault` (scoped to
+    /// `scope` when opened from an item row). Filters and window survive
+    /// re-entry on the *same* vault+scope only when the buffer does; a scope
+    /// change always starts clean so stale rows can't masquerade as current.
+    pub fn enter_access_view(
+        &mut self,
+        scope: Option<crate::azure::key_vault_logs::ItemScope>,
+        return_view: View,
+    ) {
+        self.access_events = None;
+        self.access_error = None;
+        self.access_pending = false;
+        self.access_cursor = 0;
+        self.access_view_top.set(0);
+        self.access_scope = scope;
+        self.access_operation = None;
+        self.access_truncated = false;
+        self.access_return_view = Some(return_view);
+        self.access_window_input.reset();
+        self.access_window_input_active = false;
+        self.access_generation = self.access_generation.wrapping_add(1);
     }
 }
 
@@ -1476,6 +1576,13 @@ pub struct LogsCache {
     /// anchor is resolved so the kept line lands mid-screen with context above and
     /// below. `Cell` because render holds `&AppState`.
     pub center_pending: Cell<bool>,
+    /// True while an `E` (jump-to-next-error) hunt is in flight: no error-level
+    /// line exists below the cursor in the buffer yet, so the event loop keeps
+    /// chaining older-than fetches, re-checking after each page lands. Cleared
+    /// when an error is found, the window is exhausted, the fetch scope changes,
+    /// or the user cancels with Esc. The logs header renders a "searching…"
+    /// chip while set.
+    pub error_hunt: bool,
     /// Memoized distinct-source list for the tab-bar / Tab-cycling, paired with
     /// the buffer fingerprint it was computed from. Recomputing it means cloning
     /// and sorting every cached line's source on each 250ms redraw — wasted work
@@ -1544,6 +1651,9 @@ impl LogsCache {
         self.context_around = None;
         self.pending_anchor = None;
         self.center_pending.set(false);
+        // An error hunt chains fetches for one specific resource's buffer;
+        // carried into another resource it would chase the wrong stream.
+        self.error_hunt = false;
         // The cursor / viewport / horizontal offset are equally resource-bound:
         // left at the previous resource's deep-scroll position, a fresh buffer
         // renders pinned to its clamped bottom while `k` decrements an index

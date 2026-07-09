@@ -17,7 +17,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter items  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter items  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -291,6 +291,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.key_vault.vaults_filter.reset();
+            state.key_vault.vaults_cursor = 0;
             state.key_vault.vaults_filter_active = true;
             true
         }
@@ -313,6 +315,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 // an earlier Key Vault reference jump.
                 state.key_vault.items_return_view = None;
                 state.view = View::KeyVaultItems;
+            }
+            true
+        }
+        Action::OpenLogs => {
+            // `l` on a vault: its access (audit) log, vault-wide.
+            let vault = state
+                .key_vault
+                .filtered_vaults()
+                .get(state.key_vault.vaults_cursor)
+                .copied()
+                .cloned();
+            if let Some(vault) = vault {
+                state.key_vault.selected_vault = Some(vault);
+                state.key_vault.enter_access_view(None, View::KeyVaults);
+                state.view = View::KeyVaultAccessLogs;
             }
             true
         }

@@ -264,6 +264,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.registry.tags_filter.reset();
+            state.registry.tags_cursor = 0;
             state.registry.tags_filter_active = true;
             true
         }

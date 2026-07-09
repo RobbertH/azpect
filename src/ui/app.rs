@@ -580,21 +580,27 @@ async fn event_loop(
                                     .logs
                                     .by_resource
                                     .insert(resource_id.clone(), page.lines);
-                                // A fresh page is the moment a pending anchor can be
-                                // resolved: re-select the same line (or the nearest
-                                // by time) in the new buffer and center it. Only on
-                                // the initial fetch — appends extend an existing
-                                // view whose cursor shouldn't jump.
-                                if let Some(anchor) = state.logs.pending_anchor.take() {
-                                    if let Some(idx) = state.anchor_index(&resource_id, &anchor) {
-                                        state.logs.scroll = idx;
-                                        state.logs.center_pending.set(true);
-                                    }
-                                }
                             }
+                            // Every landed page is a moment a pending anchor or an
+                            // armed error hunt can make progress — including appends,
+                            // which is how both chase rows the first page stopped
+                            // short of. Ordinary user-scrolled appends carry neither,
+                            // so their cursor never jumps.
+                            resolve_pending_anchor(state, &resource_id);
+                            crate::ui::views::logs::advance_error_hunt(state, &resource_id);
                         }
-                        Err(e) => state.logs.last_error = Some(e),
+                        Err(e) => {
+                            state.logs.last_error = Some(e);
+                            // The chain is broken — don't leave the "searching…"
+                            // chip up with nothing in flight. The pending anchor is
+                            // kept: the next fresh page resolves it as usual.
+                            state.logs.error_hunt = false;
+                        }
                     }
+                    // Anchor/hunt resolution above may have raised
+                    // `fetch_more_requested`; the usual drain point runs only on
+                    // key events, so chain the next page here.
+                    drain_fetch_more_requested(state, auth, tx);
                 }
             }
             AppEvent::HealthLoaded {
@@ -1083,6 +1089,26 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::KeyVaultAccessLoaded { generation, result } => {
+                // A page fetched under an older query scope (window / item /
+                // exclude-me changed while it was in flight) no longer
+                // describes what the header claims — drop it; the fetch for
+                // the current generation owns the pending flag.
+                if generation == state.key_vault.access_generation {
+                    state.key_vault.access_pending = false;
+                    match result {
+                        Ok(page) => {
+                            state.key_vault.access_error = None;
+                            state.key_vault.access_truncated = page.truncated;
+                            state.key_vault.access_hidden = page.hidden;
+                            state.key_vault.access_events = Some(page.events);
+                            state.key_vault.access_cursor = 0;
+                            state.key_vault.access_view_top.set(0);
+                        }
+                        Err(e) => state.key_vault.access_error = Some(e),
+                    }
+                }
+            }
             AppEvent::KeyVaultSecretValueLoaded {
                 vault_id,
                 name,
@@ -1382,6 +1408,15 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
     // reset — search steers the scroll position on Enter, not a filtered list.
     if should_forward_to_logs_search(state, key) {
         state.logs.search_input.handle_event(&CtEvent::Key(key));
+        return true;
+    }
+    // Same shape for the KV access-logs custom window ("6m", "1y"): a plain
+    // value input, no list cursor attached.
+    if should_forward_to_access_window_input(state, key) {
+        state
+            .key_vault
+            .access_window_input
+            .handle_event(&CtEvent::Key(key));
         return true;
     }
     if should_forward_to_blobs_filter(state, key) {
@@ -1892,6 +1927,18 @@ fn should_forward_to_key_vault_items_filter(
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the key-vault access-logs custom
+/// window input (`t`, e.g. "6m"). Up/Down aren't carved out — the input is a
+/// one-line value, not a filter steering a list underneath.
+fn should_forward_to_access_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::KeyVaultAccessLogs
+        && state.key_vault.access_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
 /// Mirror of `should_forward_to_filter` for the service-bus namespaces filter.
 fn should_forward_to_sb_namespaces_filter(
     state: &AppState,
@@ -2133,6 +2180,7 @@ fn decide_action(
         || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active)
         || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
         || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
+        || (state.view == View::KeyVaultAccessLogs && state.key_vault.access_window_input_active)
         || (state.view == View::ServiceBusNamespaces && state.service_bus.namespaces_filter_active)
         || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
         || (state.view == View::ServiceBusSubscriptions
@@ -2200,6 +2248,7 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::CosmosItem => crate::ui::views::cosmos_item::handle(action, state),
         View::KeyVaults => crate::ui::views::key_vaults::handle(action, state),
         View::KeyVaultItems => crate::ui::views::key_vault_items::handle(action, state),
+        View::KeyVaultAccessLogs => crate::ui::views::key_vault_access::handle(action, state),
         View::ServiceBusNamespaces => {
             crate::ui::views::service_bus_namespaces::handle(action, state)
         }
@@ -2680,6 +2729,13 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_vault
             .as_ref()
             .map(|v| format!("{PORTAL_BASE}{}", v.id)),
+        // The access log's portal counterpart is the vault's diagnostics /
+        // logs side nav; the overview blade is the stable entry point.
+        View::KeyVaultAccessLogs => state
+            .key_vault
+            .selected_vault
+            .as_ref()
+            .map(|v| format!("{PORTAL_BASE}{}", v.id)),
         // Service Bus views land on the namespace overview blade; the portal
         // exposes queues / topics / subscriptions from the side nav there. The
         // cursor indexes into the *filtered* view so `o` follows the screen.
@@ -2894,6 +2950,7 @@ fn yank_target(state: &AppState) -> Option<String> {
             let vault = state.key_vault.selected_vault.as_ref()?;
             Some(vault.id.clone())
         }),
+        View::KeyVaultAccessLogs => crate::ui::views::key_vault_access::yank_text(state),
         View::ServiceBusNamespaces => state
             .service_bus
             .filtered_namespaces()
@@ -3076,6 +3133,10 @@ fn semantic_parent(view: View) -> Option<View> {
         View::CosmosItem => Some(View::CosmosContainers),
         View::KeyVaults => Some(View::Subscriptions),
         View::KeyVaultItems => Some(View::KeyVaults),
+        // The view's own Back handler consumes Esc first (it returns to the
+        // recorded origin — vaults list or items list); this is the static
+        // fallback for the breadcrumb tree.
+        View::KeyVaultAccessLogs => Some(View::KeyVaults),
         View::ServiceBusNamespaces => Some(View::Subscriptions),
         View::ServiceBusEntities => Some(View::ServiceBusNamespaces),
         View::ServiceBusSubscriptions => Some(View::ServiceBusEntities),
@@ -3103,17 +3164,35 @@ fn after_action(
         Action::ToggleErrorsOnly
         | Action::SetWindowHour
         | Action::SetWindowDay
-        | Action::SetWindowWeek => {
+        | Action::SetWindowWeek
+        | Action::ToggleExcludeSelf => {
             // Chart windows force too: the view handler dropped the cached
             // series for the new range, and a fetch for the *old* range still
             // in flight would otherwise debounce the respawn away — the range
             // tag on `MetricsLoaded` / `SqlMetricsLoaded` discards that stale
             // result, so forcing is safe (mirrors the logs generation guard).
+            // The KV access view is in the force set for the same reason: its
+            // window keys and the exclude-me toggle change the query scope and
+            // its generation guard discards the stale in-flight page.
             let force = matches!(
                 state.view,
-                View::Logs | View::LogDetail | View::Detail | View::SqlDetail
+                View::Logs
+                    | View::LogDetail
+                    | View::Detail
+                    | View::SqlDetail
+                    | View::KeyVaultAccessLogs
             );
             kick_off_loads_for_view(state, auth, tx, force);
+        }
+        // Enter in the KV access view while its buffer is invalidated is the
+        // custom-window input committing (the view handler just parsed and
+        // applied it) — spawn the refetch past the pending-flag debounce.
+        Action::OpenSelected
+            if state.view == View::KeyVaultAccessLogs
+                && !state.key_vault.access_window_input_active
+                && state.key_vault.access_events.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
         // Opening logs always starts a fresh newest-end fetch; force past the
         // global `logs.loading` debounce so switching to resource B while
@@ -3753,6 +3832,33 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::KeyVaultAccessLogs => {
+            if let Some(vault) = state.key_vault.selected_vault.clone() {
+                let cached = state.key_vault.access_events.is_some();
+                let in_flight = state.key_vault.access_pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.key_vault.access_events = None;
+                        state.key_vault.access_error = None;
+                    }
+                    // Every spawn owns the buffer: bump the generation so an
+                    // older in-flight page is discarded when it lands instead
+                    // of clobbering this fetch's flags (mirrors the logs view).
+                    state.key_vault.access_generation =
+                        state.key_vault.access_generation.wrapping_add(1);
+                    state.key_vault.access_pending = true;
+                    spawn_load_key_vault_access(
+                        auth.clone(),
+                        vault,
+                        state.key_vault.access_window.clone(),
+                        state.key_vault.access_scope.clone(),
+                        state.key_vault.access_exclude_self,
+                        state.key_vault.access_generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         View::ServiceBusNamespaces => {
             let cached = state.service_bus.namespaces.is_some();
             let in_flight = state.service_bus.namespaces_pending;
@@ -3819,6 +3925,43 @@ fn kick_off_loads_for_view(
         }
         // LogDetail is a pure-view-over-state screen; nothing to load.
         View::LogDetail | View::Help => {}
+    }
+}
+
+/// Resolve `logs.pending_anchor` against the buffer that just landed: re-select
+/// the anchored line (or the nearest by time) and center it. But only once the
+/// buffer actually reaches the anchor's timestamp or the window has no older
+/// rows left — a context window centered on an error holds at most one page of
+/// its *newest* rows, so on a busy stream the anchored row may be several pages
+/// down. Landing "nearest by time" then would silently put the cursor on a
+/// later row; instead keep the anchor pending and chain another older-than
+/// fetch. Esc in the logs view cancels the chase.
+fn resolve_pending_anchor(state: &mut AppState, resource_id: &str) {
+    let Some(anchor) = state.logs.pending_anchor.take() else {
+        return;
+    };
+    // Lines are sorted newest → oldest, so the buffer covers the anchor once
+    // its last (oldest) row is at or before the anchor's timestamp.
+    let covered = state
+        .logs
+        .by_resource
+        .get(resource_id)
+        .and_then(|lines| lines.last())
+        .is_some_and(|oldest| oldest.ts <= anchor.ts);
+    let more = state
+        .logs
+        .more_available
+        .get(resource_id)
+        .copied()
+        .unwrap_or(false);
+    if !covered && more {
+        state.logs.pending_anchor = Some(anchor);
+        state.logs.fetch_more_requested = true;
+        return;
+    }
+    if let Some(idx) = state.anchor_index(resource_id, &anchor) {
+        state.logs.scroll = idx;
+        state.logs.center_pending.set(true);
     }
 }
 
@@ -3945,6 +4088,9 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::KeyVaults => crate::ui::views::key_vaults::render(f, view_area, state, theme),
         View::KeyVaultItems => {
             crate::ui::views::key_vault_items::render(f, view_area, state, theme)
+        }
+        View::KeyVaultAccessLogs => {
+            crate::ui::views::key_vault_access::render(f, view_area, state, theme)
         }
         View::ServiceBusNamespaces => {
             crate::ui::views::service_bus_namespaces::render(f, view_area, state, theme)
@@ -5635,6 +5781,43 @@ fn spawn_load_key_vault_items(
     });
 }
 
+/// Fetch one page of Key Vault `AuditEvent` rows for the access-logs view.
+/// `generation` is the query-scope token the result is validated against on
+/// landing (see `AppEvent::KeyVaultAccessLoaded`).
+fn spawn_load_key_vault_access(
+    auth: AzureAuth,
+    vault: crate::azure::key_vault::KeyVault,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    scope: Option<crate::azure::key_vault_logs::ItemScope>,
+    exclude_self: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::KeyVaultAccessLoaded {
+            generation,
+            result: Ok(crate::azure::demo::key_vault_access(
+                &window,
+                scope.as_ref(),
+                exclude_self,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::key_vault_logs::fetch(
+            &auth,
+            &vault,
+            &window,
+            scope.as_ref(),
+            exclude_self,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::KeyVaultAccessLoaded { generation, result });
+    });
+}
+
 /// Fetch one secret's plaintext value for the reveal modal. Carries the
 /// `(vault_id, name)` back so the handler can ignore the result if the modal
 /// has since closed or moved to another secret.
@@ -5812,6 +5995,86 @@ mod tests {
 
     fn k(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn log_line(off: i64, msg: &str) -> crate::azure::logs::LogLine {
+        crate::azure::logs::LogLine {
+            ts: chrono::Utc::now() - chrono::Duration::minutes(off),
+            level: crate::azure::logs::LogLevel::Info,
+            source: "app".into(),
+            message: msg.into(),
+            fields: Vec::new(),
+        }
+    }
+
+    fn state_with_log_resource() -> (AppState, String) {
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/one".into(),
+            name: "alpha".into(),
+            kind: crate::azure::resources::ResourceKind::ContainerApp,
+            location: "westeurope".into(),
+            resource_group: "rg-demo".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        (state, "/r/one".into())
+    }
+
+    #[test]
+    fn pending_anchor_chains_fetch_until_its_timestamp_is_covered() {
+        let (mut state, id) = state_with_log_resource();
+        // Anchor at t-10m, but the landed page only reaches back to t-3m — the
+        // busy window held more rows than one page. Resolving now would snap
+        // the cursor to a later row.
+        let anchored = log_line(10, "the error");
+        state.logs.pending_anchor = Some(crate::ui::state::LineAnchor::of(&anchored));
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![log_line(1, "newest"), log_line(3, "later")],
+        );
+        state.logs.more_available.insert(id.clone(), true);
+
+        resolve_pending_anchor(&mut state, &id);
+        assert!(state.logs.pending_anchor.is_some(), "anchor stays pending");
+        assert!(state.logs.fetch_more_requested, "chains an older page");
+        assert_eq!(state.logs.scroll, 0, "cursor untouched until covered");
+
+        // The chained page reaches past the anchor: now it resolves and centers.
+        state
+            .logs
+            .by_resource
+            .get_mut(&id)
+            .unwrap()
+            .extend([anchored, log_line(12, "older")]);
+        state.logs.fetch_more_requested = false;
+        resolve_pending_anchor(&mut state, &id);
+        assert!(state.logs.pending_anchor.is_none());
+        assert_eq!(state.logs.scroll, 2, "cursor on the anchored line");
+        assert!(state.logs.center_pending.get());
+        assert!(!state.logs.fetch_more_requested);
+    }
+
+    #[test]
+    fn pending_anchor_falls_back_to_nearest_when_window_is_exhausted() {
+        let (mut state, id) = state_with_log_resource();
+        let anchored = log_line(10, "the error");
+        state.logs.pending_anchor = Some(crate::ui::state::LineAnchor::of(&anchored));
+        state.logs.by_resource.insert(
+            id.clone(),
+            vec![log_line(1, "newest"), log_line(3, "later")],
+        );
+        state.logs.more_available.insert(id.clone(), false);
+
+        resolve_pending_anchor(&mut state, &id);
+        // No older rows exist, so nearest-by-time is the best we can do.
+        assert!(state.logs.pending_anchor.is_none());
+        assert_eq!(state.logs.scroll, 1);
+        assert!(!state.logs.fetch_more_requested);
     }
 
     #[test]

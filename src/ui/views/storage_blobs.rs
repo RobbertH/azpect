@@ -4,9 +4,10 @@
 //! blob name and opens [`View::StorageBlobDetail`].
 //!
 //! The filter input has the same focus-then-commit lifecycle as the
-//! storage-accounts / storage-containers views: `/` activates it, Enter
-//! commits and deactivates (the filter value persists), Esc cancels and
-//! clears. Matching is purely client-side over the full container — no
+//! storage-accounts / storage-containers views: `/` activates an empty input
+//! (a previously committed value is discarded, vim-style), Enter commits and
+//! deactivates (the filter value persists until the next `/`), Esc cancels
+//! and clears. Matching is purely client-side over the full container — no
 //! server-side prefix is sent to the Blob REST API.
 
 #![allow(dead_code, unused_variables)]
@@ -323,6 +324,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.storage.blobs_filter.reset();
+            state.storage.blobs_cursor = 0;
             state.storage.blobs_filter_active = true;
             true
         }

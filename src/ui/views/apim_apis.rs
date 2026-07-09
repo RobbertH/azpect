@@ -334,6 +334,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.apim.apis_filter.reset();
+            state.apim.apis_cursor = 0;
             state.apim.apis_filter_active = true;
             true
         }

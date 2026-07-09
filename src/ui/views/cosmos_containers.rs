@@ -298,6 +298,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::StartSearch => {
+            state.cosmos.containers_filter.reset();
+            state.cosmos.containers_cursor = 0;
             state.cosmos.containers_filter_active = true;
             true
         }

@@ -1281,6 +1281,158 @@ pub fn key_vault_secret_value(name: &str) -> String {
     }
 }
 
+/// The identity `--demo` pretends you signed in with, so the access-log
+/// "exclude me" toggle has something to hide.
+pub fn self_identity() -> crate::azure::key_vault_logs::SelfIdentity {
+    crate::azure::key_vault_logs::SelfIdentity {
+        upn: Some("robbert@contoso.com".to_string()),
+        ip: Some("203.0.113.7".to_string()),
+    }
+}
+
+/// Synthesized Key Vault `AuditEvent` rows: a mix of humans (including
+/// "yourself"), managed identities, and a bare service principal, spread over
+/// the window. Same filter semantics as the real fetch: item scope and
+/// exclude-me narrow the rows server-side.
+pub fn key_vault_access(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    scope: Option<&crate::azure::key_vault_logs::ItemScope>,
+    exclude_self: bool,
+) -> crate::azure::key_vault_logs::AccessPage {
+    use crate::azure::key_vault_logs::{AccessEvent, AccessPage, CallerKind};
+    let me = self_identity();
+    let now = Utc::now();
+    let mirid_checkout = resource_id(
+        SUB_PROD,
+        "rg-commerce-prod",
+        "Microsoft.App/containerApps",
+        "ca-checkout-api",
+    )
+    .to_lowercase();
+    let mirid_func = resource_id(
+        SUB_PROD,
+        "rg-commerce-prod",
+        "Microsoft.Web/sites",
+        "func-orders-prod",
+    )
+    .to_lowercase();
+
+    // (operation, caller, kind, ip, object, result)
+    type Template = (
+        &'static str,
+        &'static str,
+        CallerKind,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+    );
+    let template: &[Template] = &[
+        (
+            "SecretGet",
+            "ca-checkout-api",
+            CallerKind::ManagedIdentity,
+            "10.0.1.12",
+            Some("secrets/orders-db-connection"),
+            "OK",
+        ),
+        (
+            "SecretGet",
+            "func-orders-prod",
+            CallerKind::ManagedIdentity,
+            "10.0.2.7",
+            Some("secrets/payment-api-signing-key"),
+            "OK",
+        ),
+        (
+            "SecretGet",
+            "robbert@contoso.com",
+            CallerKind::User,
+            "203.0.113.7",
+            Some("secrets/orders-db-connection"),
+            "OK",
+        ),
+        (
+            "SecretList",
+            "robbert@contoso.com",
+            CallerKind::User,
+            "203.0.113.7",
+            None,
+            "OK",
+        ),
+        (
+            "SecretGet",
+            "dana@contoso.com",
+            CallerKind::User,
+            "198.51.100.23",
+            Some("secrets/smtp-relay-password"),
+            "OK",
+        ),
+        (
+            "VaultGet",
+            "dana@contoso.com",
+            CallerKind::User,
+            "198.51.100.23",
+            None,
+            "OK",
+        ),
+        (
+            "SecretGet",
+            "1e2f9a34-demo-appid",
+            CallerKind::App,
+            "20.93.10.4",
+            Some("secrets/payment-api-signing-key"),
+            "Forbidden",
+        ),
+        (
+            "CertificateGet",
+            "ca-checkout-api",
+            CallerKind::ManagedIdentity,
+            "10.0.1.12",
+            Some("certificates/api-contoso-com"),
+            "OK",
+        ),
+    ];
+
+    let total_minutes = window.duration().num_minutes().max(60);
+    // Enough repetitions to fill the window at ~1 event / 9 minutes, capped
+    // well under the page size so demo never looks truncated.
+    let count = (total_minutes / 9).clamp(8, 240) as usize;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let (op, caller, kind, ip, object, result) = template[i % template.len()];
+        let minutes_ago = (i as i64 * total_minutes) / count as i64 + (i as i64 % 7);
+        let mirid = match (kind, caller) {
+            (CallerKind::ManagedIdentity, "ca-checkout-api") => Some(mirid_checkout.clone()),
+            (CallerKind::ManagedIdentity, _) => Some(mirid_func.clone()),
+            _ => None,
+        };
+        events.push(AccessEvent {
+            ts: now - Duration::minutes(minutes_ago),
+            operation: op.to_string(),
+            caller: caller.to_string(),
+            caller_kind: kind,
+            ip: ip.to_string(),
+            object: object.map(str::to_owned),
+            result: result.to_string(),
+            mirid,
+        });
+    }
+    if let Some(scope) = scope {
+        let path = scope.path();
+        events.retain(|e| e.object.as_deref() == Some(path.as_str()));
+    }
+    if exclude_self {
+        events.retain(|e| {
+            me.upn.as_deref() != Some(e.caller.as_str()) && me.ip.as_deref() != Some(e.ip.as_str())
+        });
+    }
+    AccessPage {
+        events,
+        truncated: false,
+        hidden: exclude_self.then(self_identity),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Service Bus
 // ---------------------------------------------------------------------------
