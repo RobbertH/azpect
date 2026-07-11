@@ -615,11 +615,9 @@ fn parse_epoch(v: &serde_json::Value) -> Option<DateTime<Utc>> {
         n
     } else if let Some(n) = v.as_u64() {
         i64::try_from(n).ok()?
-    } else if let Some(f) = v.as_f64() {
-        // Some legacy responses returned floats; truncate to whole seconds.
-        f as i64
     } else {
-        return None;
+        // Some legacy responses returned floats; truncate to whole seconds.
+        v.as_f64()? as i64
     };
     Utc.timestamp_opt(secs, 0).single()
 }

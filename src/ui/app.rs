@@ -3481,18 +3481,8 @@ fn kick_off_loads_for_view(
         View::ApimApis => {
             if let Some(svc_id) = state
                 .selected_resource()
+                .filter(|r| r.kind == crate::azure::resources::ResourceKind::Apim)
                 .map(|r| r.id.clone())
-                .and_then(|id| {
-                    if state
-                        .selected_resource()
-                        .map(|r| r.kind == crate::azure::resources::ResourceKind::Apim)
-                        .unwrap_or(false)
-                    {
-                        Some(id)
-                    } else {
-                        None
-                    }
-                })
             {
                 let cached = state.apim.apis.contains_key(&svc_id);
                 let in_flight = state.apim.apis_pending.contains(&svc_id);
