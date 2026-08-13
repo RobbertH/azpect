@@ -48,6 +48,17 @@ pub struct Config {
     /// refresh on demand). See `app::maybe_auto_refresh`.
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
+
+    /// Whether azpect may open **live T-SQL connections** to Azure SQL
+    /// databases (TDS, port 1433) for the features that need them: the
+    /// open-sessions view and the "database users with no audit activity"
+    /// merge in the SQL audit roll-up. Everything else in azpect is REST-only;
+    /// these two run fixed, read-only `SELECT`s against system views
+    /// (`sys.dm_exec_sessions`, `sys.database_principals`) and are flagged
+    /// with a ⚠ in the UI wherever they fire. Set to `false` to guarantee
+    /// azpect never speaks TDS to a database.
+    #[serde(default = "default_sql_live_queries")]
+    pub sql_live_queries: bool,
 }
 
 fn default_theme() -> String {
@@ -56,6 +67,10 @@ fn default_theme() -> String {
 
 fn default_refresh_secs() -> u64 {
     60
+}
+
+fn default_sql_live_queries() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -67,6 +82,7 @@ impl Default for Config {
             default_window: TimeRange::default(),
             theme: default_theme(),
             refresh_secs: default_refresh_secs(),
+            sql_live_queries: default_sql_live_queries(),
         }
     }
 }

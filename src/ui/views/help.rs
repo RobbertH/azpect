@@ -1,4 +1,8 @@
-//! Help overlay. Toggled by `?`. Shows the keymap in a centered popup.
+//! Help overlay. Toggled by `?`. Shows a keymap popup **scoped to the view it
+//! was opened from**: navigation and global keys always, plus the sections
+//! for the current category — cosmos controls are noise on a SQL audit page
+//! and vice versa. The "Go to" section lists the palette commands that jump
+//! between categories, so every other mode is one `:command` away.
 
 #![allow(dead_code, unused_variables)]
 
@@ -9,221 +13,319 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+use crate::ui::state::{AppState, Category, View};
 use crate::ui::theme::Theme;
 
-const SECTIONS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Navigation",
-        &[
-            ("j / k", "down / up"),
-            ("h", "left"),
-            ("g g", "go to top"),
-            ("G", "go to bottom"),
-            ("Ctrl-d / Ctrl-u", "half page down / up"),
-            ("Esc", "back"),
-        ],
-    ),
-    (
-        "API resources",
-        &[
-            ("Enter", "open detail"),
-            ("l", "open logs"),
-            ("f", "toggle favorite"),
-            ("F", "favorites only"),
-            ("/", "search"),
-            ("s", "switch subscription"),
-        ],
-    ),
-    (
-        "Detail / Logs",
-        &[
-            ("Enter", "log line detail (logs)"),
-            ("0", "window 1h"),
-            ("1", "window 1d"),
-            ("7", "window 7d"),
-            ("w", "wrap (logs)"),
-            ("e", "errors only (logs) / env vars (detail)"),
-            ("E", "jump to next error, fetching older rows (logs)"),
-            ("Tab / S-Tab", "cycle source filter (logs)"),
-            ("s", "shell into container (Container App detail/logs)"),
-            ("x", "reveal / hide env var values (env vars)"),
-            ("Ctrl-e / Ctrl-n", "edit / add env var (env vars)"),
-            ("/", "search (logs)"),
-            ("n / N", "next / prev match (logs)"),
-            ("V", "visual-line select for yank (logs)"),
-            ("l", "open logs (detail)"),
-        ],
-    ),
-    (
-        "Key vault access log (l on a vault or item)",
-        &[
-            (
-                "l",
-                "access log — who accessed what, when (vault-wide or one item)",
-            ),
-            ("0 / 1 / 7", "window 1h / 1d / 7d"),
-            ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
-            ("m", "hide your own accesses (your user / sign-in IP)"),
-            ("Tab / S-Tab", "cycle operation filter (SecretGet, …)"),
-            ("y", "yank row (incl. full managed-identity id)"),
-        ],
-    ),
-    (
-        "Health badge",
-        &[
-            ("window", "computed over a fixed 24h, not the chart range"),
-            ("HEALTHY", "<1% 5xx and no error spikes"),
-            ("DEGRADED", "sustained >1% 5xx, or a single-bin spike"),
-            ("CRITICAL", "stopped, platform down, or >5% / sharp spike"),
-            ("IDLE", "running but no traffic in the last 24h"),
-            ("UNKNOWN", "no data / not loaded yet"),
-            ("ERROR", "couldn't fetch the health metrics"),
-            ("5xx", "had server errors in 24h (flag, not the verdict)"),
-            (
-                "◌ vs ●",
-                "hollow = provisional (still loading metrics); solid = settled",
-            ),
-            (
-                "refresh",
-                "list self-updates on a timer (refresh_secs); r forces it",
-            ),
-            ("note", "verdict is worst-of all signals (pessimistic)"),
-        ],
-    ),
-    (
-        "APIM (APIs/Routes)",
-        &[
-            ("Enter", "drill down: APIs > routes > policy"),
-            ("y", "yank API / operation / policy"),
-            ("o", "open in Azure Portal"),
-            ("r", "refresh current panel"),
-        ],
-    ),
-    (
-        "Application Gateway",
-        &[
-            ("Enter", "show backend pools and their members"),
-            ("y", "yank gateway id / FQDN / IP / NIC id"),
-            ("o", "open gateway in Azure Portal"),
-            ("r", "refresh backend pools"),
-        ],
-    ),
-    (
-        "Storage (blobs)",
-        &[
-            ("S", "enter storage mode"),
-            (
-                "Enter",
-                "drill: accounts > overview > containers > blobs > preview",
-            ),
-            (
-                "overview",
-                "per-account stats (blobs/files/queues/tables, ~24h lag)",
-            ),
-            (
-                "/",
-                "filter accounts / containers / blobs by name (substring)",
-            ),
-            ("j/k", "scroll preview (detail)"),
-            ("g/G", "preview top / bottom"),
-            ("y", "yank account / container / blob / body"),
-            ("o", "open account in Azure Portal"),
-            ("r", "refresh current panel"),
-        ],
-    ),
-    (
-        "Container registries (ACR)",
-        &[
-            ("R", "enter registries mode"),
-            ("Enter", "drill: registries > repositories > tags"),
-            ("/", "filter registries / repos / tags by name (substring)"),
-            ("y", "yank registry id / repo name / pull ref"),
-            ("o", "open registry in Azure Portal"),
-            ("r", "refresh current panel"),
-        ],
-    ),
-    (
-        "Cosmos DB (SQL/Core API)",
-        &[
-            (":cosmos", "enter cosmos mode (palette only — no keybind)"),
-            ("Enter", "drill: accounts > databases > containers > items"),
-            ("/", "filter accounts / databases / containers by name"),
-            ("y", "yank account id / db name / container / item json"),
-            ("o", "open account's Data Explorer in Azure Portal"),
-            (
-                "r",
-                "refresh current panel (item preview costs RU — see title bar)",
-            ),
-        ],
-    ),
-    (
-        "Key Vaults (listing is metadata only)",
-        &[
-            (":keyvaults / :kv", "enter key vault mode (palette only)"),
-            ("Enter", "vaults: drill in to secrets / certificates"),
-            ("Enter / x", "secrets: reveal selected value in a modal"),
-            ("Tab / S-Tab", "toggle secrets ↔ certificates"),
-            ("/", "filter vaults / items by name (substring)"),
-            ("y", "yank vault id / item name · in modal: the value"),
-            ("o", "open vault in Azure Portal"),
-            ("r", "refresh current panel"),
-        ],
-    ),
-    (
-        "Service Bus (control plane)",
-        &[
-            (":servicebus / :sb", "enter service bus mode (palette only)"),
-            ("Enter", "drill: namespaces > queues/topics > subs"),
-            ("Tab / S-Tab", "toggle queues ↔ topics"),
-            ("DLQ", "dead-letter depth, red when non-zero"),
-            ("/", "filter by name (substring)"),
-            ("y", "yank id / entity / subscription"),
-            ("o", "open namespace in Azure Portal"),
-            ("r", "refresh current panel"),
-        ],
-    ),
-    (
-        "Azure SQL (pools + databases)",
-        &[
-            (":sql / :sqldb", "enter azure sql mode (palette only)"),
-            ("Enter", "open utilization sparklines for the pool/database"),
-            ("0 / 1 / 7", "chart window: 1h / 1d / 7d"),
-            ("/", "filter pools & databases by name / server"),
-            ("y", "yank resource id"),
-            ("o", "open pool / database in Azure Portal"),
-            ("r", "refresh"),
-        ],
-    ),
-    (
-        "Global",
-        &[
-            ("r", "refresh"),
-            ("y", "yank to clipboard"),
-            ("o", "open in Azure Portal"),
-            ("?", "toggle help"),
-            ("q", "quit"),
-        ],
-    ),
-    (
-        "Command palette (:)",
-        &[
-            (":", "open command palette"),
-            ("Tab / S-Tab", "cycle prefix matches"),
-            (":storage", "enter storage mode"),
-            (":registries / :reg / :acr", "enter registries mode"),
-            (":cosmos", "enter cosmos mode"),
-            (":keyvaults / :kv / :vaults", "enter key vault mode"),
-            (":servicebus / :sb / :bus", "enter service bus mode"),
-            (":sql / :sqldb / :sqlpools", "enter azure sql mode"),
-            (":apis", "back to apis list"),
-            (":subscriptions / :subs", "subscription picker"),
-            (":help / :h / :?", "open help"),
-            (":refresh", "force-refresh current view"),
-            (":quit / :q", "quit"),
-        ],
-    ),
-];
+type Section = (&'static str, &'static [(&'static str, &'static str)]);
+
+const NAVIGATION: Section = (
+    "Navigation",
+    &[
+        ("j / k", "down / up"),
+        ("h", "left"),
+        ("g g", "go to top"),
+        ("G", "go to bottom"),
+        ("Ctrl-d / Ctrl-u", "half page down / up"),
+        ("Esc", "back"),
+    ],
+);
+
+const API_RESOURCES: Section = (
+    "API resources",
+    &[
+        ("Enter", "open detail"),
+        ("l", "open logs"),
+        ("f", "toggle favorite"),
+        ("F", "favorites only"),
+        ("/", "search"),
+        ("s", "switch subscription"),
+    ],
+);
+
+const DETAIL_LOGS: Section = (
+    "Detail / Logs",
+    &[
+        ("Enter", "log line detail (logs)"),
+        ("0", "window 1h"),
+        ("1", "window 1d"),
+        ("7", "window 7d"),
+        ("w", "wrap (logs)"),
+        ("e", "errors only (logs) / env vars (detail)"),
+        ("E", "jump to next error, fetching older rows (logs)"),
+        ("Tab / S-Tab", "cycle source filter (logs)"),
+        ("s", "shell into container (Container App detail/logs)"),
+        ("x", "reveal / hide env var values (env vars)"),
+        ("Ctrl-e / Ctrl-n", "edit / add env var (env vars)"),
+        ("/", "search (logs)"),
+        ("n / N", "next / prev match (logs)"),
+        ("V", "visual-line select for yank (logs)"),
+        ("l", "open logs (detail)"),
+    ],
+);
+
+const KV_ACCESS_LOG: Section = (
+    "Key vault access log (l on a vault or item)",
+    &[
+        (
+            "l",
+            "access log — who accessed what, when (vault-wide or one item)",
+        ),
+        ("0 / 1 / 7", "window 1h / 1d / 7d"),
+        ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
+        ("m", "hide your own accesses (your user / sign-in IP)"),
+        ("Tab / S-Tab", "cycle operation filter (SecretGet, …)"),
+        ("y", "yank row (incl. full managed-identity id)"),
+    ],
+);
+
+const HEALTH_BADGE: Section = (
+    "Health badge",
+    &[
+        ("window", "computed over a fixed 24h, not the chart range"),
+        ("HEALTHY", "<1% 5xx and no error spikes"),
+        ("DEGRADED", "sustained >1% 5xx, or a single-bin spike"),
+        ("CRITICAL", "stopped, platform down, or >5% / sharp spike"),
+        ("IDLE", "running but no traffic in the last 24h"),
+        ("UNKNOWN", "no data / not loaded yet"),
+        ("ERROR", "couldn't fetch the health metrics"),
+        ("5xx", "had server errors in 24h (flag, not the verdict)"),
+        (
+            "◌ vs ●",
+            "hollow = provisional (still loading metrics); solid = settled",
+        ),
+        (
+            "refresh",
+            "list self-updates on a timer (refresh_secs); r forces it",
+        ),
+        ("note", "verdict is worst-of all signals (pessimistic)"),
+    ],
+);
+
+const APIM: Section = (
+    "APIM (APIs/Routes)",
+    &[
+        ("Enter", "drill down: APIs > routes > policy"),
+        ("y", "yank API / operation / policy"),
+        ("o", "open in Azure Portal"),
+        ("r", "refresh current panel"),
+    ],
+);
+
+const APP_GATEWAY: Section = (
+    "Application Gateway",
+    &[
+        ("Enter", "show backend pools and their members"),
+        ("y", "yank gateway id / FQDN / IP / NIC id"),
+        ("o", "open gateway in Azure Portal"),
+        ("r", "refresh backend pools"),
+    ],
+);
+
+const STORAGE: Section = (
+    "Storage (blobs)",
+    &[
+        ("S", "enter storage mode"),
+        (
+            "Enter",
+            "drill: accounts > overview > containers > blobs > preview",
+        ),
+        (
+            "overview",
+            "per-account stats (blobs/files/queues/tables, ~24h lag)",
+        ),
+        (
+            "/",
+            "filter accounts / containers / blobs by name (substring)",
+        ),
+        ("j/k", "scroll preview (detail)"),
+        ("g/G", "preview top / bottom"),
+        ("y", "yank account / container / blob / body"),
+        ("o", "open account in Azure Portal"),
+        ("r", "refresh current panel"),
+    ],
+);
+
+const REGISTRIES: Section = (
+    "Container registries (ACR)",
+    &[
+        ("R", "enter registries mode"),
+        ("Enter", "drill: registries > repositories > tags"),
+        ("/", "filter registries / repos / tags by name (substring)"),
+        ("y", "yank registry id / repo name / pull ref"),
+        ("o", "open registry in Azure Portal"),
+        ("r", "refresh current panel"),
+    ],
+);
+
+const COSMOS: Section = (
+    "Cosmos DB (SQL/Core API)",
+    &[
+        ("Enter", "drill: accounts > databases > containers > items"),
+        ("/", "filter accounts / databases / containers by name"),
+        ("y", "yank account id / db name / container / item json"),
+        ("o", "open account's Data Explorer in Azure Portal"),
+        (
+            "r",
+            "refresh current panel (item preview costs RU — see title bar)",
+        ),
+    ],
+);
+
+const KEY_VAULTS: Section = (
+    "Key Vaults (listing is metadata only)",
+    &[
+        ("Enter", "vaults: drill in to secrets / certificates"),
+        ("Enter / x", "secrets: reveal selected value in a modal"),
+        ("Tab / S-Tab", "toggle secrets ↔ certificates"),
+        ("/", "filter vaults / items by name (substring)"),
+        ("y", "yank vault id / item name · in modal: the value"),
+        ("o", "open vault in Azure Portal"),
+        ("r", "refresh current panel"),
+    ],
+);
+
+const SERVICE_BUS: Section = (
+    "Service Bus (control plane)",
+    &[
+        ("Enter", "drill: namespaces > queues/topics > subs"),
+        ("Tab / S-Tab", "toggle queues ↔ topics"),
+        ("DLQ", "dead-letter depth, red when non-zero"),
+        ("/", "filter by name (substring)"),
+        ("y", "yank id / entity / subscription"),
+        ("o", "open namespace in Azure Portal"),
+        ("r", "refresh current panel"),
+    ],
+);
+
+const AZURE_SQL: Section = (
+    "Azure SQL (pools + databases)",
+    &[
+        ("Enter", "open utilization sparklines for the pool/database"),
+        ("0 / 1 / 7", "chart window: 1h / 1d / 7d"),
+        ("/", "filter pools & databases by name / server"),
+        ("y", "yank resource id"),
+        ("o", "open pool / database in Azure Portal"),
+        ("r", "refresh"),
+    ],
+);
+
+const SQL_AUDIT: Section = (
+    "SQL audit log (l on a pool / database)",
+    &[
+        (
+            "l",
+            "principal roll-up — last seen / event counts per login",
+        ),
+        (
+            "Enter",
+            "drill: principal > events > full event (statement + error)",
+        ),
+        (
+            "0 / 1 / 7 / 3 / 9",
+            "window 1h / 1d / 7d / 30d / 1y (default 30d)",
+        ),
+        ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
+        ("/", "filter principals by name (raw or resolved)"),
+        ("Tab / S-Tab", "cycle action filter (batch, login, tx-…)"),
+        ("e", "errors only (events — refetches server-side)"),
+        ("bottom j / G", "fetch rows older than the page (events)"),
+        ("y", "yank roll-up row / full statement"),
+        (
+            "note",
+            "needs auditing → Log Analytics; pools audit server-wide",
+        ),
+        (
+            "⚠ users",
+            "db-scoped roll-up lists users via live T-SQL (silent at bottom)",
+        ),
+    ],
+);
+
+const SQL_SESSIONS: Section = (
+    "SQL open sessions (u on a pool / database) ⚠ live T-SQL",
+    &[
+        ("u", "who's connected now — since when, idle how long"),
+        ("query", "read-only SELECT on sys.dm_exec_sessions over TDS"),
+        ("y", "yank session row (login, timings, client)"),
+        (
+            "off-switch",
+            "sql_live_queries = false in config.toml disables all live T-SQL",
+        ),
+        (
+            "note",
+            "needs the firewall to admit you + a db user mapping",
+        ),
+    ],
+);
+
+/// Action-code legend for the SQL audit views (codes per
+/// `sys.dm_audit_actions`) — SQL mode only, it's noise everywhere else.
+const SQL_AUDIT_CODES: Section = (
+    "SQL audit action codes",
+    &[
+        ("BCM", "batch completed — an actual query"),
+        ("RCM", "rpc completed — a stored-proc / parameterized call"),
+        ("DBAS / DBAF", "database authentication succeeded / failed"),
+        ("TRBC", "transaction begin completed"),
+        ("TRCC / TRRC", "transaction commit / rollback completed"),
+        (
+            "AUSC",
+            "audit session changed (auditing itself (re)started)",
+        ),
+    ],
+);
+
+const GLOBAL: Section = (
+    "Global",
+    &[
+        ("r", "refresh"),
+        ("y", "yank to clipboard"),
+        ("o", "open in Azure Portal"),
+        ("?", "toggle help"),
+        ("q", "quit"),
+    ],
+);
+
+/// How to get everywhere else — always shown, since the scoped help hides the
+/// other categories' sections.
+const GO_TO: Section = (
+    "Go to (command palette :)",
+    &[
+        (":", "open command palette (Tab cycles matches)"),
+        (":apis", "API resources (the start view)"),
+        (":storage", "storage / blobs (also: S)"),
+        (":registries / :acr", "container registries (also: R)"),
+        (":cosmos", "cosmos db"),
+        (":keyvaults / :kv", "key vaults"),
+        (":servicebus / :sb", "service bus"),
+        (":sql / :sqldb", "azure sql"),
+        (":subscriptions", "subscription picker (also: s)"),
+        (":refresh", "force-refresh current view"),
+        (":quit / :q", "quit"),
+    ],
+);
+
+/// The sections relevant to where help was opened from: navigation first,
+/// then the origin category's own sections, then the global keys and the
+/// "Go to" palette list that replaces the hidden categories.
+fn sections_for(origin: Option<View>) -> Vec<Section> {
+    let mut out = vec![NAVIGATION];
+    match origin.and_then(Category::of) {
+        Some(Category::Apis) => {
+            out.extend([API_RESOURCES, DETAIL_LOGS, HEALTH_BADGE, APIM, APP_GATEWAY])
+        }
+        Some(Category::Storage) => out.push(STORAGE),
+        Some(Category::Registries) => out.push(REGISTRIES),
+        Some(Category::Cosmos) => out.push(COSMOS),
+        Some(Category::KeyVaults) => out.extend([KEY_VAULTS, KV_ACCESS_LOG]),
+        Some(Category::ServiceBus) => out.push(SERVICE_BUS),
+        Some(Category::Sql) => out.extend([AZURE_SQL, SQL_AUDIT, SQL_SESSIONS, SQL_AUDIT_CODES]),
+        // Subscriptions picker / unknown origin: just the shared sections.
+        None => {}
+    }
+    out.extend([GLOBAL, GO_TO]);
+    out
+}
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let popup = centered_rect(74, 80, area);
@@ -251,9 +353,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
 
-    let mid = SECTIONS.len().div_ceil(2);
-    let left_lines = lines_for(&SECTIONS[..mid], theme);
-    let right_lines = lines_for(&SECTIONS[mid..], theme);
+    // Scope to the origin view — `?` pushed it onto `view_stack`.
+    let sections = sections_for(state.view_stack.last().copied());
+
+    let mid = sections.len().div_ceil(2);
+    let left_lines = lines_for(&sections[..mid], theme);
+    let right_lines = lines_for(&sections[mid..], theme);
 
     frame.render_widget(Paragraph::new(left_lines), cols[0]);
     frame.render_widget(Paragraph::new(right_lines), cols[1]);
@@ -275,7 +380,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 }
 
-fn lines_for(sections: &[(&str, &[(&str, &str)])], theme: &Theme) -> Vec<Line<'static>> {
+fn lines_for(sections: &[Section], theme: &Theme) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     for (i, (heading, entries)) in sections.iter().enumerate() {
         if i > 0 {
@@ -331,14 +436,72 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    fn render_from(origin: Option<View>) -> String {
+        let theme = Theme::catppuccin_mocha();
+        let mut state = AppState::new(Config::default());
+        if let Some(v) = origin {
+            state.view_stack.push(v);
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 90)).unwrap();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        format!("{:?}", term.backend().buffer())
+    }
+
+    #[test]
+    fn help_is_scoped_to_the_origin_view() {
+        // From a SQL view: SQL sections (incl. the action-code legend), no
+        // cosmos / storage / service-bus noise.
+        let s = render_from(Some(View::SqlAuditEvents));
+        assert!(s.contains("Azure SQL"));
+        assert!(s.contains("SQL audit log"));
+        assert!(s.contains("open sessions"));
+        assert!(s.contains("audit action codes"));
+        assert!(s.contains("TRBC"));
+        assert!(!s.contains("Cosmos DB"), "cosmos is noise in SQL mode");
+        assert!(!s.contains("Service Bus (control plane)"));
+        assert!(!s.contains("Storage (blobs)"));
+
+        // From cosmos: the reverse.
+        let s = render_from(Some(View::CosmosDatabases));
+        assert!(s.contains("Cosmos DB"));
+        assert!(!s.contains("SQL audit log"));
+        assert!(!s.contains("audit action codes"));
+
+        // Key vault views bring the vault + access-log pair.
+        let s = render_from(Some(View::KeyVaultAccessLogs));
+        assert!(s.contains("Key Vaults"));
+        assert!(s.contains("Key vault access log"));
+        assert!(!s.contains("Application Gateway"));
+    }
+
+    #[test]
+    fn shared_sections_and_go_to_always_render() {
+        for origin in [
+            None,
+            Some(View::List),
+            Some(View::SqlSessions),
+            Some(View::StorageBlobs),
+        ] {
+            let s = render_from(origin);
+            assert!(s.contains("Navigation"), "origin {origin:?}");
+            assert!(s.contains("Global"), "origin {origin:?}");
+            assert!(s.contains("Go to (command palette"), "origin {origin:?}");
+            assert!(s.contains(":sql / :sqldb"), "origin {origin:?}");
+            assert!(s.contains(":cosmos"), "origin {origin:?}");
+        }
+        // Apis origin carries its full section family.
+        let s = render_from(Some(View::Detail));
+        assert!(s.contains("API resources"));
+        assert!(s.contains("Detail / Logs"));
+        assert!(s.contains("Health badge"));
+        assert!(s.contains("APIM"));
+        assert!(s.contains("Application Gateway"));
+    }
+
     #[test]
     fn renders_without_panic() {
-        // Backend has to be tall enough to fit the help popup's column with
-        // the most content. Adding new sections (Cosmos, etc.) pushes the
-        // right-column footers further down — bump backend height if you add
-        // sections that grow either column past ~30 lines.
         let theme = Theme::catppuccin_mocha();
-        let backend = TestBackend::new(100, 72);
+        let backend = TestBackend::new(100, 60);
         let mut term = Terminal::new(backend).unwrap();
         let state = AppState::new(Config::default());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
@@ -346,12 +509,6 @@ mod tests {
         assert!(s.to_lowercase().contains("help"));
         assert!(s.contains("Navigation"));
         assert!(s.contains("Global"));
-        assert!(s.contains("Cosmos"), "Cosmos section should render");
-        assert!(
-            s.contains("Service Bus"),
-            "Service Bus section should render"
-        );
-        assert!(s.contains("Azure SQL"), "Azure SQL section should render");
     }
 
     #[test]

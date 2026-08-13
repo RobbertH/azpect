@@ -297,6 +297,39 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             }
             s
         }
+
+        View::SqlAuditPrincipals => {
+            let mut s = vec![subscription_segment(state), "azure sql".to_string()];
+            if let Some(target) = state.sql.audit.target.as_ref() {
+                s.push(target.label());
+            }
+            s.push("audit".to_string());
+            s
+        }
+
+        View::SqlAuditEvents | View::SqlAuditEventDetail => {
+            let mut s = vec![subscription_segment(state), "azure sql".to_string()];
+            if let Some(target) = state.sql.audit.target.as_ref() {
+                s.push(target.label());
+            }
+            s.push("audit".to_string());
+            if let Some(p) = state.sql.audit.selected_principal.as_deref() {
+                s.push(p.to_string());
+            }
+            if state.view == View::SqlAuditEventDetail {
+                s.push("event".to_string());
+            }
+            s
+        }
+
+        View::SqlSessions => {
+            let mut s = vec![subscription_segment(state), "azure sql".to_string()];
+            if let Some(target) = state.sql.sessions.target.as_ref() {
+                s.push(target.label());
+            }
+            s.push("sessions".to_string());
+            s
+        }
     }
 }
 

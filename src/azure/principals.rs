@@ -24,6 +24,19 @@ pub async fn resolve_display_name(
     // `/directoryObjects/{id}` resolves users, service principals, and managed
     // identities alike; `$select` keeps the payload to just the name.
     let path = format!("/directoryObjects/{object_id}?$select=displayName");
+    match client.get(&path).await {
+        Ok(resp) => {
+            if let Some(name) = display_name(&resp) {
+                return Ok(Some(name));
+            }
+        }
+        Err(_) => {
+            // Fall through: the GUID may be an *application (client) id*, not a
+            // directory object id — SQL audit logs and connection strings carry
+            // the client id for app/service-principal identities.
+        }
+    }
+    let path = format!("/servicePrincipals(appId='{object_id}')?$select=displayName");
     let resp = client
         .get(&path)
         .await

@@ -14,11 +14,11 @@ use ratatui::Frame;
 use super::{col_width, truncate_ellipsis};
 use crate::azure::sql::{SqlKind, SqlResource};
 use crate::ui::events::Action;
-use crate::ui::state::{subscription_display_name, AppState, View};
+use crate::ui::state::{subscription_display_name, AppState, SqlCache, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter metrics  / filter  Esc back  r refresh  o portal  y yank id  ? help  q quit";
+    "j/k move  Enter metrics  l audit log  u sessions ⚠  / filter  Esc back  r refresh  o portal  y yank id  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -112,7 +112,27 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         Some(_) => {
             let show_sub_cols = state.selected_subscription.is_none();
-            let layout = plan_columns(&filtered, body_area.width, show_sub_cols, state);
+            // Databases living in an on-screen elastic pool render indented
+            // under it (the list is ordered pool-then-members by
+            // `filtered_resources`); a member whose pool was filtered out
+            // stays flush left rather than indenting under a stranger.
+            let pool_ids = SqlCache::pool_ids(&filtered);
+            let display_names: Vec<String> = filtered
+                .iter()
+                .map(|r| match r.elastic_pool_id.as_deref() {
+                    Some(pid) if pool_ids.contains(&pid.to_lowercase()) => {
+                        format!("└ {}", r.name)
+                    }
+                    _ => r.name.clone(),
+                })
+                .collect();
+            let layout = plan_columns(
+                &filtered,
+                &display_names,
+                body_area.width,
+                show_sub_cols,
+                state,
+            );
 
             let mut widths: Vec<Constraint> = vec![Constraint::Length(layout.name_w)];
             let mut headers: Vec<&'static str> = vec!["NAME"];
@@ -139,7 +159,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             let cursor = state.sql.cursor.min(filtered.len() - 1);
             let body_rows: Vec<Row> = filtered
                 .iter()
-                .map(|r| build_row(r, state, &layout, theme))
+                .zip(&display_names)
+                .map(|(r, name)| build_row(r, name, state, &layout, theme))
                 .collect();
 
             let table = Table::new(body_rows, widths)
@@ -182,6 +203,7 @@ struct ColLayout {
 /// exceeds the terminal width.
 fn plan_columns(
     filtered: &[&SqlResource],
+    display_names: &[String],
     area_width: u16,
     show_sub_cols: bool,
     state: &AppState,
@@ -222,8 +244,13 @@ fn plan_columns(
     };
 
     // Chrome before any cell: the selection symbol "▍ " (2 cols). Each column
-    // also costs 2 cols of spacing to its left neighbour.
-    let longest_name = max_len(&|r| r.name.chars().count());
+    // also costs 2 cols of spacing to its left neighbour. NAME is sized on the
+    // *display* names, which carry the "└ " pool-member indent.
+    let longest_name = display_names
+        .iter()
+        .map(|n| n.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     let name_budget = area_width.saturating_sub(2);
     let name_w = longest_name.max(4).min(name_budget.max(4));
 
@@ -259,6 +286,7 @@ fn plan_columns(
 
 fn build_row<'a>(
     r: &'a SqlResource,
+    display_name: &str,
     state: &'a AppState,
     layout: &ColLayout,
     theme: &Theme,
@@ -279,10 +307,11 @@ fn build_row<'a>(
         None => Style::default().fg(theme.muted),
     };
 
-    let mut cells: Vec<Cell> = vec![
-        Cell::from(truncate_ellipsis(&r.name, layout.name_w as usize))
-            .style(Style::default().fg(theme.fg)),
-    ];
+    let mut cells: Vec<Cell> =
+        vec![
+            Cell::from(truncate_ellipsis(display_name, layout.name_w as usize))
+                .style(Style::default().fg(theme.fg)),
+        ];
     if layout.kind.is_some() {
         cells.push(Cell::from(r.kind.short_tag()).style(Style::default().fg(kind_color)));
     }
@@ -399,7 +428,53 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             }
             true
         }
+        Action::OpenLogs => {
+            // `l` on a pool / database: its audit log, as a principal roll-up.
+            // A database scopes the queries to itself; a pool audits the whole
+            // server (pools have no audit stream of their own).
+            if let Some(resource) = state.sql.selected_in_list() {
+                match crate::azure::sql_audit::AuditTarget::from_resource(&resource) {
+                    Some(target) => {
+                        state.sql.selected = Some(resource);
+                        state.sql.audit.enter(target, View::SqlResources);
+                        state.view = View::SqlAuditPrincipals;
+                    }
+                    None => state.set_status("can't derive the audit scope for this resource"),
+                }
+            }
+            true
+        }
+        Action::OpenSessions => {
+            open_sessions_view(state, View::SqlResources);
+            true
+        }
         _ => false,
+    }
+}
+
+/// `u`: open the live open-sessions view (⚠ T-SQL) for the selected / pinned
+/// resource. Refuses politely when the config kill-switch is off — shared by
+/// every SQL view that binds the key.
+pub(crate) fn open_sessions_view(state: &mut AppState, return_view: View) {
+    if !state.config.sql_live_queries {
+        state.set_status(
+            "live T-SQL queries are disabled (sql_live_queries = false in config.toml)",
+        );
+        return;
+    }
+    let resource = match return_view {
+        View::SqlResources => state.sql.selected_in_list(),
+        _ => state.sql.selected.clone(),
+    };
+    if let Some(resource) = resource {
+        match crate::azure::sql_audit::AuditTarget::from_resource(&resource) {
+            Some(target) => {
+                state.sql.selected = Some(resource);
+                state.sql.sessions.enter(target, return_view);
+                state.view = View::SqlSessions;
+            }
+            None => state.set_status("can't derive the session scope for this resource"),
+        }
     }
 }
 
@@ -501,8 +576,9 @@ mod tests {
         a.server = "imecd365replicationv2".into();
         let resources = [a];
         let filtered: Vec<&SqlResource> = resources.iter().collect();
+        let names: Vec<String> = filtered.iter().map(|r| r.name.clone()).collect();
         // Wide enough for NAME but not every column.
-        let layout = plan_columns(&filtered, 60, true, &state);
+        let layout = plan_columns(&filtered, &names, 60, true, &state);
         assert_eq!(
             layout.name_w as usize,
             "a-fairly-long-database-name".len(),
@@ -524,6 +600,49 @@ mod tests {
             state.sql.selected.as_ref().map(|r| r.name.as_str()),
             Some("pool-a")
         );
+    }
+
+    #[test]
+    fn pooled_databases_sort_under_their_pool_and_indent() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let the_pool = pool("pool-prod");
+        let mut member = pool("orders");
+        member.kind = SqlKind::Database;
+        member.id = "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Sql/servers/srv/databases/orders".into();
+        member.elastic_pool_id = Some(the_pool.id.clone());
+        let mut standalone = pool("inventory");
+        standalone.kind = SqlKind::Database;
+        standalone.id = "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Sql/servers/srv/databases/inventory".into();
+        // Deliberately unsorted input: member first, pool last.
+        state.sql.resources = Some(vec![member, standalone, the_pool]);
+
+        let ordered: Vec<&str> = state
+            .sql
+            .filtered_resources()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            ordered,
+            vec!["inventory", "pool-prod", "orders"],
+            "member follows its pool; standalone interleaves by name"
+        );
+
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("└ orders"), "pool member indents");
+        assert!(!buf.contains("└ inventory"), "standalone stays flush");
+
+        // Filter the pool away: the member loses its indent (no stranger
+        // above it to indent under).
+        state.sql.filter = tui_input::Input::new("orders".into());
+        let mut term = Terminal::new(TestBackend::new(160, 12)).unwrap();
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(!buf.contains("└ orders"), "orphaned member is flush left");
     }
 
     #[test]

@@ -119,7 +119,15 @@ impl Category {
                 View::ServiceBusNamespaces
                     | View::ServiceBusEntities
                     | View::ServiceBusSubscriptions,
-            ) | (Category::Sql, View::SqlResources | View::SqlDetail)
+            ) | (
+                Category::Sql,
+                View::SqlResources
+                    | View::SqlDetail
+                    | View::SqlAuditPrincipals
+                    | View::SqlAuditEvents
+                    | View::SqlAuditEventDetail
+                    | View::SqlSessions,
+            )
         )
     }
 
@@ -332,6 +340,24 @@ pub enum View {
     /// Utilization-sparkline detail for the pinned pool / database: CPU %,
     /// eDTU/DTU %, storage %, workers %. Opened with Enter from `SqlResources`.
     SqlDetail,
+    /// SQL audit-log principal roll-up for the pinned pool / database's
+    /// server: one row per `server_principal_name` with last-seen / event
+    /// counts — answers "does anything still use this login?". Opened with
+    /// `l` from `SqlResources` or `SqlDetail`. Requires auditing to forward
+    /// to a Log Analytics workspace.
+    SqlAuditPrincipals,
+    /// Newest audit rows (statements included) for one principal. Opened with
+    /// Enter from `SqlAuditPrincipals`.
+    SqlAuditEvents,
+    /// Full-screen detail for a single audit event: the complete (wrapped)
+    /// statement plus `additional_information` — which carries the actual
+    /// error for failed events. Opened with Enter from `SqlAuditEvents`.
+    SqlAuditEventDetail,
+    /// Open sessions on the SQL server / database — who is connected *right
+    /// now*, since when, idle how long. Opened with `u` from the SQL views.
+    /// ⚠ Backed by **live T-SQL** (`sys.dm_exec_sessions` over TDS), not
+    /// REST; gated by the `sql_live_queries` config flag.
+    SqlSessions,
     Help,
 }
 
@@ -1454,25 +1480,321 @@ pub struct SqlCache {
     pub metrics_failures: HashMap<String, String>,
     /// Currently-selected chart window; changed with `0`/`1`/`7` in the detail.
     pub metrics_range: TimeRange,
+
+    /// Audit-log drill-in (`l` on a pool / database): the principal roll-up
+    /// and per-principal event views.
+    pub audit: SqlAuditState,
+
+    /// Open-sessions view (`u` on a pool / database). ⚠ live T-SQL.
+    pub sessions: SqlSessionsState,
 }
 
-impl SqlCache {
-    /// Apply `filter` to `resources` as a case-insensitive substring match on
-    /// the resource name or its logical server. Empty filter passes everything;
-    /// returns empty when nothing's been fetched yet.
-    pub fn filtered_resources(&self) -> Vec<&crate::azure::sql::SqlResource> {
-        let needle = self.filter.value().to_lowercase();
-        match self.resources.as_ref() {
+/// State for the open-sessions view — the only view backed by live T-SQL
+/// (with the audit roll-up's database-user merge). Same fetch discipline as
+/// the audit views: `generation` orphans stale in-flight results.
+#[derive(Clone, Default)]
+pub struct SqlSessionsState {
+    /// Server (+ optional database) the query targets, derived from the
+    /// pinned SQL resource on entry.
+    pub target: Option<crate::azure::sql_audit::AuditTarget>,
+    /// Where Esc should land (wherever `u` was pressed).
+    pub return_view: Option<View>,
+    pub rows: Option<Vec<crate::azure::sql_tds::DbSession>>,
+    pub pending: bool,
+    pub error: Option<String>,
+    pub cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub view_top: Cell<usize>,
+    pub generation: u64,
+}
+
+impl SqlSessionsState {
+    /// Reset for a fresh entry on `target`.
+    pub fn enter(&mut self, target: crate::azure::sql_audit::AuditTarget, return_view: View) {
+        self.target = Some(target);
+        self.return_view = Some(return_view);
+        self.rows = None;
+        self.pending = false;
+        self.error = None;
+        self.cursor = 0;
+        self.view_top.set(0);
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+/// State for the SQL audit views (principal roll-up + per-principal events).
+/// Same query-scope discipline as the Key Vault access view: the window and
+/// target are *query* parameters — changing them drops the buffers and bumps
+/// `generation` so a stale in-flight page can't land.
+#[derive(Clone)]
+pub struct SqlAuditState {
+    /// What the queries run against, derived from the pinned SQL resource on
+    /// entry. `None` until the view is first opened.
+    pub target: Option<crate::azure::sql_audit::AuditTarget>,
+    /// Where Esc from the principals view should land (`SqlResources` or
+    /// `SqlDetail`, wherever `l` was pressed).
+    pub return_view: Option<View>,
+    /// Query time window, shared by both audit views. Defaults to 30 days —
+    /// "can I delete this user" needs lookback, not today.
+    pub window: crate::azure::key_vault_logs::AccessWindow,
+    /// Free-form custom-window input (`t`), e.g. "6m" — see the KV access view.
+    pub window_input: Input,
+    pub window_input_active: bool,
+    /// Monotonic fetch-scope token for the principal roll-up; a landing page
+    /// with a stale generation is discarded. The events fetch has its own
+    /// token (`events_generation`) so spawning one can never orphan an
+    /// in-flight fetch of the other.
+    pub generation: u64,
+    /// Fetch-scope token for the per-principal events page.
+    pub events_generation: u64,
+
+    /// The database's actual user list (⚠ via live T-SQL,
+    /// `sys.database_principals`) — merged into the roll-up so users with
+    /// *zero* audit rows in the window become visible instead of invisible.
+    /// Only fetched when the target is a single database and
+    /// `sql_live_queries` is on. Not window-scoped: survives window changes.
+    pub db_users: Option<Vec<crate::azure::sql_tds::DbUser>>,
+    pub db_users_pending: bool,
+    /// Fetch-scope token for the user list — separate from `generation` so a
+    /// window-change refetch of the roll-up can never orphan an in-flight
+    /// user fetch (the list isn't window-scoped).
+    pub db_users_generation: u64,
+    /// Why the user list is absent (T-SQL failed / disabled by config) — shown
+    /// as a one-line note, never as a fatal error: the audit roll-up itself
+    /// is unaffected.
+    pub db_users_note: Option<String>,
+
+    /// The principal roll-up. `Option` distinguishes "never fetched" from
+    /// "fetched and empty".
+    pub principals: Option<Vec<crate::azure::sql_audit::PrincipalSummary>>,
+    pub principals_truncated: bool,
+    pub pending: bool,
+    pub error: Option<String>,
+    pub cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub view_top: Cell<usize>,
+    /// `/`-filter over the roll-up (matches the raw principal *and* its
+    /// Graph-resolved display name — the user filters what they see). Standard
+    /// substring-filter pattern shared with every list view.
+    pub principals_filter: Input,
+    pub principals_filter_active: bool,
+
+    /// Principal pinned by Enter on a roll-up row (the events view's scope).
+    pub selected_principal: Option<String>,
+    pub events: Option<Vec<crate::azure::sql_audit::AuditEvent>>,
+    pub events_truncated: bool,
+    pub events_pending: bool,
+    pub events_error: Option<String>,
+    pub events_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub events_view_top: Cell<usize>,
+    /// Server-side `succeeded == false` filter, toggled with `e` in the
+    /// events view. A query parameter (all failures in the window), not a
+    /// client-side narrowing of the fetched page.
+    pub events_errors_only: bool,
+    /// Client-side action-code filter (`BCM`, `TRCC`, …), cycled with Tab /
+    /// Shift-Tab through the distinct actions in the fetched page — hides tx /
+    /// session noise to leave just the queries (or just the logins). Unlike
+    /// `events_errors_only` this narrows the cached page, not the query.
+    pub events_action_filter: Option<String>,
+    /// Vertical scroll inside the event detail view (long statements wrap).
+    pub detail_scroll: u16,
+    /// An *older-than* page is in flight (scroll-past-bottom fetch). Distinct
+    /// from `events_pending` so the body doesn't wipe back to "loading" while
+    /// appending — mirrors `LogsCache::loading_more`.
+    pub events_loading_more: bool,
+    /// Set by the events view when the cursor pushes past the last row and
+    /// the window has more; drained by `after_action`, which spawns the
+    /// older-than fetch (view handlers can't spawn tasks).
+    pub events_fetch_older: bool,
+}
+
+impl Default for SqlAuditState {
+    fn default() -> Self {
+        SqlAuditState {
+            target: None,
+            return_view: None,
+            // 30 days, not the KV default of 1 day: the audit questions here
+            // ("is this login dead?") need lookback.
+            window: crate::azure::key_vault_logs::AccessWindow::Custom {
+                hours: 30 * 24,
+                label: "30d".to_string(),
+            },
+            window_input: Input::default(),
+            window_input_active: false,
+            generation: 0,
+            events_generation: 0,
+            db_users: None,
+            db_users_pending: false,
+            db_users_generation: 0,
+            db_users_note: None,
+            principals: None,
+            principals_truncated: false,
+            pending: false,
+            error: None,
+            cursor: 0,
+            view_top: Cell::new(0),
+            principals_filter: Input::default(),
+            principals_filter_active: false,
+            selected_principal: None,
+            events: None,
+            events_truncated: false,
+            events_pending: false,
+            events_error: None,
+            events_cursor: 0,
+            events_view_top: Cell::new(0),
+            events_errors_only: false,
+            events_action_filter: None,
+            detail_scroll: 0,
+            events_loading_more: false,
+            events_fetch_older: false,
+        }
+    }
+}
+
+impl SqlAuditState {
+    /// Reset for a fresh entry on `target` (from wherever `l` was pressed).
+    /// The window survives re-entry — lookback preference is sticky — but the
+    /// buffers never do: a different resource (or a refreshed one) must not
+    /// show stale rows under a new header.
+    pub fn enter(&mut self, target: crate::azure::sql_audit::AuditTarget, return_view: View) {
+        self.target = Some(target);
+        self.return_view = Some(return_view);
+        self.db_users = None;
+        self.db_users_pending = false;
+        self.db_users_note = None;
+        self.db_users_generation = self.db_users_generation.wrapping_add(1);
+        self.window_input.reset();
+        self.window_input_active = false;
+        self.principals = None;
+        self.principals_truncated = false;
+        self.pending = false;
+        self.error = None;
+        self.cursor = 0;
+        self.view_top.set(0);
+        self.principals_filter.reset();
+        self.principals_filter_active = false;
+        self.selected_principal = None;
+        self.events_errors_only = false;
+        self.drop_events();
+        self.generation = self.generation.wrapping_add(1);
+        self.events_generation = self.events_generation.wrapping_add(1);
+    }
+
+    /// Drop the per-principal event buffer (entering the events view on a new
+    /// principal, or invalidating on a window change). The errors-only filter
+    /// survives — it's a preference, not part of the buffer.
+    pub fn drop_events(&mut self) {
+        self.events = None;
+        self.events_truncated = false;
+        self.events_pending = false;
+        self.events_error = None;
+        self.events_cursor = 0;
+        self.events_view_top.set(0);
+        self.events_loading_more = false;
+        self.events_fetch_older = false;
+        // The action filter narrows the buffer being dropped; a fresh page
+        // starts unfiltered (the errors-only flag is a query param and sticks).
+        self.events_action_filter = None;
+    }
+
+    /// Events with the client-side action filter applied — the view the
+    /// events table (and its cursor) indexes into.
+    pub fn visible_events(&self) -> Vec<&crate::azure::sql_audit::AuditEvent> {
+        match self.events.as_ref() {
             Some(rows) => rows
                 .iter()
-                .filter(|r| {
-                    needle.is_empty()
-                        || r.name.to_lowercase().contains(&needle)
-                        || r.server.to_lowercase().contains(&needle)
+                .filter(|e| {
+                    self.events_action_filter
+                        .as_deref()
+                        .is_none_or(|a| e.action == a)
                 })
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Distinct action codes in the fetched page, sorted — the Tab cycle
+    /// order for the action filter.
+    pub fn event_actions(&self) -> Vec<String> {
+        let mut actions: Vec<String> = self
+            .events
+            .iter()
+            .flatten()
+            .map(|e| e.action.clone())
+            .collect();
+        actions.sort();
+        actions.dedup();
+        actions
+    }
+
+    /// Drop both buffers and bump the generation — the query scope (window)
+    /// changed, so neither buffer describes what the header claims and any
+    /// in-flight fetch is stale.
+    pub fn invalidate_fetch(&mut self) {
+        self.principals = None;
+        self.principals_truncated = false;
+        self.pending = false;
+        self.error = None;
+        self.cursor = 0;
+        self.view_top.set(0);
+        self.drop_events();
+        self.generation = self.generation.wrapping_add(1);
+        self.events_generation = self.events_generation.wrapping_add(1);
+    }
+}
+
+impl SqlCache {
+    /// Apply `filter` to `resources` as a case-insensitive substring match on
+    /// the resource name or its logical server, then order the survivors so
+    /// each elastic pool is immediately followed by its member databases (the
+    /// view indents those). A member whose pool didn't survive the filter
+    /// sorts as a standalone row. Empty filter passes everything; returns
+    /// empty when nothing's been fetched yet.
+    pub fn filtered_resources(&self) -> Vec<&crate::azure::sql::SqlResource> {
+        let needle = self.filter.value().to_lowercase();
+        let Some(rows) = self.resources.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<&crate::azure::sql::SqlResource> = rows
+            .iter()
+            .filter(|r| {
+                needle.is_empty()
+                    || r.name.to_lowercase().contains(&needle)
+                    || r.server.to_lowercase().contains(&needle)
+            })
+            .collect();
+        let pool_ids = Self::pool_ids(&out);
+        // Group key: pooled databases adopt their pool's leaf name and sort
+        // *after* it (rank 1); pools and standalone databases interleave by
+        // their own name (rank 0).
+        let key = |r: &crate::azure::sql::SqlResource| -> (String, String, u8, String) {
+            let server = r.server.to_lowercase();
+            match r
+                .elastic_pool_id
+                .as_deref()
+                .map(str::to_lowercase)
+                .filter(|id| pool_ids.contains(id))
+            {
+                Some(pool_id) => {
+                    let pool_name = pool_id.rsplit('/').next().unwrap_or(&pool_id).to_string();
+                    (server, pool_name, 1, r.name.to_lowercase())
+                }
+                None => (server, r.name.to_lowercase(), 0, String::new()),
+            }
+        };
+        out.sort_by_key(|r| key(r));
+        out
+    }
+
+    /// Lowercased ARM ids of the elastic pools in `rows` — the "is this
+    /// database's pool on screen" test shared by the ordering above and the
+    /// view's indentation.
+    pub fn pool_ids(rows: &[&crate::azure::sql::SqlResource]) -> HashSet<String> {
+        rows.iter()
+            .filter(|r| matches!(r.kind, crate::azure::sql::SqlKind::ElasticPool))
+            .map(|r| r.id.to_lowercase())
+            .collect()
     }
 
     /// The row currently under the cursor in the filtered list.

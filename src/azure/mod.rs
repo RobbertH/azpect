@@ -28,5 +28,7 @@ pub mod resource_health;
 pub mod resources;
 pub mod service_bus;
 pub mod sql;
+pub mod sql_audit;
+pub mod sql_tds;
 pub mod storage;
 pub mod subscriptions;

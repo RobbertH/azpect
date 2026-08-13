@@ -660,8 +660,15 @@ pub fn function_app_triggers(_resource_id: &str) -> Vec<FunctionTrigger> {
     ]
 }
 
-pub fn principal_display_name(_object_id: &str) -> Option<String> {
-    Some("Contoso CI Pipeline".to_string())
+pub fn principal_display_name(object_id: &str) -> Option<String> {
+    // Distinct names for the SQL-audit demo principals (a clientId@tenantId
+    // login and a SID-only login) so resolution is visibly per-identity;
+    // everything else keeps the historical CI-pipeline name.
+    match object_id {
+        "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c" => Some("sp-orders-deploy".to_string()),
+        "aabbccdd-eeff-1122-3344-556677889900" => Some("sp-dbt-warehouse".to_string()),
+        _ => Some("Contoso CI Pipeline".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1089,345 @@ pub fn sql_resources(sub_ids: &[String]) -> Vec<SqlResource> {
     ];
     all.retain(|r| in_subs(&r.subscription_id, sub_ids));
     all
+}
+
+/// Synthesized SQL audit principal roll-up, shaped like
+/// [`crate::azure::sql_audit::fetch_principals`]. Includes the cast the view
+/// exists for: busy app logins, an occasional human, a service account that
+/// only fails, and a long-dead login (the deletion candidate). Rows outside
+/// the window are dropped — a `1h` window legitimately shows fewer principals.
+pub fn sql_audit_principals(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    target: &crate::azure::sql_audit::AuditTarget,
+) -> crate::azure::sql_audit::PrincipalsPage {
+    use crate::azure::sql_audit::{PrincipalSummary, PrincipalsPage};
+    let now = Utc::now();
+    // (principal, minutes since last event, events, queries, logins, failed,
+    //  dbs, ips, apps)
+    type Row = (
+        &'static str,
+        i64,
+        u64,
+        u64,
+        u64,
+        u64,
+        &'static [&'static str],
+        u64,
+        &'static [&'static str],
+    );
+    let template: &[Row] = &[
+        (
+            "app-orders",
+            3,
+            48_211,
+            44_020,
+            2_105,
+            0,
+            &["orders"],
+            2,
+            &["orders-api"],
+        ),
+        (
+            "app-inventory",
+            11,
+            9_402,
+            8_710,
+            402,
+            0,
+            &["inventory"],
+            2,
+            &["inventory-sync"],
+        ),
+        // An Entra service principal, raw `clientId@tenantId` form — resolved
+        // to its app registration's display name via Graph.
+        (
+            "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c@9188040d-6c67-4c5b-b112-36a304b66dad",
+            95,
+            310,
+            288,
+            22,
+            0,
+            &["orders"],
+            1,
+            &["azure-pipelines"],
+        ),
+        // An Entra principal SQL only knows by SID — decoded + resolved.
+        (
+            "S-1-9-3-2864434397-287502079-1716864051-10061943",
+            4_100, // ~3 days
+            18,
+            14,
+            4,
+            0,
+            &["inventory"],
+            1,
+            &["dbt"],
+        ),
+        (
+            "dana@contoso.com",
+            2_640, // ~2 days
+            57,
+            43,
+            14,
+            0,
+            &["orders", "inventory"],
+            1,
+            &["Azure Data Studio"],
+        ),
+        (
+            "svc_reporting",
+            9_100, // ~6 days: only failures — broken since a password rotation
+            41,
+            0,
+            41,
+            41,
+            &["orders"],
+            1,
+            &["PowerBI"],
+        ),
+        (
+            "legacy_readonly",
+            273_600, // ~190 days: the deletion candidate
+            12,
+            8,
+            4,
+            0,
+            &["orders"],
+            1,
+            &["SQLCMD"],
+        ),
+    ];
+    let horizon = window.duration().num_minutes();
+    let principals = template
+        .iter()
+        .filter(|(_, mins_ago, ..)| *mins_ago <= horizon)
+        .filter(|(_, _, _, _, _, _, dbs, _, _)| {
+            target
+                .database
+                .as_deref()
+                .is_none_or(|db| dbs.contains(&db))
+        })
+        .map(
+            |(principal, mins_ago, events, queries, logins, failed, dbs, ips, apps)| {
+                PrincipalSummary {
+                    principal: principal.to_string(),
+                    last_seen: now - Duration::minutes(*mins_ago),
+                    events: *events,
+                    queries: *queries,
+                    logins: *logins,
+                    failed: *failed,
+                    databases: dbs.iter().map(|s| s.to_string()).collect(),
+                    distinct_ips: *ips,
+                    apps: apps.iter().map(|s| s.to_string()).collect(),
+                }
+            },
+        )
+        .collect();
+    PrincipalsPage {
+        principals,
+        truncated: false,
+    }
+}
+
+/// Synthesized audit events for one demo principal, shaped like
+/// [`crate::azure::sql_audit::fetch_events`].
+pub fn sql_audit_events(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    principal: &str,
+    errors_only: bool,
+) -> crate::azure::sql_audit::EventsPage {
+    use crate::azure::sql_audit::{AuditEvent, EventsPage};
+    let now = Utc::now();
+    // (action, succeeded, app, ip, statement, response rows)
+    type Template = (
+        &'static str,
+        bool,
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<i64>,
+    );
+    let template: &[Template] = match principal {
+        "svc_reporting" => &[("DBAF", false, "PowerBI", "40.113.20.9", "", None)],
+        "dana@contoso.com" => &[
+            (
+                "BCM",
+                true,
+                "Azure Data Studio",
+                "203.0.113.7",
+                "SELECT TOP 100 * FROM orders ORDER BY created_at DESC",
+                Some(100),
+            ),
+            ("DBAS", true, "Azure Data Studio", "203.0.113.7", "", None),
+        ],
+        "legacy_readonly" => &[
+            (
+                "BCM",
+                true,
+                "SQLCMD",
+                "10.0.4.30",
+                "SELECT COUNT(*) FROM orders WHERE status = 'open'",
+                Some(1),
+            ),
+            ("DBAS", true, "SQLCMD", "10.0.4.30", "", None),
+        ],
+        _ => &[
+            (
+                "RCM",
+                true,
+                "orders-api",
+                "10.0.1.12",
+                "EXEC get_order @order_id = 48213",
+                Some(1),
+            ),
+            (
+                "BCM",
+                true,
+                "orders-api",
+                "10.0.1.12",
+                "UPDATE orders SET status = 'shipped', updated_at = SYSUTCDATETIME() WHERE id = 48213",
+                None,
+            ),
+            ("DBAS", true, "orders-api", "10.0.1.12", "", None),
+        ],
+    };
+    let total_minutes = window.duration().num_minutes().max(60);
+    let count = (total_minutes / 7).clamp(6, 200) as usize;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let (action, succeeded, app, ip, stmt, response) = template[i % template.len()];
+        let minutes_ago = (i as i64 * total_minutes) / count as i64 + (i as i64 % 5);
+        // Failed events carry the actual error in additional_information,
+        // just like real audit rows.
+        let info = if succeeded {
+            String::new()
+        } else {
+            "<action_info xmlns=\"http://schemas.microsoft.com/sqlserver/2008/sqlaudit_data\"><pooled_connection>1</pooled_connection><error>0x00004818</error><state>46</state><address>redirected</address></action_info>".to_string()
+        };
+        events.push(AuditEvent {
+            ts: now - Duration::minutes(minutes_ago),
+            action: action.to_string(),
+            succeeded,
+            database: "orders".to_string(),
+            ip: ip.to_string(),
+            app: app.to_string(),
+            host: "aks-node-04".to_string(),
+            statement: stmt.to_string(),
+            info,
+            affected_rows: (action == "BCM" && stmt.starts_with("UPDATE")).then_some(1),
+            response_rows: response,
+        });
+    }
+    if errors_only {
+        events.retain(|e| !e.succeeded);
+    }
+    EventsPage {
+        events,
+        truncated: false,
+    }
+}
+
+/// Synthesized `sys.database_principals` rows (the ⚠ live-T-SQL user list).
+/// Includes two users the audit demo data never mentions — the "exists but
+/// silent" deletion candidates the merge is for.
+pub fn sql_db_users() -> Vec<crate::azure::sql_tds::DbUser> {
+    use crate::azure::sql_tds::DbUser;
+    let now = Utc::now();
+    let user = |name: &str, kind: &str, auth: &str, days_old: i64| DbUser {
+        name: name.to_string(),
+        kind: kind.to_string(),
+        auth: auth.to_string(),
+        created: Some(now - Duration::days(days_old)),
+    };
+    vec![
+        user("app-orders", "EXTERNAL_USER", "EXTERNAL", 700),
+        user("app-inventory", "EXTERNAL_USER", "EXTERNAL", 650),
+        user("dana@contoso.com", "EXTERNAL_USER", "EXTERNAL", 400),
+        user("svc_reporting", "SQL_USER", "DATABASE", 900),
+        user("legacy_readonly", "SQL_USER", "DATABASE", 1400),
+        // Never seen in the audit demo data — the point of the merge.
+        user("temp_migration_user", "SQL_USER", "DATABASE", 800),
+        user("qa-team@contoso.com", "EXTERNAL_GROUP", "EXTERNAL", 500),
+    ]
+}
+
+/// Synthesized `sys.dm_exec_sessions` rows (the ⚠ live-T-SQL sessions view):
+/// a busy app pool, a human editor idling, and a long-lived stale connection.
+pub fn sql_sessions() -> Vec<crate::azure::sql_tds::DbSession> {
+    use crate::azure::sql_tds::DbSession;
+    let now = Utc::now();
+    let session = |id: i16,
+                   login: &str,
+                   status: &str,
+                   login_hours_ago: i64,
+                   idle_minutes: i64,
+                   host: &str,
+                   program: &str,
+                   ip: &str| DbSession {
+        id,
+        login: login.to_string(),
+        status: status.to_string(),
+        login_time: Some(now - Duration::hours(login_hours_ago)),
+        idle_since: Some(now - Duration::minutes(idle_minutes)),
+        host: host.to_string(),
+        program: program.to_string(),
+        ip: ip.to_string(),
+        database: "orders".to_string(),
+    };
+    vec![
+        session(
+            51,
+            "app-orders",
+            "running",
+            30,
+            0,
+            "aks-node-04",
+            "orders-api",
+            "10.0.1.12",
+        ),
+        session(
+            52,
+            "app-orders",
+            "sleeping",
+            30,
+            4,
+            "aks-node-04",
+            "orders-api",
+            "10.0.1.12",
+        ),
+        session(
+            53,
+            "app-orders",
+            "sleeping",
+            8,
+            11,
+            "aks-node-07",
+            "orders-api",
+            "10.0.1.19",
+        ),
+        session(
+            61,
+            "dana@contoso.com",
+            "sleeping",
+            2,
+            47,
+            "LAPTOP-DANA",
+            "Azure Data Studio",
+            "203.0.113.7",
+        ),
+        // Authenticated weeks ago, idle for days: exactly the connection the
+        // audit trail can't show — dropping this user breaks it silently.
+        session(
+            17,
+            "legacy_readonly",
+            "sleeping",
+            500,
+            4300,
+            "vm-legacy-batch",
+            "SQLCMD",
+            "10.0.4.30",
+        ),
+    ]
 }
 
 /// Synthesized utilization metrics for a demo SQL pool / database, shaped

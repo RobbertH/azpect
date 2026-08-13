@@ -1109,6 +1109,106 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::SqlAuditPrincipalsLoaded { generation, result } => {
+                // Same stale-scope rule as `KeyVaultAccessLoaded`.
+                if generation == state.sql.audit.generation {
+                    state.sql.audit.pending = false;
+                    match result {
+                        Ok(page) => {
+                            // GUID-shaped principals (client ids, S-1-9-3
+                            // SIDs) resolve to directory names via Graph —
+                            // best-effort, cached, deduped like the Detail
+                            // view's author resolution.
+                            for p in &page.principals {
+                                let Some(id) =
+                                    crate::azure::sql_audit::graph_candidate(&p.principal)
+                                else {
+                                    continue;
+                                };
+                                if state.principals.by_id.contains_key(&id)
+                                    || state.principals.failed.contains(&id)
+                                    || state.principals.pending.contains(&id)
+                                {
+                                    continue;
+                                }
+                                state.principals.pending.insert(id.clone());
+                                spawn_resolve_principal(auth.clone(), id, tx.clone());
+                            }
+                            state.sql.audit.error = None;
+                            state.sql.audit.principals_truncated = page.truncated;
+                            state.sql.audit.principals = Some(page.principals);
+                            state.sql.audit.cursor = 0;
+                            state.sql.audit.view_top.set(0);
+                        }
+                        Err(e) => state.sql.audit.error = Some(e),
+                    }
+                }
+            }
+            AppEvent::SqlAuditEventsLoaded {
+                generation,
+                append,
+                result,
+            } => {
+                if generation == state.sql.audit.events_generation {
+                    state.sql.audit.events_pending = false;
+                    state.sql.audit.events_loading_more = false;
+                    match result {
+                        Ok(page) => {
+                            state.sql.audit.events_error = None;
+                            state.sql.audit.events_truncated = page.truncated;
+                            if append {
+                                // Older-than page: extend, keep the cursor
+                                // where the user was scrolling.
+                                state
+                                    .sql
+                                    .audit
+                                    .events
+                                    .get_or_insert_with(Vec::new)
+                                    .extend(page.events);
+                            } else {
+                                state.sql.audit.events = Some(page.events);
+                                state.sql.audit.events_cursor = 0;
+                                state.sql.audit.events_view_top.set(0);
+                            }
+                        }
+                        Err(e) => state.sql.audit.events_error = Some(e),
+                    }
+                }
+            }
+            AppEvent::SqlAuditDbUsersLoaded { generation, result } => {
+                if generation == state.sql.audit.db_users_generation {
+                    state.sql.audit.db_users_pending = false;
+                    match result {
+                        Ok(users) => {
+                            state.sql.audit.db_users_note = None;
+                            state.sql.audit.db_users = Some(users);
+                        }
+                        // Best-effort: a T-SQL failure demotes to a note; the
+                        // audit roll-up itself is unaffected.
+                        Err(e) => {
+                            state.sql.audit.db_users = None;
+                            // First line only — the friendly errors are
+                            // multi-line and the note is a single row.
+                            let short = e.lines().next().unwrap_or(&e).to_string();
+                            state.sql.audit.db_users_note = Some(short);
+                        }
+                    }
+                }
+            }
+            AppEvent::SqlSessionsLoaded { generation, result } => {
+                if generation == state.sql.sessions.generation {
+                    state.sql.sessions.pending = false;
+                    match result {
+                        Ok(rows) => {
+                            state.sql.sessions.error = None;
+                            state.sql.sessions.rows = Some(rows);
+                            state.sql.sessions.cursor = 0;
+                            state.sql.sessions.view_top.set(0);
+                        }
+                        Err(e) => state.sql.sessions.error = Some(e),
+                    }
+                }
+            }
             AppEvent::KeyVaultSecretValueLoaded {
                 vault_id,
                 name,
@@ -1419,6 +1519,15 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
             .handle_event(&CtEvent::Key(key));
         return true;
     }
+    // The SQL audit views' custom window input (`t`), same shape.
+    if should_forward_to_sql_audit_window_input(state, key) {
+        state
+            .sql
+            .audit
+            .window_input
+            .handle_event(&CtEvent::Key(key));
+        return true;
+    }
     if should_forward_to_blobs_filter(state, key) {
         state.storage.blobs_filter.handle_event(&CtEvent::Key(key));
         state.storage.blobs_cursor = 0;
@@ -1488,6 +1597,15 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
     if should_forward_to_sql_filter(state, key) {
         state.sql.filter.handle_event(&CtEvent::Key(key));
         state.sql.cursor = 0;
+        return true;
+    }
+    if should_forward_to_sql_audit_filter(state, key) {
+        state
+            .sql
+            .audit
+            .principals_filter
+            .handle_event(&CtEvent::Key(key));
+        state.sql.audit.cursor = 0;
         return true;
     }
     if should_forward_to_key_vaults_filter(state, key) {
@@ -1841,6 +1959,20 @@ fn should_forward_to_sql_filter(state: &AppState, key: crossterm::event::KeyEven
         )
 }
 
+fn should_forward_to_sql_audit_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::SqlAuditPrincipals
+        && state.sql.audit.principals_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 fn should_forward_to_cosmos_accounts_filter(
     state: &AppState,
     key: crossterm::event::KeyEvent,
@@ -1936,6 +2068,17 @@ fn should_forward_to_access_window_input(
 ) -> bool {
     state.view == View::KeyVaultAccessLogs
         && state.key_vault.access_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
+/// Mirror of `should_forward_to_access_window_input` for the SQL audit views'
+/// custom window input.
+fn should_forward_to_sql_audit_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    matches!(state.view, View::SqlAuditPrincipals | View::SqlAuditEvents)
+        && state.sql.audit.window_input_active
         && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
 }
 
@@ -2187,7 +2330,10 @@ fn decide_action(
             && state.service_bus.subscriptions_filter_active)
         || (state.view == View::ApimApis && state.apim.apis_filter_active)
         || (state.view == View::ApimOperations && state.apim.operations_filter_active)
-        || (state.view == View::SqlResources && state.sql.filter_active);
+        || (state.view == View::SqlResources && state.sql.filter_active)
+        || (matches!(state.view, View::SqlAuditPrincipals | View::SqlAuditEvents)
+            && state.sql.audit.window_input_active)
+        || (state.view == View::SqlAuditPrincipals && state.sql.audit.principals_filter_active);
 
     // First-key-of-chord? Stash and wait.
     if is_chord_starter(key, input_focused) {
@@ -2258,6 +2404,10 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         }
         View::SqlResources => crate::ui::views::sql_resources::handle(action, state),
         View::SqlDetail => crate::ui::views::sql_detail::handle(action, state),
+        View::SqlAuditPrincipals | View::SqlAuditEvents | View::SqlAuditEventDetail => {
+            crate::ui::views::sql_audit::handle(action, state)
+        }
+        View::SqlSessions => crate::ui::views::sql_sessions::handle(action, state),
         View::Help => crate::ui::views::help::handle(action, state),
     }
 }
@@ -2762,6 +2912,16 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected
             .as_ref()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        // The audit views' portal counterpart is the server's Auditing blade;
+        // the pinned resource's overview is the stable entry point.
+        View::SqlAuditPrincipals
+        | View::SqlAuditEvents
+        | View::SqlAuditEventDetail
+        | View::SqlSessions => state
+            .sql
+            .selected
+            .as_ref()
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         View::Help => None,
     }
 }
@@ -2977,6 +3137,10 @@ fn yank_target(state: &AppState) -> Option<String> {
             .get(state.sql.cursor)
             .map(|r| r.id.clone()),
         View::SqlDetail => state.sql.selected.as_ref().map(|r| r.id.clone()),
+        View::SqlAuditPrincipals | View::SqlAuditEvents | View::SqlAuditEventDetail => {
+            crate::ui::views::sql_audit::yank_text(state)
+        }
+        View::SqlSessions => crate::ui::views::sql_sessions::yank_text(state),
         View::Help => None,
     }
 }
@@ -3142,6 +3306,15 @@ fn semantic_parent(view: View) -> Option<View> {
         View::ServiceBusSubscriptions => Some(View::ServiceBusEntities),
         View::SqlResources => Some(View::Subscriptions),
         View::SqlDetail => Some(View::SqlResources),
+        // The principals view's own Back handler consumes Esc first (it
+        // returns to the recorded origin — list or detail); this is the
+        // static fallback for the breadcrumb tree.
+        View::SqlAuditPrincipals => Some(View::SqlResources),
+        View::SqlAuditEvents => Some(View::SqlAuditPrincipals),
+        View::SqlAuditEventDetail => Some(View::SqlAuditEvents),
+        // The view's own Back handler returns to the recorded origin; this is
+        // the static breadcrumb fallback.
+        View::SqlSessions => Some(View::SqlResources),
     }
 }
 
@@ -3165,6 +3338,8 @@ fn after_action(
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
+        | Action::SetWindowMonth
+        | Action::SetWindowYear
         | Action::ToggleExcludeSelf => {
             // Chart windows force too: the view handler dropped the cached
             // series for the new range, and a fetch for the *old* range still
@@ -3181,6 +3356,8 @@ fn after_action(
                     | View::Detail
                     | View::SqlDetail
                     | View::KeyVaultAccessLogs
+                    | View::SqlAuditPrincipals
+                    | View::SqlAuditEvents
             );
             kick_off_loads_for_view(state, auth, tx, force);
         }
@@ -3194,6 +3371,29 @@ fn after_action(
         {
             kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
+        // Same custom-window-commit spawn for the SQL audit views (Enter on
+        // the principals view is otherwise the drill-in, handled by the
+        // generic OpenSelected arm below).
+        Action::OpenSelected
+            if state.view == View::SqlAuditPrincipals
+                && !state.sql.audit.window_input_active
+                && state.sql.audit.principals.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        }
+        Action::OpenSelected
+            if state.view == View::SqlAuditEvents
+                && !state.sql.audit.window_input_active
+                && state.sql.audit.events.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        }
+        // Esc from the events view lands on the principals view, whose buffer
+        // may have been invalidated by a window change made *inside* events —
+        // kick a (non-force, so a no-op when cached) reload for it.
+        Action::Back if state.view == View::SqlAuditPrincipals => {
+            kick_off_loads_for_view(state, auth, tx, /* force */ false);
+        }
         // Opening logs always starts a fresh newest-end fetch; force past the
         // global `logs.loading` debounce so switching to resource B while
         // resource A's fetch is still in flight doesn't leave B's view empty
@@ -3205,6 +3405,7 @@ fn after_action(
         // appropriate to whatever the new view is.
         Action::OpenSelected
         | Action::OpenLogs
+        | Action::OpenSessions
         | Action::OpenStorage
         | Action::OpenRegistries
         // NextPanel / PrevPanel toggle a sub-kind in place (Key Vault
@@ -3217,6 +3418,48 @@ fn after_action(
         }
         _ => {}
     }
+
+    // SQL audit events: the view handler requests an older-than page by
+    // setting this flag (view handlers can't spawn tasks) — drain it here,
+    // whatever action raised it.
+    if state.sql.audit.events_fetch_older {
+        state.sql.audit.events_fetch_older = false;
+        fetch_older_sql_audit_events(state, auth, tx);
+    }
+}
+
+/// Spawn the *older-than* audit-events page for the scroll-past-bottom fetch:
+/// same scope as the loaded buffer, `before` pinned to its oldest row. Runs
+/// under the current events generation (no bump — it extends, not replaces,
+/// the buffer; any scope change bumps and orphans it).
+fn fetch_older_sql_audit_events(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let audit = &state.sql.audit;
+    if audit.events_pending || audit.events_loading_more || !audit.events_truncated {
+        return;
+    }
+    let (Some(target), Some(principal)) = (audit.target.clone(), audit.selected_principal.clone())
+    else {
+        return;
+    };
+    let Some(oldest) = audit.events.as_ref().and_then(|e| e.last()).map(|e| e.ts) else {
+        return;
+    };
+    state.sql.audit.events_loading_more = true;
+    spawn_load_sql_audit_events(
+        auth.clone(),
+        target,
+        state.sql.audit.window.clone(),
+        principal,
+        state.sql.audit.events_errors_only,
+        Some(oldest),
+        /* append */ true,
+        state.sql.audit.events_generation,
+        tx.clone(),
+    );
 }
 
 /// Look at `state.view` and the loading flags, and spawn whichever loaders are
@@ -3740,6 +3983,111 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::SqlAuditPrincipals => {
+            if let Some(target) = state.sql.audit.target.clone() {
+                let cached = state.sql.audit.principals.is_some();
+                let in_flight = state.sql.audit.pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.sql.audit.principals = None;
+                        state.sql.audit.error = None;
+                    }
+                    // Every spawn owns the buffer — see the KV access arm.
+                    state.sql.audit.generation = state.sql.audit.generation.wrapping_add(1);
+                    state.sql.audit.pending = true;
+                    spawn_load_sql_audit_principals(
+                        auth.clone(),
+                        target.clone(),
+                        state.sql.audit.window.clone(),
+                        state.sql.audit.generation,
+                        tx.clone(),
+                    );
+                }
+                // The (⚠ live T-SQL) database-users merge rides along when the
+                // target is a single database. Not window-scoped, so it only
+                // fetches once per entry (or on force). Config-off leaves a
+                // note instead of a socket.
+                if let Some(database) = target.database.clone() {
+                    if !state.config.sql_live_queries {
+                        if state.sql.audit.db_users_note.is_none() {
+                            state.sql.audit.db_users_note =
+                                Some("live T-SQL disabled (sql_live_queries = false)".to_string());
+                        }
+                    } else {
+                        let u_cached = state.sql.audit.db_users.is_some()
+                            || state.sql.audit.db_users_note.is_some();
+                        let u_in_flight = state.sql.audit.db_users_pending;
+                        if force || (!u_cached && !u_in_flight) {
+                            if force {
+                                state.sql.audit.db_users = None;
+                                state.sql.audit.db_users_note = None;
+                            }
+                            state.sql.audit.db_users_generation =
+                                state.sql.audit.db_users_generation.wrapping_add(1);
+                            state.sql.audit.db_users_pending = true;
+                            spawn_load_sql_audit_db_users(
+                                auth.clone(),
+                                target.server.clone(),
+                                database,
+                                state.config.sql_live_queries,
+                                state.sql.audit.db_users_generation,
+                                tx.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        View::SqlSessions => {
+            if let Some(target) = state.sql.sessions.target.clone() {
+                let cached = state.sql.sessions.rows.is_some();
+                let in_flight = state.sql.sessions.pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.sql.sessions.rows = None;
+                        state.sql.sessions.error = None;
+                    }
+                    state.sql.sessions.generation = state.sql.sessions.generation.wrapping_add(1);
+                    state.sql.sessions.pending = true;
+                    spawn_load_sql_sessions(
+                        auth.clone(),
+                        target,
+                        state.config.sql_live_queries,
+                        state.sql.sessions.generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
+        View::SqlAuditEvents => {
+            if let (Some(target), Some(principal)) = (
+                state.sql.audit.target.clone(),
+                state.sql.audit.selected_principal.clone(),
+            ) {
+                let cached = state.sql.audit.events.is_some();
+                let in_flight = state.sql.audit.events_pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.sql.audit.events = None;
+                        state.sql.audit.events_error = None;
+                    }
+                    state.sql.audit.events_generation =
+                        state.sql.audit.events_generation.wrapping_add(1);
+                    state.sql.audit.events_pending = true;
+                    spawn_load_sql_audit_events(
+                        auth.clone(),
+                        target,
+                        state.sql.audit.window.clone(),
+                        principal,
+                        state.sql.audit.events_errors_only,
+                        /* before */ None,
+                        /* append */ false,
+                        state.sql.audit.events_generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         View::CosmosDatabases => {
             if let Some(account) = state.cosmos.selected_account.clone() {
                 let cached = state.cosmos.databases.contains_key(&account.id);
@@ -3914,7 +4262,8 @@ fn kick_off_loads_for_view(
             }
         }
         // LogDetail is a pure-view-over-state screen; nothing to load.
-        View::LogDetail | View::Help => {}
+        // Leaves rendered entirely from already-loaded state — nothing to kick.
+        View::LogDetail | View::SqlAuditEventDetail | View::Help => {}
     }
 }
 
@@ -4093,6 +4442,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         }
         View::SqlResources => crate::ui::views::sql_resources::render(f, view_area, state, theme),
         View::SqlDetail => crate::ui::views::sql_detail::render(f, view_area, state, theme),
+        View::SqlAuditPrincipals | View::SqlAuditEvents | View::SqlAuditEventDetail => {
+            crate::ui::views::sql_audit::render(f, view_area, state, theme)
+        }
+        View::SqlSessions => crate::ui::views::sql_sessions::render(f, view_area, state, theme),
         View::Help => crate::ui::views::help::render(f, view_area, state, theme),
     }
 
@@ -5805,6 +6158,131 @@ fn spawn_load_key_vault_access(
         .await
         .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::KeyVaultAccessLoaded { generation, result });
+    });
+}
+
+/// Fetch the SQL audit principal roll-up. `generation` is the query-scope
+/// token the result is validated against on landing (see
+/// `AppEvent::SqlAuditPrincipalsLoaded`).
+fn spawn_load_sql_audit_principals(
+    auth: AzureAuth,
+    target: crate::azure::sql_audit::AuditTarget,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlAuditPrincipalsLoaded {
+            generation,
+            result: Ok(crate::azure::demo::sql_audit_principals(&window, &target)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql_audit::fetch_principals(&auth, &target, &window)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlAuditPrincipalsLoaded { generation, result });
+    });
+}
+
+/// Fetch one page of audit events for the pinned principal. `before` +
+/// `append` carry the scroll-past-bottom pagination (see
+/// `fetch_older_sql_audit_events`).
+#[allow(clippy::too_many_arguments)]
+fn spawn_load_sql_audit_events(
+    auth: AzureAuth,
+    target: crate::azure::sql_audit::AuditTarget,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    principal: String,
+    errors_only: bool,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    append: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlAuditEventsLoaded {
+            generation,
+            append,
+            result: Ok(crate::azure::demo::sql_audit_events(
+                &window,
+                &principal,
+                errors_only,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql_audit::fetch_events(
+            &auth,
+            &target,
+            &window,
+            &principal,
+            errors_only,
+            before,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlAuditEventsLoaded {
+            generation,
+            append,
+            result,
+        });
+    });
+}
+
+/// Fetch the audited database's user list (⚠ live T-SQL) for the roll-up's
+/// silent-users merge. `enabled` is the `sql_live_queries` config flag —
+/// `sql_tds` fails closed on it before opening any socket.
+fn spawn_load_sql_audit_db_users(
+    auth: AzureAuth,
+    server: String,
+    database: String,
+    enabled: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlAuditDbUsersLoaded {
+            generation,
+            result: Ok(crate::azure::demo::sql_db_users()),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql_tds::fetch_db_users(&auth, &server, &database, enabled)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlAuditDbUsersLoaded { generation, result });
+    });
+}
+
+/// Query open sessions on the pinned SQL target (⚠ live T-SQL).
+fn spawn_load_sql_sessions(
+    auth: AzureAuth,
+    target: crate::azure::sql_audit::AuditTarget,
+    enabled: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::SqlSessionsLoaded {
+            generation,
+            result: Ok(crate::azure::demo::sql_sessions()),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::sql_tds::fetch_sessions(
+            &auth,
+            &target.server,
+            target.database.as_deref(),
+            enabled,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::SqlSessionsLoaded { generation, result });
     });
 }
 

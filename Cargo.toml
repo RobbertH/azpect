@@ -38,6 +38,8 @@ nucleo-matcher = "0.3"
 futures = "0.3"
 open = "5"
 quick-xml = { version = "0.36", features = ["serialize"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
 
 # Unix-only: temporarily ignore terminal job-control signals while a shell-out
 # child (`az containerapp exec`) owns the terminal, so Ctrl-C interrupts the

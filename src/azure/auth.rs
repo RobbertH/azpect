@@ -57,6 +57,14 @@ pub const SCOPE_COSMOS: &str = "https://cosmos.azure.com/.default";
 /// one of the older services that uses a host-form audience.
 pub const SCOPE_KEY_VAULT: &str = "https://vault.azure.net/.default";
 
+/// OAuth scope for the Azure SQL **database engine** (`database.windows.net`) —
+/// the TDS data plane, not REST. Used only by [`crate::azure::sql_tds`] for
+/// the explicitly-flagged live T-SQL features (open sessions, database-user
+/// listing), which the user can disable wholesale via `sql_live_queries` in
+/// config.toml. The signed-in identity must be a user in the target database;
+/// ARM `Reader` buys nothing here.
+pub const SCOPE_SQL: &str = "https://database.windows.net/.default";
+
 /// OAuth scope for Microsoft Graph (`graph.microsoft.com`). Used best-effort to
 /// resolve `systemData` author object-ids (service principals / managed
 /// identities) to display names. The signed-in identity needs directory read

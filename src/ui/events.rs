@@ -291,6 +291,38 @@ pub enum AppEvent {
         generation: u64,
         result: Result<crate::azure::key_vault_logs::AccessPage, String>,
     },
+    /// Background load completion: the SQL audit principal roll-up.
+    /// `generation` mirrors `SqlAuditState::generation` — a page fetched under
+    /// an older query scope (window / target) is discarded on landing.
+    SqlAuditPrincipalsLoaded {
+        generation: u64,
+        result: Result<crate::azure::sql_audit::PrincipalsPage, String>,
+    },
+    /// Background load completion: one page of audit events for the pinned
+    /// principal. Same generation guard as `SqlAuditPrincipalsLoaded`.
+    /// `append` distinguishes the initial / refresh fetch (`false` — replace
+    /// the buffer) from a scroll-past-bottom *older-than* page (`true` — push
+    /// onto the end), mirroring `LogsLoaded`.
+    SqlAuditEventsLoaded {
+        generation: u64,
+        append: bool,
+        result: Result<crate::azure::sql_audit::EventsPage, String>,
+    },
+    /// Background load completion: the audited database's user list (⚠ live
+    /// T-SQL, `sys.database_principals`) for the roll-up's silent-users
+    /// merge. `Err` becomes a note, never a fatal error. Guarded by
+    /// `SqlAuditState::generation`.
+    SqlAuditDbUsersLoaded {
+        generation: u64,
+        result: Result<Vec<crate::azure::sql_tds::DbUser>, String>,
+    },
+    /// Background load completion: open sessions on the pinned SQL target
+    /// (⚠ live T-SQL, `sys.dm_exec_sessions`). Guarded by
+    /// `SqlSessionsState::generation`.
+    SqlSessionsLoaded {
+        generation: u64,
+        result: Result<Vec<crate::azure::sql_tds::DbSession>, String>,
+    },
     /// Background load completion: list of Service Bus namespaces for the
     /// current subscription scope. Resource Graph control-plane call. `scope` —
     /// see [`AppEvent::SubscriptionsLoaded`].
@@ -367,6 +399,17 @@ pub enum Action {
     /// Key Vault access-logs view: focus the free-form window input so the
     /// user can type a custom range like "6m" or "1y".
     SetCustomWindow,
+    /// 30-day window (`3`) — audit views only; their default lookback, one
+    /// key-press away after narrowing to 1h/1d/7d.
+    SetWindowMonth,
+    /// 1-year window (`9`) — audit views only. The digit ladder's top rung
+    /// (`y` itself is yank); the practical max, since Log Analytics retention
+    /// rarely reaches further.
+    SetWindowYear,
+    /// Open the SQL open-sessions view (`u` in the SQL views). ⚠ Backed by
+    /// live T-SQL over TDS; the handlers refuse when `sql_live_queries` is
+    /// off in config.
+    OpenSessions,
     SwitchSubscription,
     /// Cycle the logs view's client-side source filter through the distinct
     /// `LogLine::source` values in the cached buffer (all → A → B → … → all).
@@ -514,11 +557,15 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // action keeps `after_action` from treating it like a panel switch and
         // refetching the log buffer on every keystroke.
         KeyCode::Tab => match view {
-            View::Logs | View::KeyVaultAccessLogs => Action::CycleSourceFilter,
+            View::Logs | View::KeyVaultAccessLogs | View::SqlAuditEvents => {
+                Action::CycleSourceFilter
+            }
             _ => Action::NextPanel,
         },
         KeyCode::BackTab => match view {
-            View::Logs | View::KeyVaultAccessLogs => Action::CycleSourceFilterBack,
+            View::Logs | View::KeyVaultAccessLogs | View::SqlAuditEvents => {
+                Action::CycleSourceFilterBack
+            }
             _ => Action::PrevPanel,
         },
 
@@ -533,9 +580,14 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             // Horizontal nav in views that use it; elsewhere `l` opens logs.
             // (In the KV access view it's inert — pressing `l` again inside
             // the log you just opened shouldn't re-enter it.)
-            View::Logs | View::LogDetail | View::EnvVars | View::KeyVaultAccessLogs => {
-                Action::MoveRight
-            }
+            View::Logs
+            | View::LogDetail
+            | View::EnvVars
+            | View::KeyVaultAccessLogs
+            | View::SqlAuditPrincipals
+            | View::SqlAuditEvents
+            | View::SqlAuditEventDetail
+            | View::SqlSessions => Action::MoveRight,
             _ => Action::OpenLogs,
         },
         KeyCode::Char('L') => Action::OpenLogs,
@@ -558,7 +610,9 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             _ => Action::Noop,
         },
         KeyCode::Char('t') => match view {
-            View::KeyVaultAccessLogs => Action::SetCustomWindow,
+            View::KeyVaultAccessLogs | View::SqlAuditPrincipals | View::SqlAuditEvents => {
+                Action::SetCustomWindow
+            }
             _ => Action::Noop,
         },
         KeyCode::Char('x') => Action::DecodeSecret,
@@ -581,6 +635,23 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         KeyCode::Char('0') => Action::SetWindowHour,
         KeyCode::Char('1') => Action::SetWindowDay,
         KeyCode::Char('7') => Action::SetWindowWeek,
+        // `3` → 30d and `9` → 1y, only where that much lookback means
+        // something (the audit views); inert elsewhere. `9` is the ladder's
+        // top rung — `y` itself is taken by yank.
+        KeyCode::Char('3') => match view {
+            View::SqlAuditPrincipals | View::SqlAuditEvents => Action::SetWindowMonth,
+            _ => Action::Noop,
+        },
+        KeyCode::Char('9') => match view {
+            View::SqlAuditPrincipals | View::SqlAuditEvents => Action::SetWindowYear,
+            _ => Action::Noop,
+        },
+        // `u` → open sessions (live T-SQL ⚠), scoped to the SQL views so the
+        // key stays free elsewhere.
+        KeyCode::Char('u') => match view {
+            View::SqlResources | View::SqlDetail | View::SqlAuditPrincipals => Action::OpenSessions,
+            _ => Action::Noop,
+        },
         KeyCode::Char('w') => Action::ToggleWrap,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char(':') => Action::StartCommand,

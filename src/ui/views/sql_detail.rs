@@ -17,11 +17,11 @@ use crate::azure::health::find;
 use crate::azure::metrics::{MetricKind, MetricSeries, TimeRange};
 use crate::azure::sql::SqlResource;
 use crate::ui::events::Action;
-use crate::ui::state::AppState;
+use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "0 1h  1 1d  7 7d  r refresh  Esc back  o portal  y yank id  ? help  q quit";
+    "0 1h  1 1d  7 7d  l audit log  u sessions ⚠  r refresh  Esc back  o portal  y yank id  ? help  q quit";
 
 /// The utilization rows, in render order: `(kind, label)`. Labels match what
 /// [`crate::azure::sql`] stamps on each `MetricSeries`.
@@ -221,6 +221,24 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::SetWindowHour => set_window(state, TimeRange::Hour),
         Action::SetWindowDay => set_window(state, TimeRange::Day),
         Action::SetWindowWeek => set_window(state, TimeRange::Week),
+        Action::OpenLogs => {
+            // `l` on the pinned pool / database: its audit-log principal
+            // roll-up (same entry as `l` on the list row).
+            if let Some(resource) = state.sql.selected.clone() {
+                match crate::azure::sql_audit::AuditTarget::from_resource(&resource) {
+                    Some(target) => {
+                        state.sql.audit.enter(target, View::SqlDetail);
+                        state.view = View::SqlAuditPrincipals;
+                    }
+                    None => state.set_status("can't derive the audit scope for this resource"),
+                }
+            }
+            true
+        }
+        Action::OpenSessions => {
+            super::sql_resources::open_sessions_view(state, View::SqlDetail);
+            true
+        }
         _ => false,
     }
 }
