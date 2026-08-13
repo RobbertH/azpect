@@ -155,7 +155,9 @@ impl MetricSeries {
 /// Monitor REST queries (some resource types need `$filter` for dimensions).
 pub fn metric_names(kind: ResourceKind) -> &'static [(MetricKind, &'static str, &'static str)] {
     match kind {
-        ResourceKind::FunctionApp => &[
+        // Function Apps and Web Apps share the Microsoft.Web/sites metric
+        // namespace, so one mapping covers both.
+        ResourceKind::FunctionApp | ResourceKind::WebApp => &[
             (MetricKind::Errors, "Http5xx", "Total"),
             (MetricKind::ClientErrors, "Http4xx", "Total"),
             (MetricKind::Traffic, "Requests", "Total"),
@@ -371,9 +373,9 @@ async fn fetch_core(
                     // App Gateway exposes `HttpStatusGroup` as `1xx`/`2xx`/.../`5xx`
                     // on the `ResponseStatus` metric.
                     ResourceKind::AppGateway => Some(format!("HttpStatusGroup eq '{category}'")),
-                    // Function Apps have dedicated Http5xx / Http4xx metrics; no
-                    // dimension filter needed.
-                    ResourceKind::FunctionApp => None,
+                    // Microsoft.Web/sites has dedicated Http5xx / Http4xx
+                    // metrics; no dimension filter needed.
+                    ResourceKind::FunctionApp | ResourceKind::WebApp => None,
                 }
             }
             _ => None,

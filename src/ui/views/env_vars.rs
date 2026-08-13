@@ -110,12 +110,13 @@ fn render_body(
     let Some(vars) = env_vars_for(state, id, kind) else {
         // Not loaded. Function App settings can be permission-gated; Container
         // App env vars ride on the overview fetch and only ever appear loading.
-        let msg =
-            if kind == ResourceKind::FunctionApp && state.func_settings.failures.contains_key(id) {
-                "env vars unavailable — the signed-in identity needs config/list permission."
-            } else {
-                "loading environment variables…"
-            };
+        let msg = if matches!(kind, ResourceKind::FunctionApp | ResourceKind::WebApp)
+            && state.func_settings.failures.contains_key(id)
+        {
+            "env vars unavailable — the signed-in identity needs config/list permission."
+        } else {
+            "loading environment variables…"
+        };
         frame.render_widget(muted(msg), area);
         return;
     };

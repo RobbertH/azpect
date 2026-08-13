@@ -45,7 +45,10 @@ pub struct LogLine {
 pub fn supports_logs(kind: ResourceKind) -> bool {
     matches!(
         kind,
-        ResourceKind::FunctionApp | ResourceKind::ContainerApp | ResourceKind::Apim
+        ResourceKind::FunctionApp
+            | ResourceKind::WebApp
+            | ResourceKind::ContainerApp
+            | ResourceKind::Apim
     )
 }
 
@@ -61,7 +64,16 @@ pub fn supports_logs(kind: ResourceKind) -> bool {
 /// that; here we only emit the name-filtered query text.
 pub fn portal_query(resource: &Resource, lines: &[LogLine]) -> Option<String> {
     match resource.kind {
-        ResourceKind::FunctionApp => Some(function_app_portal_query(lines)),
+        ResourceKind::FunctionApp => Some(site_portal_query(
+            lines,
+            &FUNCTION_APP_LOG_TABLES,
+            "FunctionAppLogs",
+        )),
+        ResourceKind::WebApp => Some(site_portal_query(
+            lines,
+            &WEB_APP_LOG_TABLES,
+            "AppServiceConsoleLogs",
+        )),
         // Console logs land on two possible table/column shapes; filter to this
         // one app by name (the env forwards every app's logs to one workspace).
         ResourceKind::ContainerApp => Some(format!(
@@ -91,22 +103,37 @@ const FUNCTION_APP_LOG_TABLES: [&str; 4] = [
     "AppRequests",
 ];
 
-/// Build the Function App portal query, unioning **only the tables that actually
-/// produced the rows on screen**. A diagnostic-settings-only app ships solely
-/// `FunctionAppLogs`, so referencing the App Insights tables it lacks makes the
-/// portal's fuzzy union warn ("operand ... does not refer to any known table")
-/// even though data returns — restricting to observed tables avoids that.
-/// Falls back to `FunctionAppLogs` (the standard table) when nothing is cached.
-fn function_app_portal_query(lines: &[LogLine]) -> String {
+/// Tables a Web App's logs can come from, in display-preference order. The
+/// `AppService*` tables are the diagnostic-settings categories (console output,
+/// application logging, HTTP access log); the AI tables mirror the Function
+/// App set. Mirrors the sources [`parse_web_app_row`] stamps onto
+/// `LogLine::source`.
+const WEB_APP_LOG_TABLES: [&str; 6] = [
+    "AppServiceConsoleLogs",
+    "AppServiceAppLogs",
+    "AppServiceHTTPLogs",
+    "AppTraces",
+    "AppExceptions",
+    "AppRequests",
+];
+
+/// Build a Microsoft.Web/sites portal query, unioning **only the tables that
+/// actually produced the rows on screen**. A diagnostic-settings-only app ships
+/// solely its diagnostic tables, so referencing the App Insights tables it
+/// lacks makes the portal's fuzzy union warn ("operand ... does not refer to
+/// any known table") even though data returns — restricting to observed tables
+/// avoids that. Falls back to `fallback` (the kind's standard table) when
+/// nothing is cached.
+fn site_portal_query(lines: &[LogLine], known_tables: &[&'static str], fallback: &str) -> String {
     // `source` is the table, optionally suffixed `/{FunctionName}` for
     // FunctionAppLogs rows; take the part before the slash.
-    let present: Vec<&str> = FUNCTION_APP_LOG_TABLES
+    let present: Vec<&str> = known_tables
         .iter()
         .copied()
         .filter(|t| lines.iter().any(|l| l.source.split('/').next() == Some(t)))
         .collect();
     let tables = if present.is_empty() {
-        vec!["FunctionAppLogs"]
+        vec![fallback]
     } else {
         present
     };
@@ -148,6 +175,30 @@ pub const KQL_FUNCTION_APP_ERRORS_FILTER: &str = r#"
      or (column_ifexists("Success", true) == false and column_ifexists("itemType", "") == "request")
      or column_ifexists("itemType", "") == "exception"
      or column_ifexists("Level", "") in ("Error", "Critical")
+"#;
+
+/// Web App equivalent of [`KQL_FUNCTION_APP`]: the same workspace-based App
+/// Insights tables unioned with the App Service diagnostic-settings tables —
+/// `AppServiceConsoleLogs` (container/stdout output), `AppServiceAppLogs`
+/// (application logging), `AppServiceHTTPLogs` (access log). `isfuzzy=true`
+/// skips whichever of the six aren't provisioned; at least one must resolve or
+/// the query fails with SEM0529 (folded into the "configure diagnostic
+/// settings" hint like the other kinds).
+pub const KQL_WEB_APP: &str = r#"
+union isfuzzy=true AppTraces, AppExceptions, AppRequests, AppServiceConsoleLogs, AppServiceAppLogs, AppServiceHTTPLogs
+| order by TimeGenerated desc
+| take {limit}
+"#;
+
+/// The Function App clauses (AI severity / failed requests / exceptions, plus
+/// `Level` which also covers `AppServiceAppLogs` and `AppServiceConsoleLogs`)
+/// extended with `ScStatus >= 500` for `AppServiceHTTPLogs` rows.
+pub const KQL_WEB_APP_ERRORS_FILTER: &str = r#"
+| where column_ifexists("SeverityLevel", int(0)) >= 3
+     or (column_ifexists("Success", true) == false and column_ifexists("itemType", "") == "request")
+     or column_ifexists("itemType", "") == "exception"
+     or column_ifexists("Level", "") in ("Error", "Critical")
+     or column_ifexists("ScStatus", int(0)) >= 500
 "#;
 
 /// Container Apps land in one of two console-log tables depending on the
@@ -342,6 +393,7 @@ fn build_kql(
 ) -> anyhow::Result<String> {
     let (template, errors_filter) = match resource.kind {
         ResourceKind::FunctionApp => (KQL_FUNCTION_APP.to_string(), KQL_FUNCTION_APP_ERRORS_FILTER),
+        ResourceKind::WebApp => (KQL_WEB_APP.to_string(), KQL_WEB_APP_ERRORS_FILTER),
         ResourceKind::ContainerApp => (
             container_app_kql(&resource.name),
             KQL_CONTAINER_APP_ERRORS_FILTER,
@@ -472,6 +524,7 @@ fn parse_row(columns: &[&str], cells: &[serde_json::Value], kind: ResourceKind) 
 
     let (level, source, message) = match kind {
         ResourceKind::FunctionApp => parse_function_app_row(columns, cells),
+        ResourceKind::WebApp => parse_web_app_row(columns, cells),
         ResourceKind::ContainerApp => parse_container_app_row(columns, cells),
         ResourceKind::Apim => parse_apim_row(columns, cells),
         // Unreachable in practice — supports_logs() filters this out
@@ -625,6 +678,71 @@ fn first_non_empty(columns: &[&str], cells: &[serde_json::Value], names: &[&str]
         }
     }
     String::new()
+}
+
+/// Route a Web App row to the right extractor. The union mixes three schema
+/// families: the workspace-based App Insights tables (`itemType` set — same
+/// shape as Function Apps), `AppServiceHTTPLogs` (`ScStatus` + `CsMethod`
+/// access-log rows), and the text tables `AppServiceConsoleLogs` /
+/// `AppServiceAppLogs` (`Level` + `ResultDescription`).
+fn parse_web_app_row(columns: &[&str], cells: &[serde_json::Value]) -> (LogLevel, String, String) {
+    let item_type = cell(columns, cells, "itemType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !item_type.is_empty() {
+        // AI rows are schema-identical to the Function App ones, and the FA
+        // parser's diagnostic-table fallback can't trigger here (AI rows carry
+        // no App Service `Level` string alongside `itemType`).
+        return parse_function_app_row(columns, cells);
+    }
+
+    // HTTP access log: render as a request line like APIM gateway rows so the
+    // status lands in the level column.
+    if let Some(status) = cell_num(columns, cells, "ScStatus").filter(|c| *c >= 100) {
+        let level = match status {
+            c if c >= 500 => LogLevel::Error,
+            c if c >= 400 => LogLevel::Warn,
+            _ => LogLevel::Info,
+        };
+        let method = cell(columns, cells, "CsMethod")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let path = cell(columns, cells, "CsUriStem")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/");
+        let mut message = format!("{status} ");
+        if !method.is_empty() {
+            message.push_str(method);
+            message.push(' ');
+        }
+        message.push_str(path);
+        if let Some(ms) = cell_num(columns, cells, "TimeTaken") {
+            message.push_str(&format!("  ·  {ms}ms"));
+        }
+        return (level, "AppServiceHTTPLogs".to_string(), message);
+    }
+
+    // Console / application logging rows: `Level` is `Informational` /
+    // `Warning` / `Error` / `Verbose`; the text lives in `ResultDescription`.
+    let level = match cell(columns, cells, "Level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+    {
+        "Critical" | "Error" => LogLevel::Error,
+        "Warning" => LogLevel::Warn,
+        "Verbose" | "Trace" | "Debug" => LogLevel::Trace,
+        _ => LogLevel::Info,
+    };
+    // Log Analytics stamps the originating table into `Type`; fall back to the
+    // console table (the common case) when it's somehow absent.
+    let source = cell(columns, cells, "Type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("AppServiceConsoleLogs")
+        .to_string();
+    let message = first_non_empty(columns, cells, &["ResultDescription", "Message"]);
+    (level, source, message)
 }
 
 fn parse_container_app_row(
@@ -839,6 +957,95 @@ mod tests {
         let r = test_resource(ResourceKind::FunctionApp, "func");
         let q = portal_query(&r, &[]).unwrap();
         assert_eq!(q, "FunctionAppLogs\n| order by TimeGenerated desc");
+    }
+
+    #[test]
+    fn portal_query_web_app_unions_observed_tables_with_console_fallback() {
+        let r = test_resource(ResourceKind::WebApp, "web");
+        // Nothing cached → the standard console table.
+        let q = portal_query(&r, &[]).unwrap();
+        assert_eq!(q, "AppServiceConsoleLogs\n| order by TimeGenerated desc");
+
+        // Mixed diagnostic + AI rows → union of exactly those.
+        let lines = vec![fa_line("AppServiceHTTPLogs"), fa_line("AppExceptions")];
+        let q = portal_query(&r, &lines).unwrap();
+        assert_eq!(
+            q,
+            "union isfuzzy=true AppServiceHTTPLogs, AppExceptions\n| order by TimeGenerated desc"
+        );
+    }
+
+    #[test]
+    fn web_app_kql_unions_app_service_tables() {
+        let r = test_resource(ResourceKind::WebApp, "web");
+        let kql = build_kql(&r, false, None).unwrap();
+        assert!(kql.contains("AppServiceConsoleLogs"));
+        assert!(kql.contains("AppServiceAppLogs"));
+        assert!(kql.contains("AppServiceHTTPLogs"));
+        assert!(kql.contains("AppTraces"));
+        assert!(kql.contains(&format!("take {PAGE_SIZE}")));
+    }
+
+    #[test]
+    fn web_app_errors_filter_covers_http_5xx_and_precedes_order_by() {
+        let r = test_resource(ResourceKind::WebApp, "web");
+        let kql = build_kql(&r, true, None).unwrap();
+        let order_idx = kql.find("| order by").expect("order by present");
+        let filter_idx = kql
+            .find(r#"column_ifexists("ScStatus", int(0)) >= 500"#)
+            .expect("ScStatus clause present");
+        assert!(filter_idx < order_idx, "filter must come before order by");
+        assert!(kql.contains(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#));
+    }
+
+    #[test]
+    fn parses_web_app_rows_across_schema_families() {
+        let payload = json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "TimeGenerated", "type": "datetime" },
+                    { "name": "Type", "type": "string" },
+                    { "name": "CsMethod", "type": "string" },
+                    { "name": "CsUriStem", "type": "string" },
+                    { "name": "ScStatus", "type": "int" },
+                    { "name": "TimeTaken", "type": "int" },
+                    { "name": "Level", "type": "string" },
+                    { "name": "ResultDescription", "type": "string" },
+                    { "name": "itemType", "type": "string" },
+                    { "name": "OuterMessage", "type": "string" }
+                ],
+                "rows": [
+                    // HTTP access-log rows render as status-led request lines.
+                    ["2024-05-01T10:00:00Z", "AppServiceHTTPLogs", "GET", "/products/1", 503, 120, null, null, null, null],
+                    ["2024-05-01T10:00:01Z", "AppServiceHTTPLogs", "GET", "/products/2", 404, 3, null, null, null, null],
+                    ["2024-05-01T10:00:02Z", "AppServiceHTTPLogs", "GET", "/products/3", 200, 15, null, null, null, null],
+                    // Console rows carry the text in ResultDescription.
+                    ["2024-05-01T10:00:03Z", "AppServiceConsoleLogs", null, null, null, null, "Error", "unhandled exception in worker", null, null],
+                    ["2024-05-01T10:00:04Z", "AppServiceAppLogs", null, null, null, null, "Informational", "request handled", null, null],
+                    // AI rows route through the Function App extractor.
+                    ["2024-05-01T10:00:05Z", "AppExceptions", null, null, null, null, null, null, "exception", "boom"]
+                ]
+            }]
+        });
+        let lines = parse_logs_response(&payload, ResourceKind::WebApp).unwrap();
+        assert_eq!(lines.len(), 6);
+
+        assert_eq!(lines[0].level, LogLevel::Error);
+        assert_eq!(lines[0].source, "AppServiceHTTPLogs");
+        assert_eq!(lines[0].message, "503 GET /products/1  ·  120ms");
+        assert_eq!(lines[1].level, LogLevel::Warn);
+        assert_eq!(lines[2].level, LogLevel::Info);
+
+        assert_eq!(lines[3].level, LogLevel::Error);
+        assert_eq!(lines[3].source, "AppServiceConsoleLogs");
+        assert_eq!(lines[3].message, "unhandled exception in worker");
+        assert_eq!(lines[4].level, LogLevel::Info);
+        assert_eq!(lines[4].source, "AppServiceAppLogs");
+
+        assert_eq!(lines[5].level, LogLevel::Error);
+        assert_eq!(lines[5].source, "AppExceptions");
+        assert_eq!(lines[5].message, "boom");
     }
 
     #[test]

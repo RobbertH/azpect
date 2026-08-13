@@ -468,7 +468,7 @@ fn network_cell(r: &Resource, state: &AppState, theme: &Theme) -> (String, Color
             Some(url) if !url.is_empty() => (strip_scheme(url).to_string(), theme.accent),
             _ => (String::new(), theme.muted),
         },
-        ResourceKind::FunctionApp => {
+        ResourceKind::FunctionApp | ResourceKind::WebApp => {
             if !r.meta.public_network_enabled() {
                 ("private".to_string(), theme.healthy)
             } else {
@@ -527,7 +527,9 @@ fn deployed_image(r: &Resource, state: &AppState) -> Option<String> {
             .by_resource
             .get(&r.id)
             .and_then(|m| m.image.clone()),
-        ResourceKind::FunctionApp => state.func_image.by_resource.get(&r.id).cloned().flatten(),
+        ResourceKind::FunctionApp | ResourceKind::WebApp => {
+            state.func_image.by_resource.get(&r.id).cloned().flatten()
+        }
         _ => None,
     }
 }
@@ -538,7 +540,9 @@ fn image_pending(r: &Resource, state: &AppState) -> bool {
     match r.kind {
         // Container App image rides on the revisions fetch that drives health.
         ResourceKind::ContainerApp => state.health.pending.contains(&r.id),
-        ResourceKind::FunctionApp => state.func_image.pending.contains(&r.id),
+        ResourceKind::FunctionApp | ResourceKind::WebApp => {
+            state.func_image.pending.contains(&r.id)
+        }
         _ => false,
     }
 }
@@ -1279,6 +1283,18 @@ mod tests {
         let (text, color) = network_cell(&private, &state, &theme);
         assert_eq!(text, "private");
         assert_eq!(color, theme.healthy);
+
+        // Web Apps get the same posture treatment (shared microsoft.web/sites
+        // publicNetworkAccess + config/web plumbing).
+        let mut web = r("/r/w1", "storefront-web", ResourceKind::WebApp);
+        assert_eq!(network_cell(&web, &state, &theme).0, "public");
+        state
+            .func_image
+            .access_restricted
+            .insert(web.id.clone(), true);
+        assert_eq!(network_cell(&web, &state, &theme).0, "public (restricted)");
+        web.meta.public_network_access = Some("Disabled".into());
+        assert_eq!(network_cell(&web, &state, &theme).0, "private");
     }
 
     #[test]

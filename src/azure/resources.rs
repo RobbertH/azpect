@@ -1,5 +1,5 @@
-//! Resource Graph KQL query that enumerates Function Apps, APIM instances, and
-//! Container Apps across the supplied subscriptions in one call.
+//! Resource Graph KQL query that enumerates Function Apps, Web Apps, APIM
+//! instances, and Container Apps across the supplied subscriptions in one call.
 
 #![allow(dead_code, unused_variables)]
 
@@ -13,17 +13,22 @@ use crate::azure::client::ArmClient;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum ResourceKind {
     FunctionApp,
+    /// A plain App Service web app — `microsoft.web/sites` whose `kind` does
+    /// NOT contain `functionapp`. Shares the Function App ARM surface
+    /// (app settings, `config/web`, site metrics) but has no functions list.
+    WebApp,
     Apim,
     ContainerApp,
     AppGateway,
 }
 
 impl ResourceKind {
-    /// Short tag for the list view: `FuncApp`, `APIM`, `ContApp`, `AppGW`.
+    /// Short tag for the list view: `FuncApp`, `WebApp`, `APIM`, `ContApp`, `AppGW`.
     pub fn short_tag(&self) -> &'static str {
         match self {
             ResourceKind::Apim => "APIM",
             ResourceKind::FunctionApp => "FuncApp",
+            ResourceKind::WebApp => "WebApp",
             ResourceKind::ContainerApp => "ContApp",
             ResourceKind::AppGateway => "AppGW",
         }
@@ -115,7 +120,7 @@ impl ResourceMeta {
 /// view shows "state: unknown" for those families.
 pub const KQL: &str = r#"
 Resources
-| where (type == 'microsoft.web/sites' and kind contains 'functionapp')
+| where type == 'microsoft.web/sites'
     or type == 'microsoft.apimanagement/service'
     or type == 'microsoft.app/containerapps'
     or type == 'microsoft.network/applicationgateways'
@@ -230,8 +235,15 @@ fn parse_resource(v: &serde_json::Value) -> Option<Resource> {
     let ty = v.get("type")?.as_str()?.to_lowercase();
     let kind_str = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
 
-    let kind = if ty == "microsoft.web/sites" && kind_str.to_lowercase().contains("functionapp") {
-        ResourceKind::FunctionApp
+    let kind = if ty == "microsoft.web/sites" {
+        // `kind` distinguishes the site flavors sharing this ARM type:
+        // `functionapp[,linux]` (and Logic Apps Standard's `functionapp,workflowapp`)
+        // vs plain web apps (`app`, `app,linux`, `api`, …).
+        if kind_str.to_lowercase().contains("functionapp") {
+            ResourceKind::FunctionApp
+        } else {
+            ResourceKind::WebApp
+        }
     } else if ty == "microsoft.apimanagement/service" {
         ResourceKind::Apim
     } else if ty == "microsoft.app/containerapps" {
@@ -469,8 +481,8 @@ mod tests {
             .filter_map(parse_resource)
             .collect();
 
-        // Plain web app (kind=app,linux) must be skipped.
-        assert_eq!(resources.len(), 4);
+        // Plain web app (kind=app,linux) parses as WebApp.
+        assert_eq!(resources.len(), 5);
         assert_eq!(resources[0].kind, ResourceKind::FunctionApp);
         assert_eq!(resources[0].state.as_deref(), Some("Running"));
         // Function App row carried both systemData timestamps.
@@ -488,8 +500,11 @@ mod tests {
         assert_eq!(resources[2].kind, ResourceKind::ContainerApp);
         // Container app row omitted createdAt entirely — should also be None.
         assert!(resources[2].created_at.is_none());
-        assert_eq!(resources[3].kind, ResourceKind::AppGateway);
+        assert_eq!(resources[3].kind, ResourceKind::WebApp);
+        assert_eq!(resources[3].name, "justawebapp");
         assert_eq!(resources[3].state.as_deref(), Some("Running"));
+        assert_eq!(resources[4].kind, ResourceKind::AppGateway);
+        assert_eq!(resources[4].state.as_deref(), Some("Running"));
     }
 
     #[test]

@@ -2288,7 +2288,7 @@ impl AppState {
                     self.container_app_overview.pending.contains(&r.id),
                     self.container_app_overview.by_resource.contains_key(&r.id),
                 ),
-                ResourceKind::FunctionApp => tally(
+                ResourceKind::FunctionApp | ResourceKind::WebApp => tally(
                     self.func_image.pending.contains(&r.id),
                     self.func_image.by_resource.contains_key(&r.id),
                 ),

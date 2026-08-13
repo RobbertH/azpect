@@ -3,7 +3,7 @@
 A terminal UI for inspecting the health of Azure APIs at a glance.
 Inspired by [k9s](https://github.com/derailed/k9s) and [flowrs](https://github.com/jvanbuel/flowrs), with vim-like keybindings.
 
-`azpect` lists Function Apps, API Management instances, Container Apps, and Application Gateways across every subscription you can access. It also drills into Storage accounts (containers / blobs), Container Registries (repositories / tags), Cosmos DB (databases / containers / item preview), Key Vaults (secrets + certificates, metadata only), and Service Bus (queues / topics / subscriptions, with active and dead-letter message counts).
+`azpect` lists Function Apps, Web Apps, API Management instances, Container Apps, and Application Gateways across every subscription you can access. It also drills into Storage accounts (containers / blobs), Container Registries (repositories / tags), Cosmos DB (databases / containers / item preview), Key Vaults (secrets + certificates, metadata only), and Service Bus (queues / topics / subscriptions, with active and dead-letter message counts).
 
 ![API resources across subscriptions, with health badges](https://raw.githubusercontent.com/RobbertH/azpect/main/assets/apis.png)
 

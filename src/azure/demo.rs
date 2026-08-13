@@ -177,6 +177,16 @@ pub fn resources(sub_ids: &[String]) -> Vec<Resource> {
         ),
         resource(
             SUB_PROD,
+            "rg-commerce-prod",
+            "Microsoft.Web/sites",
+            "web-storefront-prod",
+            ResourceKind::WebApp,
+            "Running",
+            377,
+            meta(&[("env", "prod"), ("team", "commerce")]),
+        ),
+        resource(
+            SUB_PROD,
             "rg-platform-prod",
             "Microsoft.ApiManagement/service",
             "apim-contoso-prod",
@@ -362,7 +372,8 @@ pub fn metrics(resource: &Resource, range: TimeRange) -> MetricsResult {
     };
 
     match resource.kind {
-        ResourceKind::FunctionApp => {
+        // Web Apps share the Microsoft.Web/sites metric shapes.
+        ResourceKind::FunctionApp | ResourceKind::WebApp => {
             out.series.push(series(
                 MetricKind::Cpu,
                 "CPU",
@@ -605,6 +616,8 @@ pub fn replicas(resource_id: &str, revision_name: &str) -> Vec<ReplicaInstance> 
 pub fn web_config(resource_id: &str) -> WebConfig {
     let image = if resource_id.ends_with("/func-orders-prod") {
         Some("DOCKER|crcontosoprod.azurecr.io/func-orders:2.3.1".to_string())
+    } else if resource_id.ends_with("/web-storefront-prod") {
+        Some("DOCKER|crcontosoprod.azurecr.io/storefront:5.1.0".to_string())
     } else {
         None
     };
@@ -614,13 +627,31 @@ pub fn web_config(resource_id: &str) -> WebConfig {
     }
 }
 
-pub fn function_app_settings(_resource_id: &str) -> Vec<EnvVar> {
+pub fn function_app_settings(resource_id: &str) -> Vec<EnvVar> {
     let var = |name: &str, value: &str, secret: bool| EnvVar {
         name: name.to_string(),
         value: value.to_string(),
         is_secret: secret,
         ..Default::default()
     };
+    // The demo Web App gets web-flavored settings (no FUNCTIONS_* keys, so the
+    // Detail view doesn't invent a Functions runtime line for it).
+    if resource_id.ends_with("/web-storefront-prod") {
+        return vec![
+            var("ASPNETCORE_ENVIRONMENT", "Production", false),
+            var(
+                "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                "InstrumentationKey=00000000-0000-0000-0000-000000000000",
+                true,
+            ),
+            var("CDN_BASE_URL", "https://cdn.contoso.com/storefront", false),
+            var(
+                "CHECKOUT_API_BASE_URL",
+                "https://ca-checkout-api.internal.contoso.com",
+                false,
+            ),
+        ];
+    }
     vec![
         var("FUNCTIONS_EXTENSION_VERSION", "~4", false),
         var("FUNCTIONS_WORKER_RUNTIME", "dotnet-isolated", false),
@@ -1907,6 +1938,7 @@ pub fn logs(
     }
     let mut lines = match resource.kind {
         ResourceKind::FunctionApp => function_app_log_lines(range),
+        ResourceKind::WebApp => web_app_log_lines(range),
         ResourceKind::ContainerApp => container_app_log_lines(&resource.name, range),
         ResourceKind::Apim => apim_log_lines(range),
         ResourceKind::AppGateway => Vec::new(),
@@ -2026,6 +2058,68 @@ fn function_app_log_lines(range: TimeRange) -> Vec<LogLine> {
                     "FunctionAppLogs/ProcessOrder",
                     format!("Order ord_{order} validated and persisted in {}ms", 12 + (noise(5, i) * 60.0) as i64),
                     vec![("Category", "Function.ProcessOrder".to_string())],
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Web App rows mirror `logs::parse_web_app_row`'s three schema families:
+/// `AppServiceHTTPLogs` access-log lines (status-led), `AppServiceConsoleLogs`
+/// stdout, and the occasional AI exception.
+fn web_app_log_lines(range: TimeRange) -> Vec<LogLine> {
+    let now = Utc::now();
+    let spacing = log_spacing(range);
+    let n = log_count(range);
+    (0..n)
+        .map(|i| {
+            let ts = now - spacing * (i as i32) - Duration::seconds((noise(23, i) * 20.0) as i64);
+            let ms = 25 + (noise(29, i) * 90.0) as i64;
+            let sku = 4_100 + (i as i64 % 37);
+            match i % 8 {
+                0 => line(
+                    ts,
+                    LogLevel::Info,
+                    "AppServiceHTTPLogs",
+                    format!("200 GET /products/sku-{sku}  ·  {ms}ms"),
+                    vec![
+                        ("CsMethod", "GET".to_string()),
+                        ("CsUriStem", format!("/products/sku-{sku}")),
+                        ("ScStatus", "200".to_string()),
+                        ("TimeTaken", ms.to_string()),
+                    ],
+                ),
+                3 if noise(31, i) > 0.85 => line(
+                    ts,
+                    LogLevel::Warn,
+                    "AppServiceHTTPLogs",
+                    format!("404 GET /products/sku-{}  ·  {ms}ms", sku + 9000),
+                    vec![
+                        ("CsMethod", "GET".to_string()),
+                        ("ScStatus", "404".to_string()),
+                        ("TimeTaken", ms.to_string()),
+                    ],
+                ),
+                5 if noise(37, i) > 0.6 => line(
+                    ts,
+                    LogLevel::Error,
+                    "AppExceptions",
+                    "System.Net.Http.HttpRequestException: checkout API returned 503 (basket price refresh)"
+                        .to_string(),
+                    vec![
+                        (
+                            "ProblemId",
+                            "HttpRequestException at CheckoutClient.RefreshPrices".to_string(),
+                        ),
+                        ("OperationName", "GET /basket".to_string()),
+                    ],
+                ),
+                _ => line(
+                    ts,
+                    LogLevel::Info,
+                    "AppServiceConsoleLogs",
+                    format!("info: Storefront.Catalog[0] rendered product page sku-{sku} in {ms}ms"),
+                    vec![("Level", "Informational".to_string())],
                 ),
             }
         })
@@ -2219,6 +2313,7 @@ mod tests {
         let rs = resources(&[]);
         for kind in [
             ResourceKind::FunctionApp,
+            ResourceKind::WebApp,
             ResourceKind::Apim,
             ResourceKind::ContainerApp,
             ResourceKind::AppGateway,

@@ -52,7 +52,9 @@ fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
         // Enter on a section pops its details modal (see `render_modal`),
         // expanding any inline `+N more`. j/k moves between sections, so it's
         // worth surfacing here too.
-        ResourceKind::FunctionApp | ResourceKind::ContainerApp => "j/k section  Enter details",
+        ResourceKind::FunctionApp | ResourceKind::WebApp | ResourceKind::ContainerApp => {
+            "j/k section  Enter details"
+        }
     };
     format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
 }
@@ -197,15 +199,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // missing so the rest of the page (tags / created / modified) doesn't get
     // pushed down once the data lands. Skeleton rows render in muted gray.
     let is_ca = resource.kind == ResourceKind::ContainerApp;
+    // Web Apps share the Function App meta block (image / runtime / network) —
+    // same ARM surface — but not the triggers section below.
+    let is_site = matches!(
+        resource.kind,
+        ResourceKind::FunctionApp | ResourceKind::WebApp
+    );
     let is_fa = resource.kind == ResourceKind::FunctionApp;
     let is_apim = resource.kind == ResourceKind::Apim;
     let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
     let (meta_lines, meta_is_skeleton) = if ca_meta_loading {
         (container_app_skeleton_meta_rows(), true)
-    } else if is_fa {
-        // Function Apps get their own (lighter) meta block: deployed image +
-        // runtime + network posture. No skeleton — the rows appear as their
-        // backing data lands.
+    } else if is_site {
+        // Function Apps / Web Apps get their own (lighter) meta block: deployed
+        // image + runtime + network posture. No skeleton — the rows appear as
+        // their backing data lands.
         (function_app_meta_lines(state, resource), false)
     } else if is_apim {
         // APIM: gateway URL + virtual IP addresses, straight off the list fetch.
@@ -516,7 +524,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut hint = footer_hint_for(resource.kind);
     if matches!(
         resource.kind,
-        ResourceKind::ContainerApp | ResourceKind::FunctionApp
+        ResourceKind::ContainerApp | ResourceKind::FunctionApp | ResourceKind::WebApp
     ) {
         hint = format!("e env vars  {hint}");
     }
@@ -1422,7 +1430,7 @@ pub(crate) fn env_vars_for<'a>(
             .by_resource
             .get(id)
             .map(|l| l.env_vars.as_slice()),
-        ResourceKind::FunctionApp => state
+        ResourceKind::FunctionApp | ResourceKind::WebApp => state
             .func_settings
             .by_resource
             .get(id)
@@ -1445,9 +1453,9 @@ fn env_var_rows(
 
     let Some(vars) = env_vars_for(state, id, kind) else {
         // Not loaded yet. Container App env vars ride on the overview fetch
-        // (other lines already signal its progress), so only Function Apps get
-        // an explicit hint here.
-        if kind == ResourceKind::FunctionApp {
+        // (other lines already signal its progress), so only Function Apps /
+        // Web Apps get an explicit hint here.
+        if matches!(kind, ResourceKind::FunctionApp | ResourceKind::WebApp) {
             if state.func_settings.failures.contains_key(id) {
                 return vec![meta_hint_row(
                     "env vars:",
@@ -1813,12 +1821,16 @@ fn selectable_metas(state: &AppState, resource: &Resource) -> Vec<SelectableMeta
     let revision_meta = state.revision_meta.by_resource.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
     let is_ca = resource.kind == ResourceKind::ContainerApp;
+    let is_site = matches!(
+        resource.kind,
+        ResourceKind::FunctionApp | ResourceKind::WebApp
+    );
     let is_fa = resource.kind == ResourceKind::FunctionApp;
     let is_apim = resource.kind == ResourceKind::Apim;
     let ca_meta_loading = is_ca && (revision_meta.is_none() || limits.is_none());
     let meta_lines = if ca_meta_loading {
         Vec::new()
-    } else if is_fa {
+    } else if is_site {
         function_app_meta_lines(state, resource)
     } else if is_apim {
         apim_meta_lines(resource)
@@ -1921,8 +1933,8 @@ pub(crate) fn selected_meta_portal_suffix(
     }
     let cursor = state.detail_view.cursor.min(metas.len() - 1);
     match (resource.kind, metas[cursor].modal_title.as_str()) {
-        // Function App "Networking" blade.
-        (ResourceKind::FunctionApp, "network") => Some("/networkingHub"),
+        // App Service (Function App / Web App) "Networking" blade.
+        (ResourceKind::FunctionApp | ResourceKind::WebApp, "network") => Some("/networkingHub"),
         // Container App "Ingress" blade — where its exposure (external/internal,
         // IP restrictions) is configured.
         (ResourceKind::ContainerApp, "network") => Some("/ingress"),
@@ -1944,9 +1956,9 @@ fn env_var_rows_count(state: &AppState, resource: &Resource, ca_meta_loading: bo
         Some(vars) if !vars.is_empty() => 1,
         Some(_) => 0,
         None => {
-            // Function-App-only: emit a hint row when the settings fetch is
-            // in flight or has already failed.
-            if kind == ResourceKind::FunctionApp
+            // Function App / Web App only: emit a hint row when the settings
+            // fetch is in flight or has already failed.
+            if matches!(kind, ResourceKind::FunctionApp | ResourceKind::WebApp)
                 && (state.func_settings.failures.contains_key(id)
                     || state.func_settings.pending.contains(id))
             {
@@ -2128,7 +2140,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         Action::OpenEnvVars => {
             let kind = state.selected_resource().map(|r| r.kind);
             match kind {
-                Some(ResourceKind::ContainerApp | ResourceKind::FunctionApp) => {
+                Some(
+                    ResourceKind::ContainerApp | ResourceKind::FunctionApp | ResourceKind::WebApp,
+                ) => {
                     // Fresh page: cursor at top, values masked.
                     state.env_vars_view = crate::ui::state::EnvVarsView::default();
                     state.view = View::EnvVars;

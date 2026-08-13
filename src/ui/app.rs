@@ -2758,7 +2758,11 @@ fn portal_url_for(state: &AppState) -> Option<String> {
         View::EnvVars => state.selected_resource().map(|r| {
             use crate::azure::resources::ResourceKind;
             let blade = match r.kind {
-                ResourceKind::FunctionApp => "/environmentVariablesAppSettings",
+                // Function Apps and Web Apps share the App Service
+                // "Environment variables" blade.
+                ResourceKind::FunctionApp | ResourceKind::WebApp => {
+                    "/environmentVariablesAppSettings"
+                }
                 ResourceKind::ContainerApp => "/containers",
                 _ => "",
             };
@@ -3616,12 +3620,17 @@ fn kick_off_loads_for_view(
                         spawn_load_container_app_overview(auth.clone(), id.clone(), tx.clone());
                     }
                 }
-                // Function App OS env vars + per-function triggers are lazy-loaded
-                // on Detail entry — neither is shown in the list, so fetching them
-                // eagerly for every app would be wasteful. (Container App env vars
-                // ride on the eagerly-fetched limits.) Guard against re-spawning
-                // while one is cached / in flight.
-                if kind == crate::azure::resources::ResourceKind::FunctionApp {
+                // App settings (Function Apps + Web Apps) + per-function triggers
+                // (Function Apps only — Web Apps have no functions list) are
+                // lazy-loaded on Detail entry — neither is shown in the list, so
+                // fetching them eagerly for every app would be wasteful.
+                // (Container App env vars ride on the eagerly-fetched limits.)
+                // Guard against re-spawning while one is cached / in flight.
+                if matches!(
+                    kind,
+                    crate::azure::resources::ResourceKind::FunctionApp
+                        | crate::azure::resources::ResourceKind::WebApp
+                ) {
                     let cached = state.func_settings.by_resource.contains_key(&id)
                         || state.func_settings.failures.contains_key(&id);
                     let in_flight = state.func_settings.pending.contains(&id);
@@ -3633,6 +3642,8 @@ fn kick_off_loads_for_view(
                         state.func_settings.pending.insert(id.clone());
                         spawn_load_function_app_settings(auth.clone(), id.clone(), tx.clone());
                     }
+                }
+                if kind == crate::azure::resources::ResourceKind::FunctionApp {
                     let t_cached = state.func_triggers.by_resource.contains_key(&id)
                         || state.func_triggers.failures.contains_key(&id);
                     let t_in_flight = state.func_triggers.pending.contains(&id);
@@ -3665,7 +3676,8 @@ fn kick_off_loads_for_view(
             if let Some(resource) = state.selected_resource().cloned() {
                 let id = resource.id;
                 match resource.kind {
-                    crate::azure::resources::ResourceKind::FunctionApp => {
+                    crate::azure::resources::ResourceKind::FunctionApp
+                    | crate::azure::resources::ResourceKind::WebApp => {
                         let cached = state.func_settings.by_resource.contains_key(&id)
                             || state.func_settings.failures.contains_key(&id);
                         let in_flight = state.func_settings.pending.contains(&id);
@@ -4838,7 +4850,8 @@ fn commit_env_var_edit(
     };
 
     let write = match edit.resource_kind {
-        ResourceKind::FunctionApp => EnvWrite::FunctionApp {
+        // Web Apps write through the same config/appsettings PUT.
+        ResourceKind::FunctionApp | ResourceKind::WebApp => EnvWrite::FunctionApp {
             name: name.clone(),
             value: value.clone(),
         },
@@ -4929,7 +4942,7 @@ fn upsert_env(vars: &mut Vec<crate::azure::env_vars::EnvVar>, name: &str, value:
 fn apply_env_edit_to_cache(state: &mut AppState, applied: &AppliedEnvEdit) {
     use crate::azure::resources::ResourceKind;
     match applied.kind {
-        ResourceKind::FunctionApp => {
+        ResourceKind::FunctionApp | ResourceKind::WebApp => {
             let vars = state
                 .func_settings
                 .by_resource
@@ -4983,7 +4996,7 @@ fn refetch_env_after_write(
 ) {
     use crate::azure::resources::ResourceKind;
     match applied.kind {
-        ResourceKind::FunctionApp
+        ResourceKind::FunctionApp | ResourceKind::WebApp
             if state
                 .func_settings
                 .pending
@@ -5634,8 +5647,8 @@ fn spawn_missing_container_app_overview(
     }
 }
 
-/// Kick off a `config/web` fetch for every Function App that doesn't already
-/// have a cached deployed image. Feeds the list's VERSION column; same
+/// Kick off a `config/web` fetch for every Function App / Web App that doesn't
+/// already have a cached deployed image. Feeds the list's VERSION column; same
 /// eager-on-load pattern as `spawn_missing_container_app_overview` (Container
 /// Apps get their image for free off the health fetch, so they're skipped here).
 fn spawn_missing_function_app_image(
@@ -5648,7 +5661,7 @@ fn spawn_missing_function_app_image(
     let to_fetch: Vec<String> = state
         .resources
         .iter()
-        .filter(|r| r.kind == ResourceKind::FunctionApp)
+        .filter(|r| matches!(r.kind, ResourceKind::FunctionApp | ResourceKind::WebApp))
         .filter(|r| {
             (force || !state.func_image.by_resource.contains_key(&r.id))
                 && !state.func_image.pending.contains(&r.id)
