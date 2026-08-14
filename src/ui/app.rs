@@ -947,6 +947,90 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::LogicAppsLoaded { scope, result } => {
+                // Stale scope — see the `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
+                state.logic_apps.workflows_pending = false;
+                match result {
+                    Ok(rows) => {
+                        state.logic_apps.workflows_error = None;
+                        if !rows.is_empty() && state.logic_apps.workflows_cursor >= rows.len() {
+                            state.logic_apps.workflows_cursor = rows.len() - 1;
+                        }
+                        state.logic_apps.workflows = Some(rows);
+                    }
+                    Err(e) => {
+                        state.logic_apps.workflows = None;
+                        state.logic_apps.workflows_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::LogicAppRunsLoaded {
+                workflow_id,
+                result,
+            } => {
+                state.logic_apps.runs_pending.remove(&workflow_id);
+                match result {
+                    Ok(rows) => {
+                        state.logic_apps.runs_error.remove(&workflow_id);
+                        state.logic_apps.runs.insert(workflow_id, rows);
+                    }
+                    Err(e) => {
+                        state.logic_apps.runs.remove(&workflow_id);
+                        state.logic_apps.runs_error.insert(workflow_id, e);
+                    }
+                }
+            }
+            AppEvent::LogicAppTriggerHistoryLoaded {
+                workflow_id,
+                result,
+            } => {
+                state
+                    .logic_apps
+                    .trigger_history_pending
+                    .remove(&workflow_id);
+                match result {
+                    Ok(rows) => {
+                        state.logic_apps.trigger_history_error.remove(&workflow_id);
+                        state.logic_apps.trigger_history.insert(workflow_id, rows);
+                    }
+                    Err(e) => {
+                        state.logic_apps.trigger_history.remove(&workflow_id);
+                        state
+                            .logic_apps
+                            .trigger_history_error
+                            .insert(workflow_id, e);
+                    }
+                }
+            }
+            AppEvent::LogicAppActionsLoaded { key, result } => {
+                state.logic_apps.actions_pending.remove(&key);
+                match result {
+                    Ok(rows) => {
+                        state.logic_apps.actions_error.remove(&key);
+                        state.logic_apps.actions.insert(key, rows);
+                    }
+                    Err(e) => {
+                        state.logic_apps.actions.remove(&key);
+                        state.logic_apps.actions_error.insert(key, e);
+                    }
+                }
+            }
+            AppEvent::LogicAppContentLoaded { key, result } => {
+                state.logic_apps.content_pending.remove(&key);
+                match result {
+                    Ok(content) => {
+                        state.logic_apps.content_error.remove(&key);
+                        state.logic_apps.content.insert(key, content);
+                    }
+                    Err(e) => {
+                        state.logic_apps.content.remove(&key);
+                        state.logic_apps.content_error.insert(key, e);
+                    }
+                }
+            }
             AppEvent::CosmosAccountsLoaded { scope, result } => {
                 // Stale scope — see the `ResourcesLoaded` arm.
                 if scope != state.scope_generation {
@@ -1570,6 +1654,14 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
         state.registry.tags_cursor = 0;
         return true;
     }
+    if should_forward_to_logic_apps_filter(state, key) {
+        state
+            .logic_apps
+            .workflows_filter
+            .handle_event(&CtEvent::Key(key));
+        state.logic_apps.workflows_cursor = 0;
+        return true;
+    }
     if should_forward_to_cosmos_accounts_filter(state, key) {
         state
             .cosmos
@@ -1932,6 +2024,21 @@ fn should_forward_to_repositories_filter(
 fn should_forward_to_tags_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
     state.view == View::RegistryTags
         && state.registry.tags_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the logic-apps list filter.
+fn should_forward_to_logic_apps_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::LogicApps
+        && state.logic_apps.workflows_filter_active
         && !matches!(
             key.code,
             KeyCode::Esc
@@ -2315,6 +2422,7 @@ fn decide_action(
         || (state.view == View::StorageBlobs && state.storage.blobs_filter_active)
         || (state.view == View::StorageContainers && state.storage.containers_filter_active)
         || (state.view == View::StorageAccounts && state.storage.accounts_filter_active)
+        || (state.view == View::LogicApps && state.logic_apps.workflows_filter_active)
         || (state.view == View::Registries && state.registry.registries_filter_active)
         || (state.view == View::RegistryRepositories && state.registry.repositories_filter_active)
         || (state.view == View::RegistryTags && state.registry.tags_filter_active)
@@ -2383,6 +2491,13 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::StorageContainers => crate::ui::views::storage_containers::handle(action, state),
         View::StorageBlobs => crate::ui::views::storage_blobs::handle(action, state),
         View::StorageBlobDetail => crate::ui::views::storage_blob_detail::handle(action, state),
+        View::LogicApps => crate::ui::views::logic_apps::handle(action, state),
+        View::LogicAppRuns => crate::ui::views::logic_app_runs::handle(action, state),
+        View::LogicAppTriggerHistory => {
+            crate::ui::views::logic_app_trigger_history::handle(action, state)
+        }
+        View::LogicAppRunDetail => crate::ui::views::logic_app_run_detail::handle(action, state),
+        View::LogicAppContent => crate::ui::views::logic_app_content::handle(action, state),
         View::Registries => crate::ui::views::registries::handle(action, state),
         View::RegistryRepositories => {
             crate::ui::views::registry_repositories::handle(action, state)
@@ -2857,6 +2972,21 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_registry
             .as_ref()
             .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
+        // Logic App views land on the workflow's overview blade — that's
+        // where the portal shows the run history the TUI was browsing.
+        View::LogicApps => state
+            .logic_apps
+            .filtered_workflows()
+            .get(state.logic_apps.workflows_cursor)
+            .map(|w| format!("{PORTAL_BASE}{}", w.id)),
+        View::LogicAppRuns
+        | View::LogicAppTriggerHistory
+        | View::LogicAppRunDetail
+        | View::LogicAppContent => state
+            .logic_apps
+            .selected_workflow
+            .as_ref()
+            .map(|w| format!("{PORTAL_BASE}{}", w.id)),
         // Cosmos views land on the account's Data Explorer blade — that's
         // where the user can act on what they were browsing in the TUI.
         View::CosmosAccounts => state
@@ -3077,6 +3207,29 @@ fn yank_target(state: &AppState) -> Option<String> {
                 repository
             ))
         }),
+        // Logic Apps: workflow id at the top level; run / firing ids on the
+        // history rows (they're what you paste into `az logic` or a support
+        // ticket); the content view yanks the whole rendered payload.
+        View::LogicApps => state
+            .logic_apps
+            .filtered_workflows()
+            .get(state.logic_apps.workflows_cursor)
+            .map(|w| w.id.clone()),
+        View::LogicAppRuns => crate::ui::views::logic_app_runs::selected_run(state).map(|r| r.name),
+        View::LogicAppTriggerHistory => {
+            crate::ui::views::logic_app_trigger_history::selected_history(state)
+                .map(|h| h.run_name.unwrap_or(h.name))
+        }
+        View::LogicAppRunDetail => crate::ui::views::logic_app_run_detail::selected_row_name(state),
+        View::LogicAppContent => {
+            crate::ui::views::logic_app_content::yank_text(state).or_else(|| {
+                state
+                    .logic_apps
+                    .selected_content
+                    .as_ref()
+                    .map(|s| s.title.clone())
+            })
+        }
         View::CosmosAccounts => state
             .cosmos
             .filtered_accounts()
@@ -3229,6 +3382,14 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
                     return true;
                 }
             }
+            // Logic App content is reachable from two siblings (run detail
+            // and trigger history); return to whichever pinned the source.
+            if state.view == View::LogicAppContent {
+                if let Some(origin) = state.logic_apps.selected_content.as_ref().map(|s| s.origin) {
+                    state.view = origin;
+                    return true;
+                }
+            }
             match semantic_parent(state.view) {
                 Some(parent) => state.view = parent,
                 None => {
@@ -3319,6 +3480,13 @@ fn semantic_parent(view: View) -> Option<View> {
         // The view's own Back handler returns to the recorded origin; this is
         // the static breadcrumb fallback.
         View::SqlSessions => Some(View::SqlResources),
+        View::LogicApps => Some(View::Subscriptions),
+        View::LogicAppRuns => Some(View::LogicApps),
+        View::LogicAppTriggerHistory => Some(View::LogicAppRuns),
+        View::LogicAppRunDetail => Some(View::LogicAppRuns),
+        // The Back arm above consumes Esc first (returns to the pinned
+        // source's origin view); this is the static breadcrumb fallback.
+        View::LogicAppContent => Some(View::LogicAppRunDetail),
     }
 }
 
@@ -3339,6 +3507,7 @@ fn after_action(
         // here is safe. Forcing is scoped to the logs view; the Detail metrics
         // window-change clears its own cache and needs no force.
         Action::ToggleErrorsOnly
+        | Action::ToggleHideHealth
         | Action::SetWindowHour
         | Action::SetWindowDay
         | Action::SetWindowWeek
@@ -3412,6 +3581,9 @@ fn after_action(
         | Action::OpenSessions
         | Action::OpenStorage
         | Action::OpenRegistries
+        // `t` in the Logic App runs view opens the trigger history — a view
+        // transition like OpenSelected, so kick its (debounced) load too.
+        | Action::OpenTriggerHistory
         // NextPanel / PrevPanel toggle a sub-kind in place (Key Vault
         // secrets↔certs, Service Bus queues↔topics). Kick off a load so the
         // newly-selected kind fetches without an extra `r`; the per-key
@@ -3725,6 +3897,7 @@ fn kick_off_loads_for_view(
                         resource,
                         state.logs.range,
                         state.logs.errors_only,
+                        state.logs.hide_health,
                         None,
                         around,
                         state.logs.generation,
@@ -3942,6 +4115,87 @@ fn kick_off_loads_for_view(
                     }
                     state.registry.tags_pending.insert(key);
                     spawn_load_tags(auth.clone(), registry, repository, tx.clone());
+                }
+            }
+        }
+        View::LogicApps => {
+            let cached = state.logic_apps.workflows.is_some();
+            let in_flight = state.logic_apps.workflows_pending;
+            if force || (!cached && !in_flight) {
+                let Some(sub_ids) = scope_sub_ids(state) else {
+                    return;
+                };
+                if force {
+                    state.logic_apps.workflows = None;
+                    state.logic_apps.workflows_error = None;
+                }
+                state.logic_apps.workflows_pending = true;
+                spawn_load_logic_apps(auth.clone(), state.scope_generation, sub_ids, tx.clone());
+            }
+        }
+        View::LogicAppRuns => {
+            if let Some(workflow) = state.logic_apps.selected_workflow.clone() {
+                let cached = state.logic_apps.runs.contains_key(&workflow.id);
+                let in_flight = state.logic_apps.runs_pending.contains(&workflow.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.logic_apps.runs.remove(&workflow.id);
+                        state.logic_apps.runs_error.remove(&workflow.id);
+                    }
+                    state.logic_apps.runs_pending.insert(workflow.id.clone());
+                    spawn_load_logic_app_runs(auth.clone(), workflow, tx.clone());
+                }
+            }
+        }
+        View::LogicAppTriggerHistory => {
+            if let Some(workflow) = state.logic_apps.selected_workflow.clone() {
+                let cached = state.logic_apps.trigger_history.contains_key(&workflow.id);
+                let in_flight = state
+                    .logic_apps
+                    .trigger_history_pending
+                    .contains(&workflow.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.logic_apps.trigger_history.remove(&workflow.id);
+                        state.logic_apps.trigger_history_error.remove(&workflow.id);
+                    }
+                    state
+                        .logic_apps
+                        .trigger_history_pending
+                        .insert(workflow.id.clone());
+                    spawn_load_logic_app_trigger_history(auth.clone(), workflow, tx.clone());
+                }
+            }
+        }
+        View::LogicAppRunDetail => {
+            if let (Some(workflow), Some(run)) = (
+                state.logic_apps.selected_workflow.clone(),
+                state.logic_apps.selected_run.clone(),
+            ) {
+                let key = crate::ui::state::LogicAppsCache::actions_key(&workflow.id, &run.name);
+                let cached = state.logic_apps.actions.contains_key(&key);
+                let in_flight = state.logic_apps.actions_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.logic_apps.actions.remove(&key);
+                        state.logic_apps.actions_error.remove(&key);
+                    }
+                    state.logic_apps.actions_pending.insert(key);
+                    spawn_load_logic_app_actions(auth.clone(), workflow, run.name, tx.clone());
+                }
+            }
+        }
+        View::LogicAppContent => {
+            if let Some(source) = state.logic_apps.selected_content.clone() {
+                let cached = state.logic_apps.content.contains_key(&source.key);
+                let in_flight = state.logic_apps.content_pending.contains(&source.key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.logic_apps.content.remove(&source.key);
+                        state.logic_apps.content_error.remove(&source.key);
+                    }
+                    state.logic_apps.content_pending.insert(source.key.clone());
+                    spawn_load_logic_app_content(auth.clone(), source, tx.clone());
                 }
             }
         }
@@ -4350,6 +4604,7 @@ fn drain_fetch_more_requested(
         resource,
         state.logs.range,
         state.logs.errors_only,
+        state.logs.hide_health,
         Some(older_than),
         // Pagination never applies to a context window — it's a bounded slice.
         None,
@@ -4420,6 +4675,17 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         View::StorageBlobs => crate::ui::views::storage_blobs::render(f, view_area, state, theme),
         View::StorageBlobDetail => {
             crate::ui::views::storage_blob_detail::render(f, view_area, state, theme)
+        }
+        View::LogicApps => crate::ui::views::logic_apps::render(f, view_area, state, theme),
+        View::LogicAppRuns => crate::ui::views::logic_app_runs::render(f, view_area, state, theme),
+        View::LogicAppTriggerHistory => {
+            crate::ui::views::logic_app_trigger_history::render(f, view_area, state, theme)
+        }
+        View::LogicAppRunDetail => {
+            crate::ui::views::logic_app_run_detail::render(f, view_area, state, theme)
+        }
+        View::LogicAppContent => {
+            crate::ui::views::logic_app_content::render(f, view_area, state, theme)
         }
         View::Registries => crate::ui::views::registries::render(f, view_area, state, theme),
         View::RegistryRepositories => {
@@ -6010,6 +6276,124 @@ fn spawn_load_sql_metrics(
     });
 }
 
+fn spawn_load_logic_apps(
+    auth: AzureAuth,
+    scope: u64,
+    sub_ids: Vec<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogicAppsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::logic_apps(&sub_ids)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::logic_apps::list_workflows(&auth, &sub_ids)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::LogicAppsLoaded { scope, result });
+    });
+}
+
+fn spawn_load_logic_app_runs(
+    auth: AzureAuth,
+    workflow: crate::azure::logic_apps::LogicApp,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogicAppRunsLoaded {
+            workflow_id: workflow.id.clone(),
+            result: Ok(crate::azure::demo::logic_app_runs(&workflow)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let workflow_id = workflow.id.clone();
+        let result = crate::azure::logic_apps::list_runs(&auth, &workflow)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::LogicAppRunsLoaded {
+            workflow_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_logic_app_trigger_history(
+    auth: AzureAuth,
+    workflow: crate::azure::logic_apps::LogicApp,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogicAppTriggerHistoryLoaded {
+            workflow_id: workflow.id.clone(),
+            result: Ok(crate::azure::demo::logic_app_trigger_history(&workflow)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let workflow_id = workflow.id.clone();
+        let result = crate::azure::logic_apps::list_trigger_history(&auth, &workflow)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::LogicAppTriggerHistoryLoaded {
+            workflow_id,
+            result,
+        });
+    });
+}
+
+fn spawn_load_logic_app_actions(
+    auth: AzureAuth,
+    workflow: crate::azure::logic_apps::LogicApp,
+    run_name: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let key = crate::ui::state::LogicAppsCache::actions_key(&workflow.id, &run_name);
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogicAppActionsLoaded {
+            key,
+            result: Ok(crate::azure::demo::logic_app_actions(&run_name)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::logic_apps::list_run_actions(&auth, &workflow, &run_name)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::LogicAppActionsLoaded { key, result });
+    });
+}
+
+fn spawn_load_logic_app_content(
+    auth: AzureAuth,
+    source: crate::ui::state::LogicContentSource,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::LogicAppContentLoaded {
+            key: source.key.clone(),
+            result: Ok(crate::azure::demo::logic_app_content(&source.key)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        // The links carry their own SAS credential — no `auth` involved.
+        let result = crate::azure::logic_apps::fetch_content(
+            source.inputs.as_ref(),
+            source.outputs.as_ref(),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::LogicAppContentLoaded {
+            key: source.key,
+            result,
+        });
+    });
+}
+
 fn spawn_load_cosmos_accounts(
     auth: AzureAuth,
     scope: u64,
@@ -6425,6 +6809,7 @@ fn spawn_load_logs(
     resource: Resource,
     range: TimeRange,
     errors_only: bool,
+    hide_health: bool,
     older_than: Option<chrono::DateTime<chrono::Utc>>,
     around: Option<chrono::DateTime<chrono::Utc>>,
     generation: u64,
@@ -6440,6 +6825,7 @@ fn spawn_load_logs(
                 &resource,
                 range,
                 errors_only,
+                hide_health,
                 older_than,
                 around,
             )),
@@ -6448,10 +6834,17 @@ fn spawn_load_logs(
     }
     tokio::spawn(async move {
         let resource_id = resource.id.clone();
-        let result =
-            crate::azure::logs::fetch(&auth, &resource, range, errors_only, older_than, around)
-                .await
-                .map_err(|e| format!("{e:#}"));
+        let result = crate::azure::logs::fetch(
+            &auth,
+            &resource,
+            range,
+            errors_only,
+            hide_health,
+            older_than,
+            around,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::LogsLoaded {
             resource_id,
             generation,
@@ -7093,6 +7486,40 @@ mod tests {
         assert_eq!(state.view, View::CosmosAccounts);
         assert!(state.view_stack.is_empty());
         assert!(state.status_message.is_none());
+    }
+
+    #[test]
+    fn command_mode_logicapps_aliases_switch_view() {
+        for cmd in ["logicapps", "logic", "workflows"] {
+            let mut state = fresh_state();
+            state.view = View::List;
+            run_command(&mut state, cmd);
+            assert_eq!(state.view, View::LogicApps, "{cmd} should open logic apps");
+            assert!(state.view_stack.is_empty());
+            assert!(state.status_message.is_none());
+        }
+    }
+
+    #[test]
+    fn back_from_logic_content_returns_to_origin_view() {
+        // Content is reachable from two siblings; Esc must return to
+        // whichever pinned the source, not always the static parent.
+        let mut state = fresh_state();
+        state.view = View::LogicAppContent;
+        state.logic_apps.selected_content = Some(crate::ui::state::LogicContentSource {
+            key: "k".into(),
+            title: "t".into(),
+            inputs: None,
+            outputs: None,
+            origin: View::LogicAppTriggerHistory,
+        });
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert_eq!(state.view, View::LogicAppTriggerHistory);
+        // Without a pinned source, fall back to the static parent.
+        state.view = View::LogicAppContent;
+        state.logic_apps.selected_content = None;
+        assert!(apply_navigation_action(Action::Back, &mut state));
+        assert_eq!(state.view, View::LogicAppRunDetail);
     }
 
     #[test]

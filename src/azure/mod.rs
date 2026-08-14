@@ -20,6 +20,7 @@ pub mod function_app_triggers;
 pub mod health;
 pub mod key_vault;
 pub mod key_vault_logs;
+pub mod logic_apps;
 pub mod logs;
 pub mod metrics;
 pub mod principals;

@@ -52,6 +52,10 @@ const DETAIL_LOGS: Section = (
         ("w", "wrap (logs)"),
         ("e", "errors only (logs) / env vars (detail)"),
         ("E", "jump to next error, fetching older rows (logs)"),
+        (
+            "H",
+            "hide health-probe requests (/health, /healthz, …) (logs)",
+        ),
         ("Tab / S-Tab", "cycle source filter (logs)"),
         ("s", "shell into container (Container App detail/logs)"),
         ("x", "reveal / hide env var values (env vars)"),
@@ -286,6 +290,21 @@ const GLOBAL: Section = (
     ],
 );
 
+const LOGIC_APPS: Section = (
+    "Logic apps (read-only)",
+    &[
+        ("Enter", "drill: logic apps > runs > actions > content"),
+        ("t", "trigger firing history (runs view)"),
+        ("/", "filter logic apps by name (substring)"),
+        ("y", "yank workflow id / run id / action / content"),
+        ("o", "open workflow in Azure Portal"),
+        (
+            "r",
+            "refresh current panel (content links expire — refresh the list first)",
+        ),
+    ],
+);
+
 /// How to get everywhere else — always shown, since the scoped help hides the
 /// other categories' sections.
 const GO_TO: Section = (
@@ -299,6 +318,7 @@ const GO_TO: Section = (
         (":keyvaults / :kv", "key vaults"),
         (":servicebus / :sb", "service bus"),
         (":sql / :sqldb", "azure sql"),
+        (":logicapps / :logic", "logic apps (run & trigger history)"),
         (":subscriptions", "subscription picker (also: s)"),
         (":refresh", "force-refresh current view"),
         (":quit / :q", "quit"),
@@ -320,6 +340,7 @@ fn sections_for(origin: Option<View>) -> Vec<Section> {
         Some(Category::KeyVaults) => out.extend([KEY_VAULTS, KV_ACCESS_LOG]),
         Some(Category::ServiceBus) => out.push(SERVICE_BUS),
         Some(Category::Sql) => out.extend([AZURE_SQL, SQL_AUDIT, SQL_SESSIONS, SQL_AUDIT_CODES]),
+        Some(Category::LogicApps) => out.push(LOGIC_APPS),
         // Subscriptions picker / unknown origin: just the shared sections.
         None => {}
     }

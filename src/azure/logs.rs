@@ -253,6 +253,36 @@ pub const KQL_APIM_ERRORS_FILTER: &str = r#"
      or column_ifexists("IsRequestSuccess", true) == false
 "#;
 
+/// Trailing-path pattern for conventional health-probe endpoints, substituted
+/// into the hide-health filters below (`{re}`) when the logs view's `H` toggle
+/// is on. Matches a full URL, bare path, or console line whose path ends in a
+/// well-known probe route — `/health`, `/healthz`, `/healthcheck`,
+/// `/health/live|ready|startup`, `/livez`, `/readyz`, `/liveness`,
+/// `/readiness`, `/ping`, `/alive`, `/hc` — plus `/robots933456.txt`, App
+/// Service's own container warm-up probe. The terminator class (`[^\w/.-]|$`)
+/// keeps the match from swallowing real endpoints that merely *start* with a
+/// probe name (`/health-records`, `/pingdom`) and lets one pattern serve URL
+/// columns, bare-path columns, and console text with trailing content alike.
+pub const HEALTH_PATH_REGEX: &str = r"(?i)/(health(z|check)?(/(live|ready|startup))?|livez|readyz|liveness|readiness|ping|alive|hc|robots933456\.txt)([^\w/.-]|$)";
+
+/// Hide-health filter for the request-bearing tables: drops rows whose request
+/// URL targets a health-probe route. `Url` covers `AppRequests` and
+/// `ApiManagementGatewayLogs`; `CsUriStem` covers `AppServiceHTTPLogs`. Rows
+/// without either column (traces, exceptions, console output) always pass —
+/// `column_ifexists` substitutes `""`, which the regex can't match.
+pub const KQL_HEALTH_FILTER: &str = r#"
+| where not(column_ifexists("Url", "") matches regex @"{re}")
+    and not(column_ifexists("CsUriStem", "") matches regex @"{re}")
+"#;
+
+/// Container-App variant of [`KQL_HEALTH_FILTER`]: console rows carry no URL
+/// column, so probe traffic is recognized inside the log text itself (the
+/// dominant shape is an access-log line like `… GET /healthz - 200`).
+pub const KQL_CONTAINER_APP_HEALTH_FILTER: &str = r#"
+| where not(column_ifexists("Log_s", "") matches regex @"{re}")
+    and not(column_ifexists("Log", "") matches regex @"{re}")
+"#;
+
 /// Maximum length of `LogLine.message` before truncation.
 const MESSAGE_TRUNCATE: usize = 500;
 
@@ -287,6 +317,7 @@ pub async fn fetch(
     resource: &Resource,
     range: TimeRange,
     errors_only: bool,
+    hide_health: bool,
     older_than: Option<DateTime<Utc>>,
     around: Option<DateTime<Utc>>,
 ) -> anyhow::Result<LogsPage> {
@@ -297,7 +328,7 @@ pub async fn fetch(
         ))));
     }
 
-    let kql = build_kql(resource, errors_only, older_than)?;
+    let kql = build_kql(resource, errors_only, hide_health, older_than)?;
     // A context jump fetches a tight window centered on one error's timestamp so
     // the surrounding INFO lines are actually in the buffer; otherwise use the
     // selected range's trailing window (newest rows back to `range`).
@@ -383,22 +414,36 @@ fn context_timespan(ts: DateTime<Utc>) -> String {
     )
 }
 
-/// Splice the errors-only filter (and an `older_than` cursor for pagination)
-/// in BEFORE the `| order by` clause. Both filters land in the same spot so
-/// the order by / take still see the narrowest possible row set.
+/// Splice the errors-only / hide-health filters (and an `older_than` cursor
+/// for pagination) in BEFORE the `| order by` clause. All filters land in the
+/// same spot so the order by / take still see the narrowest possible row set.
 fn build_kql(
     resource: &Resource,
     errors_only: bool,
+    hide_health: bool,
     older_than: Option<DateTime<Utc>>,
 ) -> anyhow::Result<String> {
-    let (template, errors_filter) = match resource.kind {
-        ResourceKind::FunctionApp => (KQL_FUNCTION_APP.to_string(), KQL_FUNCTION_APP_ERRORS_FILTER),
-        ResourceKind::WebApp => (KQL_WEB_APP.to_string(), KQL_WEB_APP_ERRORS_FILTER),
+    let (template, errors_filter, health_filter) = match resource.kind {
+        ResourceKind::FunctionApp => (
+            KQL_FUNCTION_APP.to_string(),
+            KQL_FUNCTION_APP_ERRORS_FILTER,
+            KQL_HEALTH_FILTER,
+        ),
+        ResourceKind::WebApp => (
+            KQL_WEB_APP.to_string(),
+            KQL_WEB_APP_ERRORS_FILTER,
+            KQL_HEALTH_FILTER,
+        ),
         ResourceKind::ContainerApp => (
             container_app_kql(&resource.name),
             KQL_CONTAINER_APP_ERRORS_FILTER,
+            KQL_CONTAINER_APP_HEALTH_FILTER,
         ),
-        ResourceKind::Apim => (KQL_APIM.to_string(), KQL_APIM_ERRORS_FILTER),
+        ResourceKind::Apim => (
+            KQL_APIM.to_string(),
+            KQL_APIM_ERRORS_FILTER,
+            KQL_HEALTH_FILTER,
+        ),
         ResourceKind::AppGateway => {
             return Err(anyhow!(
                 "logs not supported for {:?} in v1 (no resource-centric Log Analytics template)",
@@ -409,12 +454,16 @@ fn build_kql(
 
     let template = template.replace("{limit}", &PAGE_SIZE.to_string());
 
-    // Build the filter block (zero, one, or two clauses) and splice it before
+    // Build the filter block (zero to three clauses) and splice it before
     // `| order by`. Each clause is a full `| where …` line; concatenated they
     // form a contiguous filter section.
     let mut filter_block = String::new();
     if errors_only {
         filter_block.push_str(errors_filter.trim());
+        filter_block.push('\n');
+    }
+    if hide_health {
+        filter_block.push_str(health_filter.replace("{re}", HEALTH_PATH_REGEX).trim());
         filter_block.push('\n');
     }
     if let Some(ts) = older_than {
@@ -978,7 +1027,7 @@ mod tests {
     #[test]
     fn web_app_kql_unions_app_service_tables() {
         let r = test_resource(ResourceKind::WebApp, "web");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains("AppServiceConsoleLogs"));
         assert!(kql.contains("AppServiceAppLogs"));
         assert!(kql.contains("AppServiceHTTPLogs"));
@@ -989,13 +1038,67 @@ mod tests {
     #[test]
     fn web_app_errors_filter_covers_http_5xx_and_precedes_order_by() {
         let r = test_resource(ResourceKind::WebApp, "web");
-        let kql = build_kql(&r, true, None).unwrap();
+        let kql = build_kql(&r, true, false, None).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let filter_idx = kql
             .find(r#"column_ifexists("ScStatus", int(0)) >= 500"#)
             .expect("ScStatus clause present");
         assert!(filter_idx < order_idx, "filter must come before order by");
         assert!(kql.contains(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#));
+    }
+
+    #[test]
+    fn build_kql_omits_health_filter_by_default() {
+        let r = test_resource(ResourceKind::WebApp, "web");
+        let kql = build_kql(&r, false, false, None).unwrap();
+        assert!(!kql.contains("matches regex"));
+    }
+
+    #[test]
+    fn build_kql_splices_health_filter_on_url_columns_before_order_by() {
+        for kind in [
+            ResourceKind::FunctionApp,
+            ResourceKind::WebApp,
+            ResourceKind::Apim,
+        ] {
+            let r = test_resource(kind, "api");
+            let kql = build_kql(&r, false, true, None).unwrap();
+            let order_idx = kql.find("| order by").expect("order by present");
+            let url_idx = kql
+                .find(r#"not(column_ifexists("Url", "") matches regex"#)
+                .expect("Url clause present");
+            assert!(url_idx < order_idx, "filter must come before order by");
+            assert!(kql.contains(r#"not(column_ifexists("CsUriStem", "") matches regex"#));
+            // The `{re}` placeholder must be fully substituted.
+            assert!(
+                !kql.contains("{re}"),
+                "unsubstituted placeholder in:\n{kql}"
+            );
+            assert!(kql.contains("robots933456"));
+        }
+    }
+
+    #[test]
+    fn build_kql_health_filter_targets_console_columns_for_container_apps() {
+        let r = test_resource(ResourceKind::ContainerApp, "ca-api");
+        let kql = build_kql(&r, false, true, None).unwrap();
+        assert!(kql.contains(r#"not(column_ifexists("Log_s", "") matches regex"#));
+        assert!(kql.contains(r#"not(column_ifexists("Log", "") matches regex"#));
+        assert!(!kql.contains("{re}"));
+    }
+
+    #[test]
+    fn build_kql_combines_errors_and_health_filters() {
+        let r = test_resource(ResourceKind::Apim, "apim");
+        let kql = build_kql(&r, true, true, None).unwrap();
+        let order_idx = kql.find("| order by").unwrap();
+        let errors_idx = kql
+            .find(r#"column_ifexists("ResponseCode", int(0)) >= 400"#)
+            .expect("errors clause present");
+        let health_idx = kql
+            .find(r#"not(column_ifexists("Url", "") matches regex"#)
+            .expect("health clause present");
+        assert!(errors_idx < health_idx && health_idx < order_idx);
     }
 
     #[test]
@@ -1073,7 +1176,7 @@ mod tests {
     #[test]
     fn errors_filter_inserted_before_order_by() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, true, None).unwrap();
+        let kql = build_kql(&r, true, false, None).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let filter_idx = kql
             .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
@@ -1084,14 +1187,14 @@ mod tests {
     #[test]
     fn no_filter_when_errors_only_false() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(!kql.contains("matches regex"));
     }
 
     #[test]
     fn apim_kql_queries_gateway_logs() {
         let r = test_resource(ResourceKind::Apim, "apim");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains("ApiManagementGatewayLogs"));
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains(&format!("take {PAGE_SIZE}")));
@@ -1100,7 +1203,7 @@ mod tests {
     #[test]
     fn apim_errors_filter_inserted_before_order_by() {
         let r = test_resource(ResourceKind::Apim, "apim");
-        let kql = build_kql(&r, true, None).unwrap();
+        let kql = build_kql(&r, true, false, None).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let filter_idx = kql
             .find(r#"column_ifexists("ResponseCode", int(0)) >= 400"#)
@@ -1111,7 +1214,7 @@ mod tests {
     #[test]
     fn appgw_kql_returns_err() {
         let r = test_resource(ResourceKind::AppGateway, "agw");
-        assert!(build_kql(&r, false, None).is_err());
+        assert!(build_kql(&r, false, false, None).is_err());
     }
 
     #[test]
@@ -1285,7 +1388,7 @@ mod tests {
     #[test]
     fn errors_filter_includes_function_app_logs_level() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, true, None).unwrap();
+        let kql = build_kql(&r, true, false, None).unwrap();
         assert!(
             kql.contains(r#"column_ifexists("Level", "") in ("Error", "Critical")"#),
             "errors-only filter must catch FunctionAppLogs Error/Critical rows"
@@ -1295,7 +1398,7 @@ mod tests {
     #[test]
     fn function_app_kql_uses_fuzzy_union_with_function_app_logs() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("FunctionAppLogs"));
     }
@@ -1407,7 +1510,7 @@ mod tests {
     #[test]
     fn container_app_kql_uses_fuzzy_union_over_both_tables() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains("isfuzzy=true"));
         assert!(kql.contains("ContainerAppConsoleLogs_CL"));
         // Modern table appears followed by newline+whitespace, not `_CL`.
@@ -1419,7 +1522,7 @@ mod tests {
         // Workspace-centric path requires a name filter; otherwise the whole
         // workspace's container apps come back interleaved.
         let r = test_resource(ResourceKind::ContainerApp, "files-api");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains(r#"column_ifexists("ContainerAppName_s", "") == "files-api""#));
         assert!(kql.contains(r#"column_ifexists("ContainerAppName", "") == "files-api""#));
     }
@@ -1429,14 +1532,14 @@ mod tests {
         // Defensive: a name containing `"` would otherwise close the KQL
         // string literal and let the rest be parsed as KQL.
         let r = test_resource(ResourceKind::ContainerApp, r#"bad"name"#);
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(kql.contains(r#"bad\"name"#));
     }
 
     #[test]
     fn container_app_errors_filter_uses_column_ifexists_for_both_log_columns() {
         let r = test_resource(ResourceKind::ContainerApp, "my-app");
-        let kql = build_kql(&r, true, None).unwrap();
+        let kql = build_kql(&r, true, false, None).unwrap();
         assert!(kql.contains(r#"column_ifexists("Log_s", "")"#));
         assert!(kql.contains(r#"column_ifexists("Log", "")"#));
     }
@@ -1456,7 +1559,7 @@ mod tests {
         let cursor = DateTime::parse_from_rfc3339("2026-05-19T03:17:43.123456Z")
             .unwrap()
             .with_timezone(&Utc);
-        let kql = build_kql(&r, false, Some(cursor)).unwrap();
+        let kql = build_kql(&r, false, false, Some(cursor)).unwrap();
         let where_idx = kql
             .find("| where TimeGenerated < datetime(")
             .expect("cursor clause present");
@@ -1482,7 +1585,7 @@ mod tests {
         let cursor = DateTime::parse_from_rfc3339("2026-05-19T03:17:43.1234567Z")
             .unwrap()
             .with_timezone(&Utc);
-        let kql = build_kql(&r, false, Some(cursor)).unwrap();
+        let kql = build_kql(&r, false, false, Some(cursor)).unwrap();
         assert!(
             kql.contains(r#"datetime("2026-05-19T03:17:43.123456700Z")"#),
             "cursor must not truncate the 100ns digit, got:\n{kql}"
@@ -1548,7 +1651,7 @@ mod tests {
         let cursor = DateTime::parse_from_rfc3339("2026-05-19T01:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let kql = build_kql(&r, true, Some(cursor)).unwrap();
+        let kql = build_kql(&r, true, false, Some(cursor)).unwrap();
         let order_idx = kql.find("| order by").expect("order by present");
         let errors_idx = kql
             .find(r#"column_ifexists("SeverityLevel", int(0)) >= 3"#)
@@ -1561,7 +1664,7 @@ mod tests {
     #[test]
     fn build_kql_substitutes_page_size_into_take() {
         let r = test_resource(ResourceKind::FunctionApp, "func");
-        let kql = build_kql(&r, false, None).unwrap();
+        let kql = build_kql(&r, false, false, None).unwrap();
         assert!(
             kql.contains(&format!("take {PAGE_SIZE}")),
             "expected `take {PAGE_SIZE}` in:\n{kql}"

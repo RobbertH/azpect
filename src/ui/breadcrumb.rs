@@ -204,6 +204,49 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        View::LogicApps => vec![subscription_segment(state), "logic apps".to_string()],
+
+        View::LogicAppRuns => {
+            let mut s = vec![subscription_segment(state), "logic apps".to_string()];
+            if let Some(wf) = state.logic_apps.selected_workflow.as_ref() {
+                s.push(wf.name.clone());
+            }
+            s.push("runs".to_string());
+            s
+        }
+
+        View::LogicAppTriggerHistory => {
+            let mut s = vec![subscription_segment(state), "logic apps".to_string()];
+            if let Some(wf) = state.logic_apps.selected_workflow.as_ref() {
+                s.push(wf.name.clone());
+            }
+            s.push("trigger history".to_string());
+            s
+        }
+
+        View::LogicAppRunDetail => {
+            let mut s = vec![subscription_segment(state), "logic apps".to_string()];
+            if let Some(wf) = state.logic_apps.selected_workflow.as_ref() {
+                s.push(wf.name.clone());
+            }
+            s.push("runs".to_string());
+            if let Some(run) = state.logic_apps.selected_run.as_ref() {
+                s.push(run.name.clone());
+            }
+            s
+        }
+
+        View::LogicAppContent => {
+            let mut s = vec![subscription_segment(state), "logic apps".to_string()];
+            if let Some(wf) = state.logic_apps.selected_workflow.as_ref() {
+                s.push(wf.name.clone());
+            }
+            if let Some(src) = state.logic_apps.selected_content.as_ref() {
+                s.push(src.title.clone());
+            }
+            s
+        }
+
         View::CosmosAccounts => vec![subscription_segment(state), "cosmos".to_string()],
 
         View::CosmosDatabases => {

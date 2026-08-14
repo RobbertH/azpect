@@ -20,7 +20,7 @@ use crate::ui::state::{AppState, LineAnchor};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  H hide /health  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -131,6 +131,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         if state.logs.errors_only {
             header_spans.push(Span::styled(
                 "· filter: errors only ✓ ",
+                Style::default().fg(theme.degraded),
+            ));
+        }
+        if state.logs.hide_health {
+            header_spans.push(Span::styled(
+                "· filter: health probes hidden ✓ ",
                 Style::default().fg(theme.degraded),
             ));
         }
@@ -1101,6 +1107,23 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.logs.error_hunt = false;
             true
         }
+        Action::ToggleHideHealth => {
+            // Same refetch dance as errors-only, minus the context jump: keep
+            // the selected line if it survives the new filter, invalidate the
+            // buffer, and let `after_action` force the fresh fetch.
+            let anchor = state.selected_log_line().map(|l| LineAnchor::of(&l));
+            state.logs.hide_health = !state.logs.hide_health;
+            state.logs.pending_anchor = anchor;
+            state.logs.generation = state.logs.generation.wrapping_add(1);
+            if let Some(id) = state.selected_resource().map(|r| r.id.clone()) {
+                state.logs.by_resource.remove(&id);
+            }
+            state.logs.scroll = 0;
+            state.logs.view_top.set(0);
+            state.logs.visual_anchor = None;
+            state.logs.error_hunt = false;
+            true
+        }
         // Source cycling, bound to Tab / Shift+Tab in this view.
         Action::CycleSourceFilter => {
             cycle_source_filter(state, 1);
@@ -1982,6 +2005,23 @@ mod tests {
         assert!(handle(Action::ToggleErrorsOnly, &mut state));
         assert!(state.logs.errors_only);
         assert!(!state.logs.by_resource.contains_key("/r/one"));
+    }
+
+    #[test]
+    fn toggle_hide_health_clears_cache_and_bumps_generation() {
+        let mut state = fixture(ResourceKind::FunctionApp);
+        state
+            .logs
+            .by_resource
+            .insert("/r/one".into(), vec![line(1, LogLevel::Info, "x", "y")]);
+        let generation = state.logs.generation;
+        assert!(handle(Action::ToggleHideHealth, &mut state));
+        assert!(state.logs.hide_health);
+        assert!(!state.logs.by_resource.contains_key("/r/one"));
+        assert_ne!(state.logs.generation, generation);
+        // Second press turns it back off (still refetching).
+        assert!(handle(Action::ToggleHideHealth, &mut state));
+        assert!(!state.logs.hide_health);
     }
 
     #[test]

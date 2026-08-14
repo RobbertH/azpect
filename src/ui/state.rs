@@ -47,6 +47,11 @@ pub enum Category {
     /// a utilization-sparkline detail view. Control-plane discovery via
     /// Resource Graph + Azure Monitor metrics. See [`crate::azure::sql`].
     Sql,
+    /// Consumption Logic Apps (`Microsoft.Logic/workflows`) and the run
+    /// history / trigger history / run actions / message content chain.
+    /// Read-only, control-plane except the pre-signed content links — see
+    /// [`crate::azure::logic_apps`].
+    LogicApps,
 }
 
 impl Category {
@@ -61,6 +66,7 @@ impl Category {
         Category::KeyVaults,
         Category::ServiceBus,
         Category::Sql,
+        Category::LogicApps,
     ];
 
     /// The top-level list view for this category — the screen the user lands
@@ -75,6 +81,7 @@ impl Category {
             Category::KeyVaults => View::KeyVaults,
             Category::ServiceBus => View::ServiceBusNamespaces,
             Category::Sql => View::SqlResources,
+            Category::LogicApps => View::LogicApps,
         }
     }
 
@@ -127,6 +134,13 @@ impl Category {
                     | View::SqlAuditEvents
                     | View::SqlAuditEventDetail
                     | View::SqlSessions,
+            ) | (
+                Category::LogicApps,
+                View::LogicApps
+                    | View::LogicAppRuns
+                    | View::LogicAppTriggerHistory
+                    | View::LogicAppRunDetail
+                    | View::LogicAppContent,
             )
         )
     }
@@ -177,6 +191,9 @@ impl Category {
             Category::Sql => {
                 state.sql = SqlCache::default();
             }
+            Category::LogicApps => {
+                state.logic_apps = LogicAppsCache::default();
+            }
         }
     }
 
@@ -192,6 +209,7 @@ impl Category {
             Category::KeyVaults => state.key_vault.vaults_cursor = 0,
             Category::ServiceBus => state.service_bus.namespaces_cursor = 0,
             Category::Sql => state.sql.cursor = 0,
+            Category::LogicApps => state.logic_apps.workflows_cursor = 0,
         }
     }
 
@@ -211,6 +229,7 @@ impl Category {
             Category::KeyVaults => &["keyvaults", "kv", "vaults"],
             Category::ServiceBus => &["servicebus", "sb", "bus"],
             Category::Sql => &["sql", "sqldb", "sqlpools"],
+            Category::LogicApps => &["logicapps", "logic", "workflows"],
         }
     }
 }
@@ -358,6 +377,24 @@ pub enum View {
     /// ⚠ Backed by **live T-SQL** (`sys.dm_exec_sessions` over TDS), not
     /// REST; gated by the `sql_live_queries` config flag.
     SqlSessions,
+    /// Top-level list of consumption Logic Apps across the selected
+    /// subscriptions. Opened via the `:logicapps` palette command (no
+    /// keybind). Enter pins the row and opens `LogicAppRuns`.
+    LogicApps,
+    /// Run history for the pinned workflow, newest first. Enter opens the
+    /// run's action breakdown; `t` opens the trigger firing history.
+    LogicAppRuns,
+    /// Trigger firing history for the pinned workflow (every poll/firing,
+    /// including skipped checks that started no run). Opened with `t` from
+    /// `LogicAppRuns`. Enter opens the firing's message content.
+    LogicAppTriggerHistory,
+    /// Action breakdown of the pinned run (plus a synthetic first row for the
+    /// trigger itself). Opened with Enter from `LogicAppRuns`. Enter opens
+    /// the action's message content.
+    LogicAppRunDetail,
+    /// Scrollable inputs/outputs message content for the pinned action or
+    /// trigger firing, downloaded from its pre-signed content links.
+    LogicAppContent,
     Help,
 }
 
@@ -1119,6 +1156,96 @@ impl CosmosCache {
     }
 }
 
+/// What the Logic App content view is showing: one action's (or trigger
+/// firing's) content links plus enough identity to title the pane and key the
+/// cache. Pinned by the Enter handlers of the run-detail / trigger-history
+/// views.
+#[derive(Clone, Debug)]
+pub struct LogicContentSource {
+    /// Cache key, unique per source row (see the pinning call sites).
+    pub key: String,
+    /// Human title, e.g. `Parse_JSON` or `trigger · When_a_message_arrives`.
+    pub title: String,
+    pub inputs: Option<crate::azure::logic_apps::ContentLink>,
+    pub outputs: Option<crate::azure::logic_apps::ContentLink>,
+    /// The view Enter was pressed in, so Esc returns to the right sibling
+    /// (run detail vs trigger history).
+    pub origin: View,
+}
+
+/// State for the Logic Apps drill-in views: workflows → run history (or
+/// trigger history) → run actions → message content. Same per-key cache
+/// discipline as [`RegistryCache`] / [`CosmosCache`]; only the workflow list
+/// carries a `/` filter — the history tiers are already scoped and capped.
+#[derive(Clone, Default)]
+pub struct LogicAppsCache {
+    /// All consumption Logic Apps for the current subscription scope.
+    /// `Option` distinguishes "never fetched" from "fetched and empty".
+    pub workflows: Option<Vec<crate::azure::logic_apps::LogicApp>>,
+    pub workflows_pending: bool,
+    pub workflows_error: Option<String>,
+    pub workflows_cursor: usize,
+    /// First visible row of the workflows table (see `RegistryCache` for the
+    /// pattern rationale).
+    pub workflows_view_top: Cell<usize>,
+    pub workflows_filter: Input,
+    pub workflows_filter_active: bool,
+    /// Workflow pinned by Enter; everything below is scoped to it.
+    pub selected_workflow: Option<crate::azure::logic_apps::LogicApp>,
+
+    /// Run history, keyed by workflow ARM id.
+    pub runs: HashMap<String, Vec<crate::azure::logic_apps::WorkflowRun>>,
+    pub runs_pending: HashSet<String>,
+    pub runs_error: HashMap<String, String>,
+    pub runs_cursor: usize,
+    pub runs_view_top: Cell<usize>,
+    /// Run pinned by Enter for the actions view; carries the trigger's
+    /// content links for the synthetic trigger row.
+    pub selected_run: Option<crate::azure::logic_apps::WorkflowRun>,
+
+    /// Trigger firing history, keyed by workflow ARM id.
+    pub trigger_history: HashMap<String, Vec<crate::azure::logic_apps::TriggerHistory>>,
+    pub trigger_history_pending: HashSet<String>,
+    pub trigger_history_error: HashMap<String, String>,
+    pub trigger_history_cursor: usize,
+    pub trigger_history_view_top: Cell<usize>,
+
+    /// Run actions, keyed by `"{workflow_id}/{run_name}"`.
+    pub actions: HashMap<String, Vec<crate::azure::logic_apps::RunAction>>,
+    pub actions_pending: HashSet<String>,
+    pub actions_error: HashMap<String, String>,
+    pub actions_cursor: usize,
+    pub actions_view_top: Cell<usize>,
+
+    /// Downloaded message content, keyed by [`LogicContentSource::key`].
+    pub content: HashMap<String, crate::azure::logic_apps::ActionContent>,
+    pub content_pending: HashSet<String>,
+    pub content_error: HashMap<String, String>,
+    /// Vertical scroll offset inside the content pane.
+    pub content_scroll: u16,
+    /// Source pinned by Enter in the run-detail / trigger-history views.
+    pub selected_content: Option<LogicContentSource>,
+}
+
+impl LogicAppsCache {
+    /// Cache key for one run's actions.
+    pub fn actions_key(workflow_id: &str, run_name: &str) -> String {
+        format!("{workflow_id}/{run_name}")
+    }
+
+    /// Apply `workflows_filter` (case-insensitive substring on the name).
+    pub fn filtered_workflows(&self) -> Vec<&crate::azure::logic_apps::LogicApp> {
+        let needle = self.workflows_filter.value().to_lowercase();
+        match &self.workflows {
+            Some(rows) => rows
+                .iter()
+                .filter(|w| needle.is_empty() || w.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// State for the Key Vault drill-in views. Two levels deep: vaults → items
 /// (secrets / certs / — keys deferred). Same per-key cache discipline as
 /// [`RegistryCache`]; the items map is keyed by `(vault_id, kind)` so the two
@@ -1828,6 +1955,11 @@ pub struct LogsCache {
     pub fetch_more_requested: bool,
     pub range: TimeRange,
     pub errors_only: bool,
+    /// Server-side "hide health probes" filter (`H`): the KQL query drops
+    /// request rows whose URL targets a conventional health-check route
+    /// (see [`crate::azure::logs::HEALTH_PATH_REGEX`]), so probe spam stops
+    /// eating into the page budget. Like `errors_only`, toggling refetches.
+    pub hide_health: bool,
     /// Client-side filter on `LogLine::source` (for Container Apps the
     /// emitting container, for Function Apps the table/function). `None`
     /// shows every cached line. Cycled with `s` through the distinct sources
@@ -2083,6 +2215,7 @@ pub struct AppState {
     pub storage: StorageCache,
     pub registry: RegistryCache,
     pub cosmos: CosmosCache,
+    pub logic_apps: LogicAppsCache,
     pub key_vault: KeyVaultCache,
     pub service_bus: ServiceBusCache,
     pub sql: SqlCache,
@@ -2197,6 +2330,7 @@ impl AppState {
             storage: StorageCache::default(),
             registry: RegistryCache::default(),
             cosmos: CosmosCache::default(),
+            logic_apps: LogicAppsCache::default(),
             key_vault: KeyVaultCache::default(),
             service_bus: ServiceBusCache::default(),
             sql: SqlCache::default(),
@@ -2238,6 +2372,7 @@ impl AppState {
         self.logs = LogsCache {
             range: self.logs.range,
             errors_only: self.logs.errors_only,
+            hide_health: self.logs.hide_health,
             // Orphan any in-flight fetch: a late page from the old identity
             // must not repopulate the buffer we just flushed.
             generation: self.logs.generation.wrapping_add(1),

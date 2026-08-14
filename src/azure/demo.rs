@@ -31,6 +31,9 @@ use crate::azure::env_vars::EnvVar;
 use crate::azure::function_app_config::WebConfig;
 use crate::azure::function_app_triggers::FunctionTrigger;
 use crate::azure::key_vault::{ItemKind, KeyVault, KeyVaultItem};
+use crate::azure::logic_apps::{
+    ActionContent, ContentLink, LogicApp, RunAction, TriggerHistory, WorkflowRun,
+};
 use crate::azure::logs::{LogLevel, LogLine, LogsPage};
 use crate::azure::metrics::{MetricKind, MetricPoint, MetricSeries, MetricsResult, TimeRange};
 use crate::azure::registries::{Registry, Repository, Tag};
@@ -1025,6 +1028,206 @@ pub fn tags(_repository: &str) -> Vec<Tag> {
 }
 
 // ---------------------------------------------------------------------------
+// Logic Apps
+// ---------------------------------------------------------------------------
+
+pub fn logic_apps(sub_ids: &[String]) -> Vec<LogicApp> {
+    let now = Utc::now();
+    let wf = |sub: &str, rg: &str, name: &str, state: &str, changed_days: i64| LogicApp {
+        id: resource_id(sub, rg, "Microsoft.Logic/workflows", name),
+        name: name.to_string(),
+        resource_group: rg.to_string(),
+        subscription_id: sub.to_string(),
+        location: LOCATION.to_string(),
+        state: Some(state.to_string()),
+        changed_at: Some(now - Duration::days(changed_days)),
+        created_at: Some(now - Duration::days(changed_days + 240)),
+    };
+    let mut all = vec![
+        wf(
+            SUB_PROD,
+            "rg-commerce-prod",
+            "logic-order-webhooks",
+            "Enabled",
+            12,
+        ),
+        wf(
+            SUB_PROD,
+            "rg-commerce-prod",
+            "logic-invoice-batch",
+            "Enabled",
+            45,
+        ),
+        wf(
+            SUB_STAGING,
+            "rg-commerce-staging",
+            "logic-legacy-sync",
+            "Disabled",
+            420,
+        ),
+    ];
+    all.retain(|w| in_subs(&w.subscription_id, sub_ids));
+    all
+}
+
+/// Deterministic demo run id, unique per workflow + index (real run names are
+/// opaque sortable stamps of about this shape).
+fn demo_run_name(i: usize) -> String {
+    format!("0858528755410433{:04}", 4735 + i)
+}
+
+pub fn logic_app_runs(workflow: &LogicApp) -> Vec<WorkflowRun> {
+    let now = Utc::now();
+    let trigger = if workflow.name.contains("batch") {
+        "Recurrence"
+    } else {
+        "When_a_HTTP_request_is_received"
+    };
+    (0..40)
+        .map(|i| {
+            let start = now - Duration::minutes(i as i64 * 17 + 3);
+            let failed = noise(41, i) > 0.85;
+            let running = i == 0 && noise(43, i) > 0.5;
+            let (status, end, error) = if running {
+                ("Running".to_string(), None, None)
+            } else if failed {
+                (
+                    "Failed".to_string(),
+                    Some(start + Duration::seconds(2 + (noise(47, i) * 20.0) as i64)),
+                    Some("ActionFailed: An action failed. No dependent actions succeeded.".into()),
+                )
+            } else {
+                (
+                    "Succeeded".to_string(),
+                    Some(start + Duration::seconds(1 + (noise(47, i) * 8.0) as i64)),
+                    None,
+                )
+            };
+            WorkflowRun {
+                name: demo_run_name(i),
+                status,
+                start_time: Some(start),
+                end_time: end,
+                trigger_name: Some(trigger.to_string()),
+                // Demo mode never dereferences the links (the content loader
+                // short-circuits to `logic_app_content`), but keep them Some
+                // so the UI paths that check for link presence behave real.
+                trigger_inputs: Some(demo_link(256)),
+                trigger_outputs: Some(demo_link(512)),
+                error,
+                correlation_id: Some(format!("order-{}", 18_400 + i)),
+            }
+        })
+        .collect()
+}
+
+fn demo_link(size: i64) -> ContentLink {
+    ContentLink {
+        uri: "https://prod-01.westeurope.logic.azure.com/demo?sig=redacted".into(),
+        size: Some(size),
+    }
+}
+
+pub fn logic_app_trigger_history(workflow: &LogicApp) -> Vec<TriggerHistory> {
+    let now = Utc::now();
+    let trigger = if workflow.name.contains("batch") {
+        "Recurrence"
+    } else {
+        "When_a_HTTP_request_is_received"
+    };
+    (0..60)
+        .map(|i| {
+            let start = now - Duration::minutes(i as i64 * 11 + 1);
+            // Polling-style history: most checks fire nothing.
+            let fired = noise(53, i) > 0.6;
+            TriggerHistory {
+                name: format!("0858528755499{:05}", 10_000 + i),
+                trigger_name: trigger.to_string(),
+                status: "Succeeded".to_string(),
+                fired,
+                start_time: Some(start),
+                end_time: Some(start + Duration::seconds(1)),
+                run_name: fired.then(|| demo_run_name(i / 2)),
+                inputs: Some(demo_link(128)),
+                outputs: fired.then(|| demo_link(384)),
+            }
+        })
+        .collect()
+}
+
+pub fn logic_app_actions(run_name: &str) -> Vec<RunAction> {
+    let now = Utc::now();
+    let action =
+        |name: &str, status: &str, code: &str, offset_s: i64, error: Option<&str>| RunAction {
+            name: name.to_string(),
+            status: status.to_string(),
+            code: Some(code.to_string()),
+            start_time: Some(now - Duration::minutes(5) + Duration::seconds(offset_s)),
+            end_time: Some(now - Duration::minutes(5) + Duration::seconds(offset_s + 1)),
+            error: error.map(str::to_owned),
+            inputs: Some(demo_link(256)),
+            outputs: Some(demo_link(512)),
+        };
+    // A run whose id ends in an odd digit demos the failure shape.
+    let failing = run_name
+        .chars()
+        .last()
+        .and_then(|c| c.to_digit(10))
+        .is_some_and(|d| d % 2 == 1);
+    let mut actions = vec![
+        action("Parse_order_payload", "Succeeded", "OK", 0, None),
+        action("Lookup_customer", "Succeeded", "OK", 1, None),
+    ];
+    if failing {
+        actions.push(action(
+            "Post_to_billing_api",
+            "Failed",
+            "BadGateway",
+            2,
+            Some("Http: 502 from https://billing.internal.contoso.com/invoices"),
+        ));
+        actions.push(action(
+            "Notify_ops_channel",
+            "Skipped",
+            "ActionSkipped",
+            3,
+            None,
+        ));
+    } else {
+        actions.push(action("Post_to_billing_api", "Succeeded", "OK", 2, None));
+        actions.push(action("Send_confirmation", "Succeeded", "OK", 3, None));
+    }
+    actions
+}
+
+pub fn logic_app_content(key: &str) -> ActionContent {
+    // Shape the payload by what the key points at so drilling around the demo
+    // shows plausibly different content per row.
+    let inputs = if key.contains("/trigger") {
+        serde_json::json!({
+            "method": "POST",
+            "path": "/orders/webhook",
+            "headers": { "Content-Type": "application/json", "X-Correlation-Id": "order-18452" },
+            "body": { "orderId": 18452, "customerId": "cus_9911", "total": 219.90, "currency": "EUR" }
+        })
+    } else {
+        serde_json::json!({
+            "uri": "https://billing.internal.contoso.com/invoices",
+            "method": "POST",
+            "body": { "orderId": 18452, "lines": [ { "sku": "sku-4100", "qty": 2 } ] }
+        })
+    };
+    let outputs = serde_json::json!({
+        "statusCode": if key.contains("Post_to_billing_api") && key.ends_with('1') { 502 } else { 200 },
+        "body": { "accepted": true, "invoiceId": "inv_77120" }
+    });
+    ActionContent {
+        inputs: Some(serde_json::to_string_pretty(&inputs).unwrap_or_default()),
+        outputs: Some(serde_json::to_string_pretty(&outputs).unwrap_or_default()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cosmos DB
 // ---------------------------------------------------------------------------
 
@@ -1918,14 +2121,17 @@ pub fn sb_subscriptions(
 // ---------------------------------------------------------------------------
 
 /// One page of synthesized logs for a resource. Mirrors `logs::fetch`:
-/// `errors_only` filters to Warn/Error, an `older_than` cursor returns an
-/// empty terminal page (`has_more: false`), and Function App / Container App /
-/// APIM each get their native log shape (the APIM lines look exactly like
-/// parsed `ApiManagementGatewayLogs` request rows).
+/// `errors_only` filters to Warn/Error, `hide_health` drops health-probe
+/// request lines (the demo-mode mirror of the KQL hide-health filter), an
+/// `older_than` cursor returns an empty terminal page (`has_more: false`),
+/// and Function App / Container App / APIM each get their native log shape
+/// (the APIM lines look exactly like parsed `ApiManagementGatewayLogs`
+/// request rows).
 pub fn logs(
     resource: &Resource,
     range: TimeRange,
     errors_only: bool,
+    hide_health: bool,
     older_than: Option<DateTime<Utc>>,
     around: Option<DateTime<Utc>>,
 ) -> LogsPage {
@@ -1951,11 +2157,56 @@ pub fn logs(
     } else if errors_only {
         lines.retain(|l| matches!(l.level, LogLevel::Warn | LogLevel::Error));
     }
+    // Like the real KQL filter, hide-health composes with both branches above.
+    if hide_health {
+        lines.retain(|l| !is_health_probe_request(&l.message));
+    }
     LogsPage {
         lines,
         has_more: false,
         workspace_arm_id: None,
     }
+}
+
+/// Demo-mode mirror of the KQL hide-health filter
+/// ([`crate::azure::logs::HEALTH_PATH_REGEX`]): true when the rendered message
+/// contains a request path (or URL) whose trailing segment is a conventional
+/// health-probe route.
+fn is_health_probe_request(message: &str) -> bool {
+    const PROBE_SUFFIXES: &[&str] = &[
+        "/health",
+        "/healthz",
+        "/healthcheck",
+        "/health/live",
+        "/health/ready",
+        "/health/startup",
+        "/livez",
+        "/readyz",
+        "/liveness",
+        "/readiness",
+        "/ping",
+        "/alive",
+        "/hc",
+        "/robots933456.txt",
+    ];
+    message
+        .split_whitespace()
+        .filter_map(|token| {
+            // Strip any query string, then the scheme + host of absolute URLs,
+            // keeping only path-shaped tokens.
+            let token = token.split('?').next().unwrap_or(token);
+            match token.find("://") {
+                Some(idx) => {
+                    let after_host = &token[idx + 3..];
+                    after_host.find('/').map(|slash| &after_host[slash..])
+                }
+                None => token.starts_with('/').then_some(token),
+            }
+        })
+        .any(|path| {
+            let path = path.trim_end_matches('/').to_ascii_lowercase();
+            PROBE_SUFFIXES.iter().any(|s| path.ends_with(s))
+        })
 }
 
 /// Number of synthesized log lines per window — enough to scroll through but
@@ -2014,6 +2265,21 @@ fn function_app_log_lines(range: TimeRange) -> Vec<LogLine> {
                         ("OperationName", "GetOrderStatus".to_string()),
                         ("DurationMs", format!("{}", 18 + (noise(3, i) * 40.0) as i64)),
                         ("ClientIP", "203.0.113.42".to_string()),
+                    ],
+                ),
+                1 => line(
+                    ts,
+                    LogLevel::Info,
+                    "AppRequests",
+                    "200 GET /api/health".to_string(),
+                    vec![
+                        ("OperationName", "GET /api/health".to_string()),
+                        (
+                            "Url",
+                            "https://func-orders-prod.azurewebsites.net/api/health".to_string(),
+                        ),
+                        ("DurationMs", "2".to_string()),
+                        ("ClientIP", "10.0.2.4".to_string()),
                     ],
                 ),
                 3 => line(
@@ -2089,6 +2355,18 @@ fn web_app_log_lines(range: TimeRange) -> Vec<LogLine> {
                         ("TimeTaken", ms.to_string()),
                     ],
                 ),
+                2 => line(
+                    ts,
+                    LogLevel::Info,
+                    "AppServiceHTTPLogs",
+                    "200 GET /robots933456.txt  ·  1ms".to_string(),
+                    vec![
+                        ("CsMethod", "GET".to_string()),
+                        ("CsUriStem", "/robots933456.txt".to_string()),
+                        ("ScStatus", "200".to_string()),
+                        ("TimeTaken", "1".to_string()),
+                    ],
+                ),
                 3 if noise(31, i) > 0.85 => line(
                     ts,
                     LogLevel::Warn,
@@ -2146,7 +2424,7 @@ fn container_app_log_lines(app: &str, range: TimeRange) -> Vec<LogLine> {
                 ),
                 8 => (
                     LogLevel::Info,
-                    format!("INFO health: readiness probe ok (uptime {}h)", 14 + i % 70),
+                    format!("INFO http: 200 GET /health/ready ({}ms)", 1 + i % 3),
                 ),
                 _ => (
                     LogLevel::Info,
@@ -2181,6 +2459,7 @@ fn apim_log_lines(range: TimeRange) -> Vec<LogLine> {
     let routes: &[(&str, &str, &str, &str)] = &[
         ("GET", "/orders/ord_18452", "orders-api", "get-by-id"),
         ("POST", "/orders", "orders-api", "create"),
+        ("GET", "/health", "platform-api", "health"),
         ("GET", "/catalog/items?page=2", "catalog-api", "list"),
         ("POST", "/payments/captures", "payments-api", "create"),
         ("GET", "/orders?status=open", "orders-api", "list"),
@@ -2245,6 +2524,61 @@ fn apim_log_lines(range: TimeRange) -> Vec<LogLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hide_health_drops_probe_lines_but_not_real_requests() {
+        assert!(is_health_probe_request("200 GET /api/health"));
+        assert!(is_health_probe_request(
+            "200 GET /health  ·  2ms (backend 1ms)"
+        ));
+        assert!(is_health_probe_request(
+            "INFO http: 200 GET /health/ready (2ms)"
+        ));
+        assert!(is_health_probe_request("200 GET /robots933456.txt  ·  1ms"));
+        assert!(is_health_probe_request(
+            "Request finished HTTP/1.1 GET https://ca-api.contoso.com/healthz - 200"
+        ));
+        assert!(!is_health_probe_request(
+            "200 GET /orders/ord_18452  ·  22ms"
+        ));
+        assert!(!is_health_probe_request("200 GET /health-records/42"));
+        assert!(!is_health_probe_request(
+            "ERROR health check failed: redis down"
+        ));
+
+        // End-to-end through the demo fetch: probes present by default, gone
+        // with the toggle, and non-probe traffic survives.
+        for kind in [
+            ResourceKind::FunctionApp,
+            ResourceKind::WebApp,
+            ResourceKind::ContainerApp,
+            ResourceKind::Apim,
+        ] {
+            let r = resources(&[])
+                .into_iter()
+                .find(|r| r.kind == kind)
+                .expect("demo resource for kind");
+            let all = logs(&r, TimeRange::Hour, false, false, None, None);
+            let filtered = logs(&r, TimeRange::Hour, false, true, None, None);
+            assert!(
+                all.lines
+                    .iter()
+                    .any(|l| is_health_probe_request(&l.message)),
+                "{kind:?} demo data should contain probe lines"
+            );
+            assert!(
+                filtered
+                    .lines
+                    .iter()
+                    .all(|l| !is_health_probe_request(&l.message)),
+                "{kind:?} filtered page must not contain probe lines"
+            );
+            assert!(
+                !filtered.lines.is_empty(),
+                "{kind:?} filtered page must keep real traffic"
+            );
+        }
+    }
 
     #[test]
     fn every_resource_belongs_to_a_demo_subscription() {
@@ -2395,7 +2729,7 @@ mod tests {
         let rs = resources(&[]);
         let apim = rs.iter().find(|r| r.kind == ResourceKind::Apim).unwrap();
 
-        let page = logs(apim, TimeRange::Hour, false, None, None);
+        let page = logs(apim, TimeRange::Hour, false, false, None, None);
         assert!(!page.lines.is_empty());
         assert!(
             !page.has_more,
@@ -2415,7 +2749,7 @@ mod tests {
             assert!(w[0].ts >= w[1].ts);
         }
 
-        let errors = logs(apim, TimeRange::Hour, true, None, None);
+        let errors = logs(apim, TimeRange::Hour, true, false, None, None);
         assert!(
             !errors.lines.is_empty(),
             "demo data must include some 4xx/5xx"
@@ -2426,7 +2760,7 @@ mod tests {
             .all(|l| matches!(l.level, LogLevel::Warn | LogLevel::Error)));
 
         // Pagination cursor terminates immediately.
-        let older = logs(apim, TimeRange::Hour, false, Some(Utc::now()), None);
+        let older = logs(apim, TimeRange::Hour, false, false, Some(Utc::now()), None);
         assert!(older.lines.is_empty());
         assert!(!older.has_more);
     }
@@ -2439,11 +2773,36 @@ mod tests {
             .iter()
             .all(|a| a.subscription_id == SUB_STAGING));
         assert!(!registries(&[]).is_empty());
+        assert!(!logic_apps(&[]).is_empty());
+        assert!(logic_apps(&[SUB_STAGING.to_string()])
+            .iter()
+            .all(|w| w.subscription_id == SUB_STAGING));
         assert!(!cosmos_accounts(&[]).is_empty());
         assert!(!key_vaults(&[]).is_empty());
         assert!(!sb_namespaces(&[]).is_empty());
         assert!(!key_vault_items(ItemKind::Secret).is_empty());
         assert!(!key_vault_items(ItemKind::Certificate).is_empty());
+    }
+
+    #[test]
+    fn logic_app_demo_history_is_self_consistent() {
+        let wf = &logic_apps(&[])[0];
+        let runs = logic_app_runs(wf);
+        assert!(!runs.is_empty());
+        assert!(runs.iter().all(|r| r.trigger_name.is_some()));
+        // Both outcome shapes must be demoable.
+        assert!(runs.iter().any(|r| r.status == "Succeeded"));
+        assert!(runs
+            .iter()
+            .any(|r| r.status == "Failed" && r.error.is_some()));
+        let hist = logic_app_trigger_history(wf);
+        assert!(hist.iter().any(|h| h.fired) && hist.iter().any(|h| !h.fired));
+        // Fired checks reference the run they started; skipped ones don't.
+        assert!(hist.iter().all(|h| h.fired == h.run_name.is_some()));
+        let actions = logic_app_actions(&runs[0].name);
+        assert!(!actions.is_empty());
+        let content = logic_app_content("wf/runs/r1/trigger");
+        assert!(content.inputs.is_some() && content.outputs.is_some());
     }
 
     #[test]

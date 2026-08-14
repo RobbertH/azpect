@@ -219,6 +219,37 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::registries::Tag>, String>,
     },
+    /// Background load completion: list of consumption Logic Apps for the
+    /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
+    LogicAppsLoaded {
+        scope: u64,
+        result: Result<Vec<crate::azure::logic_apps::LogicApp>, String>,
+    },
+    /// Background load completion: run history for one workflow, keyed by
+    /// workflow ARM id.
+    LogicAppRunsLoaded {
+        workflow_id: String,
+        result: Result<Vec<crate::azure::logic_apps::WorkflowRun>, String>,
+    },
+    /// Background load completion: trigger firing history for one workflow,
+    /// keyed by workflow ARM id.
+    LogicAppTriggerHistoryLoaded {
+        workflow_id: String,
+        result: Result<Vec<crate::azure::logic_apps::TriggerHistory>, String>,
+    },
+    /// Background load completion: action breakdown for one run, keyed by the
+    /// `(workflow_id, run_name)` pair flattened by
+    /// [`crate::ui::state::LogicAppsCache::actions_key`].
+    LogicAppActionsLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::logic_apps::RunAction>, String>,
+    },
+    /// Background load completion: downloaded message content for one action /
+    /// trigger firing, keyed by [`crate::ui::state::LogicContentSource::key`].
+    LogicAppContentLoaded {
+        key: String,
+        result: Result<crate::azure::logic_apps::ActionContent, String>,
+    },
     /// Background load completion: list of Cosmos DB (SQL/Core) accounts for
     /// the current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
     CosmosAccountsLoaded {
@@ -381,6 +412,12 @@ pub enum Action {
     OpenSelected,
     OpenLogs,
     ToggleErrorsOnly,
+    /// Logs view: toggle the server-side "hide health probes" filter — the
+    /// KQL query drops request rows whose URL targets a conventional
+    /// health-check route (`/health`, `/healthz`, liveness/readiness probes,
+    /// App Service's `/robots933456.txt` warm-up ping). Bound to `H`, scoped
+    /// to the logs view.
+    ToggleHideHealth,
     ToggleFavorite,
     ToggleFavoritesOnly,
     StartSearch,
@@ -430,6 +467,9 @@ pub enum Action {
     /// Open the top-level Container Registries mode. Bound to `R` (capital so
     /// it doesn't collide with `r` = refresh).
     OpenRegistries,
+    /// Logic Apps run-history view: open the pinned workflow's trigger firing
+    /// history. Bound to `t` inside `LogicAppRuns` only.
+    OpenTriggerHistory,
     Refresh,
     SetWindowHour,
     SetWindowDay,
@@ -604,6 +644,11 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::Logs => Action::JumpToError,
             _ => Action::Noop,
         },
+        // `H` hides health-probe requests server-side; scoped like `E`.
+        KeyCode::Char('H') => match view {
+            View::Logs => Action::ToggleHideHealth,
+            _ => Action::Noop,
+        },
         // Access-logs-only keys, scoped so they stay free elsewhere.
         KeyCode::Char('m') => match view {
             View::KeyVaultAccessLogs => Action::ToggleExcludeSelf,
@@ -613,6 +658,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::KeyVaultAccessLogs | View::SqlAuditPrincipals | View::SqlAuditEvents => {
                 Action::SetCustomWindow
             }
+            View::LogicAppRuns => Action::OpenTriggerHistory,
             _ => Action::Noop,
         },
         KeyCode::Char('x') => Action::DecodeSecret,
@@ -843,6 +889,22 @@ mod tests {
         assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
         assert_eq!(key_to_action(key('q'), v, false), Action::Back);
         assert_eq!(key_to_action(key('o'), v, false), Action::OpenInBrowser);
+    }
+
+    #[test]
+    fn shift_h_toggles_hide_health_in_logs_only() {
+        assert_eq!(
+            key_to_action(key_shift('H'), View::Logs, false),
+            Action::ToggleHideHealth
+        );
+        assert_eq!(
+            key_to_action(key_shift('H'), View::List, false),
+            Action::Noop
+        );
+        assert_eq!(
+            key_to_action(key_shift('H'), View::LogDetail, false),
+            Action::Noop
+        );
     }
 
     #[test]
