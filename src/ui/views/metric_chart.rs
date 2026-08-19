@@ -92,6 +92,9 @@ pub(crate) fn render_chart_row(
 pub(crate) fn color_for_metric(kind: MetricKind, theme: &Theme) -> Color {
     match kind {
         MetricKind::Traffic => theme.accent,
+        // The "real work" series on a Function App — green so it reads as
+        // healthy activity next to the platform-noise Requests row above it.
+        MetricKind::Executions => theme.healthy,
         MetricKind::Errors => theme.critical,
         MetricKind::ClientErrors => theme.client_error,
         MetricKind::Cpu => theme.healthy,
@@ -266,6 +269,11 @@ pub(crate) fn short_missing_reason(reason: &str) -> String {
         // resource's plan/tier (e.g. CpuTime on a non-Consumption Function App,
         // or dtu_consumption_percent on a vCore SQL database).
         "metric not exposed for this plan/tier".to_string()
+    } else if reason.contains("SEM0100") || reason.contains("Failed to resolve table") {
+        // The Executions row's Log Analytics query references `AppRequests`
+        // directly; an app without workspace-based App Insights fails table
+        // resolution server-side.
+        "no App Insights telemetry (AppRequests) in a workspace".to_string()
     } else if reason.contains("403") || reason.contains("Forbidden") {
         "permission denied (need Monitoring Reader)".to_string()
     } else if reason.contains("404") {

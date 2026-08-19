@@ -377,6 +377,19 @@ pub fn metrics(resource: &Resource, range: TimeRange) -> MetricsResult {
     match resource.kind {
         // Web Apps share the Microsoft.Web/sites metric shapes.
         ResourceKind::FunctionApp | ResourceKind::WebApp => {
+            // Function Apps only: the App-Insights-backed Executions series,
+            // deliberately much busier than Requests — the realistic shape for
+            // an event-triggered app whose Requests row is just platform pings.
+            if resource.kind == ResourceKind::FunctionApp {
+                out.series.push(series(
+                    MetricKind::Executions,
+                    "Executions",
+                    "count",
+                    range,
+                    seed.wrapping_add(5),
+                    |_i, wave, nz| (150.0 + 900.0 * wave + 200.0 * nz).round(),
+                ));
+            }
             out.series.push(series(
                 MetricKind::Cpu,
                 "CPU",
@@ -2187,14 +2200,19 @@ fn is_health_probe_request(message: &str) -> bool {
         "/ping",
         "/alive",
         "/hc",
+        "/warmup",
         "/robots933456.txt",
     ];
     message
         .split_whitespace()
         .filter_map(|token| {
-            // Strip any query string, then the scheme + host of absolute URLs,
-            // keeping only path-shaped tokens.
+            // Strip any query string, then surrounding punctuation (URLs
+            // embedded in JSON-ish log text arrive as `'http://…/health',` —
+            // mirrors the KQL regex's `[^\w/.-]` terminator class), then the
+            // scheme + host of absolute URLs, keeping only path-shaped tokens.
             let token = token.split('?').next().unwrap_or(token);
+            let token =
+                token.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || "_/.-".contains(c)));
             match token.find("://") {
                 Some(idx) => {
                     let after_host = &token[idx + 3..];
@@ -2281,6 +2299,13 @@ fn function_app_log_lines(range: TimeRange) -> Vec<LogLine> {
                         ("DurationMs", "2".to_string()),
                         ("ClientIP", "10.0.2.4".to_string()),
                     ],
+                ),
+                2 => line(
+                    ts,
+                    LogLevel::Info,
+                    "FunctionAppLogs",
+                    "{'level': 'INFO', 'logger': 'trace', 'message': 'Request finished', 'url': 'http://func-orders-prod.azurewebsites.net/admin/warmup', 'user': null, 'status_code': 404}".to_string(),
+                    vec![("Category", "Host.Function.Console".to_string())],
                 ),
                 3 => line(
                     ts,
@@ -2538,10 +2563,19 @@ mod tests {
         assert!(is_health_probe_request(
             "Request finished HTTP/1.1 GET https://ca-api.contoso.com/healthz - 200"
         ));
+        // Functions worker trace lines embed the URL in quoted JSON — the
+        // shape FunctionAppLogs ships when an in-app logger prints requests.
+        assert!(is_health_probe_request(
+            "{'level': 'INFO', 'message': 'Request finished', 'url': 'http://api.azurewebsites.net/health', 'status_code': 200}"
+        ));
+        assert!(is_health_probe_request(
+            "{'level': 'INFO', 'message': 'Request started', 'url': 'http://api.azurewebsites.net/admin/warmup', 'user': null}"
+        ));
         assert!(!is_health_probe_request(
             "200 GET /orders/ord_18452  ·  22ms"
         ));
         assert!(!is_health_probe_request("200 GET /health-records/42"));
+        assert!(!is_health_probe_request("200 GET /warmup-cache/refresh"));
         assert!(!is_health_probe_request(
             "ERROR health check failed: redis down"
         ));
@@ -2693,7 +2727,9 @@ mod tests {
             .unwrap();
 
         let hour = metrics(func, TimeRange::Hour);
-        assert_eq!(hour.series.len(), 5);
+        // 5 Monitor kinds + the Function-App-only Executions series.
+        assert_eq!(hour.series.len(), 6);
+        assert!(hour.series.iter().any(|s| s.kind == MetricKind::Executions));
         assert!(hour.series.iter().all(|s| s.points.len() == 60));
         assert!(hour.missing.is_empty());
 

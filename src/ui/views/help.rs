@@ -54,7 +54,7 @@ const DETAIL_LOGS: Section = (
         ("E", "jump to next error, fetching older rows (logs)"),
         (
             "H",
-            "hide health-probe requests (/health, /healthz, …) (logs)",
+            "hide health-probe requests (/health, /healthz, /warmup, …) (logs)",
         ),
         ("Tab / S-Tab", "cycle source filter (logs)"),
         ("s", "shell into container (Container App detail/logs)"),
@@ -64,6 +64,18 @@ const DETAIL_LOGS: Section = (
         ("n / N", "next / prev match (logs)"),
         ("V", "visual-line select for yank (logs)"),
         ("l", "open logs (detail)"),
+        (
+            "Requests",
+            "HTTP hits on the site's front end, not fn executions",
+        ),
+        (
+            "⚠ fn apps",
+            "event-triggered apps still count Always On / probe pings",
+        ),
+        (
+            "Executions",
+            "actual fn invocations, any trigger (App Insights, fn apps)",
+        ),
     ],
 );
 
@@ -514,6 +526,7 @@ mod tests {
         let s = render_from(Some(View::Detail));
         assert!(s.contains("API resources"));
         assert!(s.contains("Detail / Logs"));
+        assert!(s.contains("HTTP hits"));
         assert!(s.contains("Health badge"));
         assert!(s.contains("APIM"));
         assert!(s.contains("Application Gateway"));

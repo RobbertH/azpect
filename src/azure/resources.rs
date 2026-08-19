@@ -107,6 +107,21 @@ impl ResourceMeta {
             Some(a) if a.eq_ignore_ascii_case("Disabled")
         )
     }
+
+    /// ARM id of the App Insights component linked to this app, from the
+    /// `hidden-link: /app-insights-resource-id` tag the portal / Functions
+    /// tooling stamps on the site. This is the right *scope* for querying the
+    /// app's AI telemetry: workspace-based App Insights stamps `_ResourceId`
+    /// on its rows with the component, not the site, so a resource-centric
+    /// query on the site resolves none of the `App*` tables even when
+    /// telemetry exists. See [`crate::azure::executions`].
+    pub fn app_insights_resource_id(&self) -> Option<&str> {
+        self.tags
+            .iter()
+            .find(|(k, _)| k.starts_with("hidden-link") && k.contains("app-insights-resource-id"))
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    }
 }
 
 /// KQL query template. Lane 2 substitutes nothing — Resource Graph honors the
@@ -574,6 +589,34 @@ mod tests {
                 ("Terraform".to_string(), "true".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn app_insights_resource_id_reads_the_hidden_link_tag() {
+        let mut meta = ResourceMeta::default();
+        assert_eq!(meta.app_insights_resource_id(), None);
+
+        meta.tags = vec![
+            ("Domain".to_string(), "tool".to_string()),
+            (
+                "hidden-link: /app-insights-resource-id".to_string(),
+                "/subscriptions/s/resourceGroups/rg/providers/microsoft.insights/components/my-ai"
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(
+            meta.app_insights_resource_id(),
+            Some(
+                "/subscriptions/s/resourceGroups/rg/providers/microsoft.insights/components/my-ai"
+            )
+        );
+
+        // An empty value (tag present but blank) must not become the scope.
+        meta.tags = vec![(
+            "hidden-link: /app-insights-resource-id".to_string(),
+            " ".to_string(),
+        )];
+        assert_eq!(meta.app_insights_resource_id(), None);
     }
 
     #[test]

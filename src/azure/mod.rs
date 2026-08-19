@@ -14,6 +14,7 @@ pub mod container_app_workspace;
 pub mod cosmos;
 pub mod demo;
 pub mod env_vars;
+pub mod executions;
 pub mod function_app_config;
 pub mod function_app_settings;
 pub mod function_app_triggers;

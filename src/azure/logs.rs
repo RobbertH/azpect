@@ -258,21 +258,30 @@ pub const KQL_APIM_ERRORS_FILTER: &str = r#"
 /// is on. Matches a full URL, bare path, or console line whose path ends in a
 /// well-known probe route — `/health`, `/healthz`, `/healthcheck`,
 /// `/health/live|ready|startup`, `/livez`, `/readyz`, `/liveness`,
-/// `/readiness`, `/ping`, `/alive`, `/hc` — plus `/robots933456.txt`, App
+/// `/readiness`, `/ping`, `/alive`, `/hc`, `/warmup` (which also catches the
+/// Functions host's `/admin/warmup`) — plus `/robots933456.txt`, App
 /// Service's own container warm-up probe. The terminator class (`[^\w/.-]|$`)
 /// keeps the match from swallowing real endpoints that merely *start* with a
-/// probe name (`/health-records`, `/pingdom`) and lets one pattern serve URL
-/// columns, bare-path columns, and console text with trailing content alike.
-pub const HEALTH_PATH_REGEX: &str = r"(?i)/(health(z|check)?(/(live|ready|startup))?|livez|readyz|liveness|readiness|ping|alive|hc|robots933456\.txt)([^\w/.-]|$)";
+/// probe name (`/health-records`, `/pingdom`, `/warmup-cache`) and lets one
+/// pattern serve URL columns, bare-path columns, and console text with
+/// trailing content alike.
+pub const HEALTH_PATH_REGEX: &str = r"(?i)/(health(z|check)?(/(live|ready|startup))?|livez|readyz|liveness|readiness|ping|alive|hc|warmup|robots933456\.txt)([^\w/.-]|$)";
 
 /// Hide-health filter for the request-bearing tables: drops rows whose request
 /// URL targets a health-probe route. `Url` covers `AppRequests` and
-/// `ApiManagementGatewayLogs`; `CsUriStem` covers `AppServiceHTTPLogs`. Rows
-/// without either column (traces, exceptions, console output) always pass —
+/// `ApiManagementGatewayLogs`; `CsUriStem` covers `AppServiceHTTPLogs`.
+/// Probe traffic also lands in the *text* tables with the URL embedded in the
+/// log body — `FunctionAppLogs` / `AppTraces` rows where an in-app logger
+/// prints the request (e.g. the Functions Python worker's
+/// `'url': 'http://…/health'` trace lines) and `AppServiceConsoleLogs` /
+/// `AppServiceAppLogs` stdout — so `Message` and `ResultDescription` are
+/// matched too. Rows with none of these columns always pass —
 /// `column_ifexists` substitutes `""`, which the regex can't match.
 pub const KQL_HEALTH_FILTER: &str = r#"
 | where not(column_ifexists("Url", "") matches regex @"{re}")
     and not(column_ifexists("CsUriStem", "") matches regex @"{re}")
+    and not(column_ifexists("Message", "") matches regex @"{re}")
+    and not(column_ifexists("ResultDescription", "") matches regex @"{re}")
 "#;
 
 /// Container-App variant of [`KQL_HEALTH_FILTER`]: console rows carry no URL
@@ -1069,12 +1078,17 @@ mod tests {
                 .expect("Url clause present");
             assert!(url_idx < order_idx, "filter must come before order by");
             assert!(kql.contains(r#"not(column_ifexists("CsUriStem", "") matches regex"#));
+            // Text tables (FunctionAppLogs, AppTraces, AppServiceConsoleLogs)
+            // embed the probe URL in the log body rather than a URL column.
+            assert!(kql.contains(r#"not(column_ifexists("Message", "") matches regex"#));
+            assert!(kql.contains(r#"not(column_ifexists("ResultDescription", "") matches regex"#));
             // The `{re}` placeholder must be fully substituted.
             assert!(
                 !kql.contains("{re}"),
                 "unsubstituted placeholder in:\n{kql}"
             );
             assert!(kql.contains("robots933456"));
+            assert!(kql.contains("warmup"));
         }
     }
 

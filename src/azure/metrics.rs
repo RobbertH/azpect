@@ -35,6 +35,13 @@ pub enum MetricKind {
     /// filter. Charted only — the health verdict stays 5xx-based.
     ClientErrors,
     Traffic,
+    /// Function-App invocations of any trigger type (blob / queue / timer /
+    /// durable orchestration / HTTP), counted from App Insights `AppRequests`
+    /// via Log Analytics — the `Requests` platform metric behind
+    /// [`Self::Traffic`] only sees the HTTP front end (Always On pings,
+    /// probes), never event-triggered executions. Function Apps only; see
+    /// [`crate::azure::executions`].
+    Executions,
     Cpu,
     Memory,
     /// Azure SQL eDTU / DTU consumption (`dtu_consumption_percent`). Only the
@@ -199,6 +206,7 @@ fn label_for(kind: MetricKind, resource_kind: ResourceKind) -> &'static str {
         (MetricKind::Errors, _) => "Http 5xx",
         (MetricKind::ClientErrors, _) => "Http 4xx",
         (MetricKind::Traffic, _) => "Requests",
+        (MetricKind::Executions, _) => "Executions",
         (MetricKind::Cpu, ResourceKind::Apim) => "Capacity",
         (MetricKind::Cpu, ResourceKind::AppGateway) => "Capacity Units",
         (MetricKind::Cpu, _) => "CPU",
@@ -285,6 +293,27 @@ pub async fn fetch(
     resource: &Resource,
     range: TimeRange,
 ) -> anyhow::Result<MetricsResult> {
+    // Function Apps get an extra Executions series from App Insights
+    // `AppRequests` (Log Analytics, not Monitor — see `azure::executions`),
+    // fetched concurrently with the Monitor metrics. A failure there (no App
+    // Insights / no workspace) degrades to a `missing` entry like any
+    // plan-gated Monitor metric; it never fails the whole fetch.
+    if resource.kind == ResourceKind::FunctionApp {
+        let (monitor, executions) = tokio::join!(
+            fetch_core(auth, &resource.id, resource.kind, range, None),
+            crate::azure::executions::fetch(auth, resource, range),
+        );
+        let mut result = monitor?;
+        match executions {
+            Ok(series) => result.series.push(series),
+            Err(e) => {
+                result
+                    .missing
+                    .insert(MetricKind::Executions, format!("{e:#}"));
+            }
+        }
+        return Ok(result);
+    }
     fetch_core(auth, &resource.id, resource.kind, range, None).await
 }
 

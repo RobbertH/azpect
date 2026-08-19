@@ -67,6 +67,26 @@ const ROW_KINDS: [MetricKind; 5] = [
     MetricKind::Memory,
 ];
 
+/// Function Apps add an Executions row (App Insights invocation counts, any
+/// trigger type) right under Requests — the platform Requests metric never
+/// sees event-triggered work, so on a blob/queue-triggered app it shows only
+/// Always On / probe noise. See [`crate::azure::executions`].
+const FUNCTION_APP_ROW_KINDS: [MetricKind; 6] = [
+    MetricKind::Traffic,
+    MetricKind::Executions,
+    MetricKind::Errors,
+    MetricKind::ClientErrors,
+    MetricKind::Cpu,
+    MetricKind::Memory,
+];
+
+fn row_kinds(kind: ResourceKind) -> &'static [MetricKind] {
+    match kind {
+        ResourceKind::FunctionApp => &FUNCTION_APP_ROW_KINDS,
+        _ => &ROW_KINDS,
+    }
+}
+
 /// Row label for a metric. Container App CPU/Memory are tagged `avg/replica`
 /// because the plotted series is the average across replicas (not a sum) — see
 /// [`crate::azure::metrics::MetricSeries::peak_replica`] for the busiest-replica
@@ -76,6 +96,7 @@ fn metric_row_label(kind: MetricKind, resource_kind: ResourceKind) -> &'static s
         (MetricKind::Cpu, ResourceKind::ContainerApp) => "CPU (avg/replica)",
         (MetricKind::Memory, ResourceKind::ContainerApp) => "Memory (avg/replica)",
         (MetricKind::Traffic, _) => "Requests",
+        (MetricKind::Executions, _) => "Executions",
         (MetricKind::Errors, _) => "Http 5xx",
         (MetricKind::ClientErrors, _) => "Http 4xx",
         (MetricKind::Cpu, _) => "CPU",
@@ -482,22 +503,18 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         .scroll((context_scroll, 0));
     frame.render_widget(context, body[0]);
 
-    // Sparkline grid: 5 rows of equal fixed height (1 label line + 2 bars),
+    // Sparkline grid: one fixed-height row per metric (1 label line + 2 bars),
     // plus a single shared time-axis row at the bottom. All sparklines span
-    // the same window, so one axis serves the whole grid.
-    let metric_rows = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .split(body[1]);
+    // the same window, so one axis serves the whole grid. Function Apps carry
+    // one extra row (Executions), hence the dynamic constraint list.
+    let kinds = row_kinds(resource.kind);
+    let mut row_constraints = vec![Constraint::Length(3); kinds.len()];
+    row_constraints.push(Constraint::Length(1));
+    let metric_rows = Layout::vertical(row_constraints).split(body[1]);
 
     let missing_for_resource = state.metrics.missing.get(&resource.id);
     let limits = state.container_app_overview.by_resource.get(&resource.id);
-    for (i, kind) in ROW_KINDS.iter().enumerate() {
+    for (i, kind) in kinds.iter().enumerate() {
         let area = metric_rows[i];
         if area.height == 0 {
             continue;
@@ -517,8 +534,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    if metric_rows[5].height > 0 {
-        super::metric_chart::render_time_axis(frame, metric_rows[5], state.metrics.range, theme);
+    if metric_rows[kinds.len()].height > 0 {
+        super::metric_chart::render_time_axis(
+            frame,
+            metric_rows[kinds.len()],
+            state.metrics.range,
+            theme,
+        );
     }
 
     let mut hint = footer_hint_for(resource.kind);
@@ -1501,7 +1523,10 @@ fn summary_for(
     limits: Option<&crate::azure::container_app_overview::ContainerAppOverview>,
 ) -> String {
     match kind {
-        MetricKind::Traffic | MetricKind::Errors | MetricKind::ClientErrors => {
+        MetricKind::Traffic
+        | MetricKind::Executions
+        | MetricKind::Errors
+        | MetricKind::ClientErrors => {
             let total = s.sum();
             format!("total: {}{}", format_count(total), unit_suffix(s))
         }
@@ -3311,9 +3336,10 @@ mod tests {
             kind,
             label: label.into(),
             unit: match kind {
-                MetricKind::Traffic | MetricKind::Errors | MetricKind::ClientErrors => {
-                    "count".into()
-                }
+                MetricKind::Traffic
+                | MetricKind::Executions
+                | MetricKind::Errors
+                | MetricKind::ClientErrors => "count".into(),
                 MetricKind::Cpu => "%".into(),
                 MetricKind::Memory => "bytes".into(),
                 MetricKind::Dtu | MetricKind::Storage | MetricKind::Workers => "%".into(),
