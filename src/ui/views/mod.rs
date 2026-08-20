@@ -200,6 +200,7 @@ pub mod sql_audit;
 pub mod sql_detail;
 pub mod sql_resources;
 pub mod sql_sessions;
+pub mod storage_access;
 pub mod storage_account_overview;
 pub mod storage_accounts;
 pub mod storage_blob_detail;

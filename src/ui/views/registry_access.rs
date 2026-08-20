@@ -30,6 +30,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
+use super::detail::format_count;
+use super::metric_chart::{render_chart_row, render_time_axis_minutes};
 use super::sql_audit::display_principal;
 
 const FOOTER_HINT: &str = "j/k move  0 1h  1 1d  7 7d  t custom window  m hide me  Tab operation  y yank  r refresh  Esc back  ? help";
@@ -122,12 +124,31 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         frame.render_widget(p, ia);
     }
 
+    // Pull/push activity chart from Monitor platform metrics — carved off
+    // above whatever the rest of the body shows (table, empty state, or
+    // error), because it works precisely when the event query doesn't:
+    // platform metrics need no diagnostic setting.
+    let body_area = if state.registry.access_metrics.is_some() && body_area.height >= 14 {
+        let parts = Layout::vertical([Constraint::Length(CHART_HEIGHT), Constraint::Min(0)])
+            .split(body_area);
+        render_activity_charts(frame, parts[0], state, theme);
+        parts[1]
+    } else {
+        body_area
+    };
+
     if let Some(err) = state.registry.access_error.as_ref() {
-        let p = Paragraph::new(Text::styled(
+        let mut lines = vec![Line::from(Span::styled(
             format!("error: {err}"),
             Style::default().fg(theme.critical),
-        ))
-        .wrap(Wrap { trim: false });
+        ))];
+        // A workspace that never received registry logs fails KQL table
+        // resolution — same root cause as the empty page, so same hint.
+        if err.contains("Failed to resolve table") || err.contains("SEM0100") {
+            lines.push(Line::default());
+            lines.extend(diagnostics_warning_lines(state, theme));
+        }
+        let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
         render_footer(frame, chunks[1], theme);
         return;
@@ -150,12 +171,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         Some(rows) if rows.is_empty() => {
             // Zero rows is ambiguous: nothing happened, or nothing is being
-            // recorded. Say so — a registry without a diagnostic setting will
-            // sit empty forever and that's worth knowing.
-            let p = Paragraph::new(Text::styled(
-                "no repository events in this window.\n\nif this is unexpected, check the registry's diagnostic settings — \nContainerRegistryRepositoryEvents must be forwarded to a Log Analytics \nworkspace for rows to appear here.",
-                Style::default().fg(theme.muted),
-            ));
+            // recorded. Almost always it's the latter — forwarding repository
+            // events is opt-in and most registries never got the diagnostic
+            // setting — so warn loudly instead of shrugging, and let the
+            // metrics chart prove pulls are happening but going unlogged.
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "no repository events in this window.",
+                    Style::default().fg(theme.muted),
+                )),
+                Line::default(),
+            ];
+            lines.extend(diagnostics_warning_lines(state, theme));
+            let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
             frame.render_widget(p, body_area);
         }
         Some(_) if visible.is_empty() => {
@@ -207,6 +235,113 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     render_footer(frame, chunks[1], theme);
+}
+
+/// Two 3-line sparkline rows (Pulls, Pushes) plus a 1-line time axis.
+const CHART_HEIGHT: u16 = 7;
+
+/// The pulls/pushes sparklines over the current window, from Monitor platform
+/// metrics. Registry-wide even when the event query below is scoped to one
+/// repository — the metrics carry no repository dimension, which the summary
+/// chip calls out to avoid reading the bars as that repo's traffic.
+fn render_activity_charts(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(activity) = state.registry.access_metrics.as_ref() else {
+        return;
+    };
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let scope_note = if state.registry.access_scope.is_some() {
+        " · whole registry"
+    } else {
+        ""
+    };
+    let pulls_summary = format!(
+        "total: {}{}",
+        format_count(activity.pull_total()),
+        scope_note
+    );
+    let pushes_summary = format!(
+        "total: {}{}",
+        format_count(activity.push_total()),
+        scope_note
+    );
+    render_chart_row(
+        frame,
+        rows[0],
+        activity.pulls.kind,
+        "Pulls",
+        Some(&activity.pulls),
+        &pulls_summary,
+        None,
+        theme,
+    );
+    render_chart_row(
+        frame,
+        rows[1],
+        activity.pushes.kind,
+        "Pushes",
+        Some(&activity.pushes),
+        &pushes_summary,
+        None,
+        theme,
+    );
+    render_time_axis_minutes(
+        frame,
+        rows[2],
+        state.registry.access_window.duration().num_minutes(),
+        theme,
+    );
+}
+
+/// The "your registry probably isn't logging anything" warning, shared by the
+/// empty page and the no-such-table error. Orange (`client_error`) rather than
+/// muted: an auditor who trusts an empty page here walks away thinking nobody
+/// pulls their images, and forwarding repository events is OFF by default on
+/// ACR, so the empty page is almost always a configuration gap — not quiet.
+/// When Monitor metrics counted activity in the same window, say so: that's
+/// proof pulls are happening but going unrecorded.
+fn diagnostics_warning_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(theme.client_error);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "⚠ most likely cause: this registry is not forwarding its repository events anywhere.",
+            warn.add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "ACR does NOT record pull/push logs by default. A diagnostic setting on the registry must",
+            warn,
+        )),
+        Line::from(Span::styled(
+            "explicitly send the ContainerRegistryRepositoryEvents category to a Log Analytics",
+            warn,
+        )),
+        Line::from(Span::styled(
+            "workspace, and only events from after that point are captured",
+            warn,
+        )),
+        Line::from(Span::styled(
+            "(Portal: registry → Monitoring → Diagnostic settings).",
+            warn,
+        )),
+    ];
+    if let Some(activity) = state.registry.access_metrics.as_ref() {
+        if activity.any_activity() {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "monitor metrics count ~{} pulls / ~{} pushes in this window — images ARE being pulled, but nothing records by whom.",
+                    format_count(activity.pull_total()),
+                    format_count(activity.push_total()),
+                ),
+                warn.add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    lines
 }
 
 /// Caller column text: the Graph-resolved display name when the identity is a
@@ -615,14 +750,96 @@ mod tests {
     }
 
     #[test]
-    fn renders_empty_state_with_diagnostics_hint() {
+    fn renders_empty_state_with_explicit_forwarding_warning() {
         let theme = crate::ui::theme::Theme::catppuccin_mocha();
-        let backend = TestBackend::new(120, 14);
+        let backend = TestBackend::new(120, 16);
         let mut term = Terminal::new(backend).unwrap();
         let mut state = fixture();
         state.registry.access_events = Some(Vec::new());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
-        assert!(s.contains("diagnostic settings"));
+        assert!(s.contains("not forwarding its repository events"));
+        assert!(s.contains("NOT record pull/push logs by default"));
+        assert!(s.contains("ContainerRegistryRepositoryEvents"));
+    }
+
+    #[test]
+    fn empty_state_cites_metric_counts_when_activity_exists() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 26);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_events = Some(Vec::new());
+        state.registry.access_metrics =
+            Some(crate::azure::demo::registry_activity(&AccessWindow::Day));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("images ARE being pulled"),
+            "metrics corroboration line missing"
+        );
+    }
+
+    #[test]
+    fn renders_activity_chart_rows_above_table() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 26);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_metrics =
+            Some(crate::azure::demo::registry_activity(&AccessWindow::Day));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("Pulls"), "pulls chart row missing");
+        assert!(s.contains("Pushes"), "pushes chart row missing");
+        assert!(s.contains("total:"), "chart summary missing");
+        assert!(s.contains("IMAGE"), "event table must still render");
+    }
+
+    #[test]
+    fn chart_summary_flags_registry_scope_when_table_is_repo_scoped() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 26);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_scope = Some("ca-checkout-api".to_string());
+        state.registry.access_metrics =
+            Some(crate::azure::demo::registry_activity(&AccessWindow::Day));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(
+            s.contains("whole registry"),
+            "repo-scoped view must flag that the chart is registry-wide"
+        );
+    }
+
+    #[test]
+    fn chart_is_skipped_on_short_terminals() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_metrics =
+            Some(crate::azure::demo::registry_activity(&AccessWindow::Day));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(!s.contains("Pushes"), "chart must yield to the table");
+        assert!(s.contains("IMAGE"), "event table must render");
+    }
+
+    #[test]
+    fn table_missing_error_gets_forwarding_warning() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_events = None;
+        state.registry.access_error = Some(
+            "azure api error 400: Failed to resolve table or column expression named 'ContainerRegistryRepositoryEvents'".to_string(),
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("error:"));
+        assert!(s.contains("not forwarding its repository events"));
     }
 }

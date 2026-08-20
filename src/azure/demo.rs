@@ -992,6 +992,159 @@ pub fn blob_preview(_account_name: &str, _container: &str, blob: &str) -> BlobPr
     }
 }
 
+/// Synthesized `StorageBlobLogs` rows: managed-identity reads from the apps,
+/// a CI service principal writing exports, humans via the portal (including
+/// "yourself"), plus the audit outliers — account-key and SAS traffic.
+/// Same filter semantics as the real fetch: container scope and exclude-me
+/// narrow the rows server-side.
+pub fn storage_access(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    container: Option<&str>,
+    exclude_self: bool,
+) -> crate::azure::storage_logs::AccessPage {
+    use crate::azure::storage_logs::{AccessEvent, AccessPage, CallerKind};
+    let me = self_identity();
+    let now = Utc::now();
+
+    const OID_CHECKOUT: &str = "3c5e8a70-9d2f-4b61-8e4a-7f0b1c2d3e4f";
+    const OID_CI: &str = "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c";
+
+    // (operation, identity, kind, auth, ip, object, result, ok)
+    type Template = (
+        &'static str,
+        &'static str,
+        CallerKind,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        bool,
+    );
+    let template: &[Template] = &[
+        (
+            "GetBlob",
+            OID_CHECKOUT,
+            CallerKind::Principal,
+            "OAuth",
+            "10.0.1.12",
+            Some("invoices/2026/08/inv-18204.pdf"),
+            "Success",
+            true,
+        ),
+        (
+            "PutBlob",
+            OID_CI,
+            CallerKind::Principal,
+            "OAuth",
+            "20.93.10.4",
+            Some("exports/orders-2026-08-20.parquet"),
+            "Success",
+            true,
+        ),
+        (
+            "ListBlobs",
+            "robbert@contoso.com",
+            CallerKind::User,
+            "OAuth",
+            "203.0.113.7",
+            Some("invoices"),
+            "Success",
+            true,
+        ),
+        (
+            "GetBlob",
+            "dana@contoso.com",
+            CallerKind::User,
+            "OAuth",
+            "198.51.100.23",
+            Some("exports/orders-2026-08-19.parquet"),
+            "Success",
+            true,
+        ),
+        (
+            "GetBlob",
+            "",
+            CallerKind::Sas,
+            "SAS",
+            "52.174.18.9",
+            Some("invoices/2026/07/inv-17920.pdf"),
+            "Success",
+            true,
+        ),
+        (
+            "PutBlob",
+            "",
+            CallerKind::AccountKey,
+            "AccountKey",
+            "198.51.100.3",
+            Some("raw-events/dump-legacy.bak"),
+            "Success",
+            true,
+        ),
+        (
+            "GetBlob",
+            "",
+            CallerKind::AccountKey,
+            "AccountKey",
+            "198.51.100.3",
+            Some("invoices/2026/08/inv-18100.pdf"),
+            "AuthorizationFailure",
+            false,
+        ),
+        (
+            "DeleteBlob",
+            OID_CI,
+            CallerKind::Principal,
+            "OAuth",
+            "20.93.10.4",
+            Some("exports/orders-2026-07-01.parquet"),
+            "Success",
+            true,
+        ),
+    ];
+
+    let total_minutes = window.duration().num_minutes().max(60);
+    // Enough repetitions to fill the window at ~1 event / 7 minutes, capped
+    // well under the page size so demo never looks truncated.
+    let count = (total_minutes / 7).clamp(8, 240) as usize;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let (op, identity, kind, auth, ip, object, result, ok) = template[i % template.len()];
+        let minutes_ago = (i as i64 * total_minutes) / count as i64 + (i as i64 % 6);
+        events.push(AccessEvent {
+            ts: now - Duration::minutes(minutes_ago),
+            operation: op.to_string(),
+            identity: identity.to_string(),
+            caller_kind: kind,
+            auth_type: auth.to_string(),
+            ip: ip.to_string(),
+            object: object.map(str::to_owned),
+            result: result.to_string(),
+            ok,
+        });
+    }
+    if let Some(container) = container {
+        let prefix = format!("{container}/");
+        events.retain(|e| {
+            e.object
+                .as_deref()
+                .is_some_and(|o| o.starts_with(&prefix) || o == container)
+        });
+    }
+    if exclude_self {
+        events.retain(|e| {
+            me.upn.as_deref() != Some(e.identity.as_str())
+                && me.oid.as_deref() != Some(e.identity.as_str())
+                && me.ip.as_deref() != Some(e.ip.as_str())
+        });
+    }
+    AccessPage {
+        events,
+        truncated: false,
+        hidden: exclude_self.then(self_identity),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Container registries
 // ---------------------------------------------------------------------------
@@ -1189,6 +1342,53 @@ pub fn registry_access(
         events,
         truncated: false,
         hidden: exclude_self.then(self_identity),
+    }
+}
+
+/// Synthesized registry pull/push counts for the access-logs activity chart:
+/// a steady kubelet-pull baseline with a diurnal wave, and sparse pushes (CI
+/// deploys a few times per window). Same bin grid as the real Monitor fetch.
+pub fn registry_activity(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+) -> crate::azure::registry_metrics::RegistryActivity {
+    use crate::azure::registry_metrics::{bin_minutes_for_hours, RegistryActivity};
+
+    let hours = window.duration().num_hours().max(1);
+    let step_minutes = bin_minutes_for_hours(hours);
+    let n = ((hours * 60) / step_minutes).clamp(8, 400) as usize;
+    let now = Utc::now();
+    let series = |kind: MetricKind, label: &str, seed: u64, f: &dyn Fn(f64, f64) -> f64| {
+        let points = (0..n)
+            .map(|i| {
+                let phase = (i as f64) / (n as f64) * std::f64::consts::TAU;
+                let wave = 0.5 + 0.5 * phase.sin();
+                MetricPoint {
+                    ts: now - Duration::minutes(step_minutes * (n - i) as i64),
+                    value: f(wave, noise(seed, i)),
+                }
+            })
+            .collect();
+        MetricSeries {
+            kind,
+            label: label.to_string(),
+            unit: "count".to_string(),
+            points,
+            peak_replica: None,
+        }
+    };
+    RegistryActivity {
+        // Scale per-bin counts with the bin length so totals stay plausible
+        // across windows (a 1y/P1D bin holds ~a day of kubelet pulls).
+        pulls: series(MetricKind::Traffic, "Pulls", 11, &|wave, nz| {
+            ((2.0 + 9.0 * wave + 4.0 * nz) * (step_minutes as f64 / 15.0).max(0.2)).round()
+        }),
+        pushes: series(MetricKind::Executions, "Pushes", 23, &|_wave, nz| {
+            if nz > 0.9 {
+                (1.0 + 2.0 * nz).round()
+            } else {
+                0.0
+            }
+        }),
     }
 }
 

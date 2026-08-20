@@ -2,6 +2,11 @@
 //! visible to the current subscription scope. Pressing Enter on a row pins the
 //! registry into `state.registry.selected_registry` and opens
 //! [`View::RegistryRepositories`].
+//!
+//! The PULLS column shows each registry's total pull count (Monitor's
+//! `TotalPullCount` platform metric — always available, no diagnostic
+//! setting) over an adjustable window: `0`/`1`/`7` pick 1h/1d/7d, `t` takes
+//! a free-form window like "30d" or "6m". Defaults to 7d.
 
 #![allow(dead_code, unused_variables)]
 
@@ -11,14 +16,16 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::detail::format_count;
 use super::{name_col_width, truncate_ellipsis};
+use crate::azure::key_vault_logs::AccessWindow;
 use crate::azure::registries::Registry;
 use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter repos  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter repos  l access log  0/1/7/t pulls window  / filter  Esc back  r refresh  y yank id  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -43,6 +50,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.accent),
         ));
     }
+    title_spans.push(Span::styled(
+        format!("· pulls {} ", state.registry.pulls_window().label()),
+        Style::default().fg(theme.muted),
+    ));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
@@ -64,6 +75,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ]));
         frame.render_widget(p, sa);
     }
+
+    // PULLS-column window entry row, shown only while `t` has focus. Same
+    // shape as the access-log view's custom window input.
+    let body_area = if state.registry.pulls_window_input_active {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body_area);
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled("pulls window> ", Style::default().fg(theme.accent)),
+            Span::styled(
+                state.registry.pulls_window_input.value(),
+                Style::default().fg(theme.fg),
+            ),
+            Span::styled("█", Style::default().fg(theme.accent)),
+            Span::styled(
+                "  (e.g. 12h, 30d, 6m — Enter applies, Esc cancels)",
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+        frame.render_widget(p, parts[0]);
+        parts[1]
+    } else {
+        body_area
+    };
 
     if let Some(err) = state.registry.registries_error.as_deref() {
         // `Text` keeps any line breaks from a pretty-printed JSON error body;
@@ -114,6 +147,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .iter()
                 .any(|r| r.anonymous_pull_enabled == Some(true));
 
+            // The PULLS header carries the window so the column can't be
+            // misread after the user changes it ("PULLS 7d", "PULLS 6m").
+            let pulls_header = format!("PULLS {}", state.registry.pulls_window().label());
+            let pulls_w = (pulls_header.chars().count() as u16).max(9);
+
             // NAME absorbs the leftover width; on a narrow terminal it caps to
             // the budget and truncates with an ellipsis (see `build_row`)
             // rather than the table clipping it silently. `fixed_w` sums the
@@ -123,12 +161,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 + 7
                 + 10
                 + if show_anon { 7 } else { 0 }
+                + pulls_w
                 + 20
                 + 22
                 + 10
                 + if show_sub_cols { 22 } else { 0 }
                 + 14;
-            let n_cols: u16 = 8 + if show_anon { 1 } else { 0 } + if show_sub_cols { 1 } else { 0 };
+            let n_cols: u16 = 9 + if show_anon { 1 } else { 0 } + if show_sub_cols { 1 } else { 0 };
             let longest = filtered
                 .iter()
                 .map(|r| r.name.chars().count() as u16)
@@ -142,25 +181,29 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Constraint::Length(7),      // ADMIN
                 Constraint::Length(10),     // PUBLIC NET
             ];
-            let mut headers: Vec<&'static str> = vec!["NAME", "SKU", "ADMIN", "PUBLIC NET"];
+            let mut headers: Vec<String> = ["NAME", "SKU", "ADMIN", "PUBLIC NET"]
+                .map(str::to_owned)
+                .to_vec();
             if show_anon {
                 widths.push(Constraint::Length(7));
-                headers.push("ANON");
+                headers.push("ANON".to_string());
             }
+            widths.push(Constraint::Length(pulls_w));
+            headers.push(pulls_header);
             // LOGIN SERVER is the bit users want to copy/paste, so give it
             // generous room; it absorbs leftover width.
             widths.push(Constraint::Min(20));
-            headers.push("LOGIN SERVER");
+            headers.push("LOGIN SERVER".to_string());
             widths.push(Constraint::Length(22)); // RG
-            headers.push("RESOURCE GROUP");
+            headers.push("RESOURCE GROUP".to_string());
             widths.push(Constraint::Length(10)); // CREATED
-            headers.push("CREATED");
+            headers.push("CREATED".to_string());
             if show_sub_cols {
                 widths.push(Constraint::Length(22));
-                headers.push("SUB NAME");
+                headers.push("SUB NAME".to_string());
             }
             widths.push(Constraint::Length(14)); // LOCATION
-            headers.push("LOCATION");
+            headers.push("LOCATION".to_string());
 
             let header_row = Row::new(headers).style(
                 Style::default()
@@ -232,6 +275,19 @@ fn build_row<'a>(
         };
         cells.push(anon);
     }
+    // PULLS over the adjustable window: the load is per registry, so cells
+    // settle independently ("…" while in flight, "—" when Monitor refused).
+    let pulls = match state.registry.pull_totals.get(&registry.id) {
+        Some(total) if *total > 0.0 => {
+            Cell::from(format_count(*total)).style(Style::default().fg(theme.fg))
+        }
+        Some(_) => Cell::from("0").style(Style::default().fg(theme.muted)),
+        None if state.registry.pull_totals_pending.contains(&registry.id) => {
+            Cell::from("…").style(Style::default().fg(theme.muted))
+        }
+        None => Cell::from("—").style(Style::default().fg(theme.muted)),
+    };
+    cells.push(pulls);
     cells.push(
         Cell::from(registry.login_server_or_default()).style(Style::default().fg(theme.muted)),
     );
@@ -272,6 +328,34 @@ fn format_date(dt: Option<&chrono::DateTime<chrono::Utc>>) -> String {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let len = state.registry.filtered_registries().len();
+
+    // PULLS-window input focus: raw keys flow into the input via app.rs;
+    // only Enter (apply) and Esc (cancel) land here as actions.
+    if state.registry.pulls_window_input_active {
+        match action {
+            Action::Back => {
+                state.registry.pulls_window_input_active = false;
+                state.registry.pulls_window_input.reset();
+                return true;
+            }
+            Action::OpenSelected => {
+                let raw = state.registry.pulls_window_input.value().to_string();
+                match AccessWindow::parse(&raw) {
+                    Some(window) => {
+                        state.registry.pulls_window_input_active = false;
+                        state.registry.pulls_window_input.reset();
+                        state.registry.set_pulls_window(window);
+                    }
+                    None => {
+                        state
+                            .set_status(format!("can't parse \"{raw}\" — try 12h, 30d, 6m, or 1y"));
+                    }
+                }
+                return true;
+            }
+            _ => return false,
+        }
+    }
 
     if state.registry.registries_filter_active {
         match action {
@@ -335,6 +419,25 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             state.registry.registries_filter.reset();
             state.registry.registries_cursor = 0;
             state.registry.registries_filter_active = true;
+            true
+        }
+        // PULLS-column window: `0`/`1`/`7` direct, `t` free-form. The
+        // `after_action` hook respawns the totals for the new window.
+        Action::SetWindowHour => {
+            state.registry.set_pulls_window(AccessWindow::Hour);
+            true
+        }
+        Action::SetWindowDay => {
+            state.registry.set_pulls_window(AccessWindow::Day);
+            true
+        }
+        Action::SetWindowWeek => {
+            state.registry.set_pulls_window(AccessWindow::Week);
+            true
+        }
+        Action::SetCustomWindow => {
+            state.registry.pulls_window_input.reset();
+            state.registry.pulls_window_input_active = true;
             true
         }
         Action::OpenSelected => {
@@ -401,6 +504,67 @@ mod tests {
             anonymous_pull_enabled: Some(false),
             created_at: None,
         }
+    }
+
+    #[test]
+    fn pulls_window_defaults_to_week_and_keys_adjust_it() {
+        let mut state = fixture();
+        assert_eq!(state.registry.pulls_window(), AccessWindow::Week);
+        // Loaded totals drop when the window changes — they no longer match.
+        state
+            .registry
+            .pull_totals
+            .insert("/subs/x/cr/a".to_string(), 120.0);
+        let gen0 = state.registry.pulls_generation;
+        assert!(handle(Action::SetWindowDay, &mut state));
+        assert_eq!(state.registry.pulls_window(), AccessWindow::Day);
+        assert!(state.registry.pull_totals.is_empty());
+        assert_eq!(state.registry.pulls_generation, gen0 + 1);
+        // Same window again: no invalidation.
+        state
+            .registry
+            .pull_totals
+            .insert("/subs/x/cr/a".to_string(), 7.0);
+        assert!(handle(Action::SetWindowDay, &mut state));
+        assert!(!state.registry.pull_totals.is_empty());
+    }
+
+    #[test]
+    fn custom_pulls_window_input_parses_and_applies() {
+        let mut state = fixture();
+        assert!(handle(Action::SetCustomWindow, &mut state));
+        assert!(state.registry.pulls_window_input_active);
+        state.registry.pulls_window_input = "30d".into();
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(!state.registry.pulls_window_input_active);
+        assert_eq!(state.registry.pulls_window().label(), "30d");
+        // Junk keeps the input open with a status hint.
+        handle(Action::SetCustomWindow, &mut state);
+        state.registry.pulls_window_input = "monthly".into();
+        assert!(handle(Action::OpenSelected, &mut state));
+        assert!(state.registry.pulls_window_input_active);
+        assert!(state.status_message.is_some());
+    }
+
+    #[test]
+    fn renders_pull_totals_column_with_per_row_states() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(220, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let loaded = registry("loaded");
+        let pending = registry("pending");
+        state.registry.pull_totals.insert(loaded.id.clone(), 1330.0);
+        state
+            .registry
+            .pull_totals_pending
+            .insert(pending.id.clone());
+        state.registry.registries = Some(vec![loaded, pending]);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("PULLS 7d"), "header should carry the window");
+        assert!(buf.contains("1.3k"), "formatted total should render");
+        assert!(buf.contains("…"), "pending cell should render an ellipsis");
     }
 
     #[test]

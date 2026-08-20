@@ -178,7 +178,24 @@ pub(crate) fn stretch_to_width(data: &[u64], width: usize) -> Vec<u64> {
 /// evenly-spaced labels mark the window's start, the three quarter-points, and
 /// `now` (right-anchored). Narrow widths degrade to just the start and end.
 pub(crate) fn render_time_axis(frame: &mut Frame, area: Rect, range: TimeRange, theme: &Theme) {
-    let line = build_time_axis(range, area.width);
+    let total_minutes = match range {
+        TimeRange::Hour => 60_i64,
+        TimeRange::Day => 24 * 60_i64,
+        TimeRange::Week => 7 * 24 * 60_i64,
+    };
+    render_time_axis_minutes(frame, area, total_minutes, theme);
+}
+
+/// [`render_time_axis`] for an arbitrary window length — the ACR access-log
+/// chart follows a user-typed `AccessWindow` ("6m", "1y") rather than the
+/// fixed `TimeRange` grains.
+pub(crate) fn render_time_axis_minutes(
+    frame: &mut Frame,
+    area: Rect,
+    total_minutes: i64,
+    theme: &Theme,
+) {
+    let line = build_time_axis_minutes(total_minutes, area.width);
     let p = Paragraph::new(Line::from(Span::styled(
         line,
         Style::default().fg(theme.muted),
@@ -187,15 +204,19 @@ pub(crate) fn render_time_axis(frame: &mut Frame, area: Rect, range: TimeRange, 
 }
 
 pub(crate) fn build_time_axis(range: TimeRange, width: u16) -> String {
-    let w = width as usize;
-    if w < 6 {
-        return String::new();
-    }
     let total_minutes = match range {
         TimeRange::Hour => 60_i64,
         TimeRange::Day => 24 * 60_i64,
         TimeRange::Week => 7 * 24 * 60_i64,
     };
+    build_time_axis_minutes(total_minutes, width)
+}
+
+pub(crate) fn build_time_axis_minutes(total_minutes: i64, width: u16) -> String {
+    let w = width as usize;
+    if w < 6 {
+        return String::new();
+    }
 
     // Anchor positions at 0, 1/4, 2/4, 3/4 of the width (left-anchored), and a
     // final "now" right-anchored to the very end. Fall back to two labels on
@@ -311,6 +332,14 @@ mod tests {
         let axis = build_time_axis(TimeRange::Day, 60);
         assert!(axis.ends_with("now"), "axis must end with now: {axis:?}");
         assert!(axis.starts_with("-1d"), "start label: {axis:?}");
+    }
+
+    #[test]
+    fn build_time_axis_minutes_handles_custom_windows() {
+        // A 6-month ("6m") ACR access window: start label counts back in days.
+        let axis = build_time_axis_minutes(180 * 24 * 60, 60);
+        assert!(axis.starts_with("-180d"), "start label: {axis:?}");
+        assert!(axis.ends_with("now"));
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter blobs  / filter  Esc back  r refresh  y yank name  ? help  q quit";
+    "j/k move  Enter blobs  l access log  / filter  Esc back  r refresh  y yank name  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 // Header strip is rendered by `Table::header(...)` and shares the same
@@ -327,6 +327,22 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.storage.blobs_cursor = 0;
                 state.storage.blobs_filter = tui_input::Input::default();
                 state.view = View::StorageBlobs;
+            }
+            true
+        }
+        Action::OpenLogs => {
+            // `l` on a container: the account's blob access log pre-scoped
+            // to that container.
+            let container_name = state
+                .storage
+                .filtered_containers(&account_id)
+                .get(state.storage.containers_cursor)
+                .map(|c| c.name.clone());
+            if let Some(name) = container_name {
+                state
+                    .storage
+                    .enter_access_view(Some(name), View::StorageContainers);
+                state.view = View::StorageAccessLogs;
             }
             true
         }

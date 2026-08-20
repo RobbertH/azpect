@@ -898,6 +898,41 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::StorageAccessLoaded { generation, result } => {
+                // Same stale-scope rule as `KeyVaultAccessLoaded`.
+                if generation == state.storage.access_generation {
+                    state.storage.access_pending = false;
+                    match result {
+                        Ok(page) => {
+                            // OAuth object ids resolve to directory names via
+                            // Graph — best-effort, cached, deduped like the
+                            // SQL audit roll-up's resolution.
+                            for e in &page.events {
+                                let Some(id) =
+                                    crate::azure::sql_audit::graph_candidate(&e.identity)
+                                else {
+                                    continue;
+                                };
+                                if state.principals.by_id.contains_key(&id)
+                                    || state.principals.failed.contains(&id)
+                                    || state.principals.pending.contains(&id)
+                                {
+                                    continue;
+                                }
+                                state.principals.pending.insert(id.clone());
+                                spawn_resolve_principal(auth.clone(), id, tx.clone());
+                            }
+                            state.storage.access_error = None;
+                            state.storage.access_truncated = page.truncated;
+                            state.storage.access_hidden = page.hidden;
+                            state.storage.access_events = Some(page.events);
+                            state.storage.access_cursor = 0;
+                            state.storage.access_view_top.set(0);
+                        }
+                        Err(e) => state.storage.access_error = Some(e),
+                    }
+                }
+            }
             AppEvent::RegistriesLoaded { scope, result } => {
                 // Stale scope — see the `ResourcesLoaded` arm.
                 if scope != state.scope_generation {
@@ -911,10 +946,35 @@ async fn event_loop(
                             state.registry.registries_cursor = rows.len() - 1;
                         }
                         state.registry.registries = Some(rows);
+                        // The PULLS column loads per registry — kick the
+                        // fetches for whatever the fresh list exposes.
+                        kick_registry_pull_totals(state, auth, tx);
                     }
                     Err(e) => {
                         state.registry.registries = None;
                         state.registry.registries_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::RegistryPullTotalLoaded {
+                registry_id,
+                generation,
+                result,
+            } => {
+                // A total fetched under an older PULLS window no longer
+                // matches the column header — drop it; the window change
+                // already cleared the pending set and respawned.
+                if generation == state.registry.pulls_generation {
+                    state.registry.pull_totals_pending.remove(&registry_id);
+                    match result {
+                        Ok(total) => {
+                            state.registry.pull_totals_error.remove(&registry_id);
+                            state.registry.pull_totals.insert(registry_id, total);
+                        }
+                        Err(e) => {
+                            state.registry.pull_totals.remove(&registry_id);
+                            state.registry.pull_totals_error.insert(registry_id, e);
+                        }
                     }
                 }
             }
@@ -980,6 +1040,23 @@ async fn event_loop(
                             state.registry.access_view_top.set(0);
                         }
                         Err(e) => state.registry.access_error = Some(e),
+                    }
+                }
+            }
+            AppEvent::RegistryAccessMetricsLoaded { generation, result } => {
+                // Same stale-scope rule as `RegistryAccessLoaded`: the chart's
+                // window is part of the generation-guarded query scope.
+                if generation == state.registry.access_generation {
+                    state.registry.access_metrics_pending = false;
+                    match result {
+                        Ok(activity) => {
+                            state.registry.access_metrics_error = None;
+                            state.registry.access_metrics = Some(activity);
+                        }
+                        Err(e) => {
+                            state.registry.access_metrics = None;
+                            state.registry.access_metrics_error = Some(e);
+                        }
                     }
                 }
             }
@@ -1647,6 +1724,22 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
             .handle_event(&CtEvent::Key(key));
         return true;
     }
+    // The registries list's PULLS-column window input (`t`), same shape.
+    if should_forward_to_registry_pulls_window_input(state, key) {
+        state
+            .registry
+            .pulls_window_input
+            .handle_event(&CtEvent::Key(key));
+        return true;
+    }
+    // The storage access-logs custom window input (`t`), same shape.
+    if should_forward_to_storage_access_window_input(state, key) {
+        state
+            .storage
+            .access_window_input
+            .handle_event(&CtEvent::Key(key));
+        return true;
+    }
     // The SQL audit views' custom window input (`t`), same shape.
     if should_forward_to_sql_audit_window_input(state, key) {
         state
@@ -2233,6 +2326,28 @@ fn should_forward_to_registry_access_window_input(
         && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
 }
 
+/// Mirror of `should_forward_to_access_window_input` for the registries
+/// list's PULLS-column window input.
+fn should_forward_to_registry_pulls_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::Registries
+        && state.registry.pulls_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
+/// Mirror of `should_forward_to_access_window_input` for the storage
+/// access-logs custom window input.
+fn should_forward_to_storage_access_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::StorageAccessLogs
+        && state.storage.access_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
 /// Mirror of `should_forward_to_access_window_input` for the SQL audit views'
 /// custom window input.
 fn should_forward_to_sql_audit_window_input(
@@ -2488,6 +2603,8 @@ fn decide_action(
         || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
         || (state.view == View::KeyVaultAccessLogs && state.key_vault.access_window_input_active)
         || (state.view == View::RegistryAccessLogs && state.registry.access_window_input_active)
+        || (state.view == View::Registries && state.registry.pulls_window_input_active)
+        || (state.view == View::StorageAccessLogs && state.storage.access_window_input_active)
         || (state.view == View::ServiceBusNamespaces && state.service_bus.namespaces_filter_active)
         || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
         || (state.view == View::ServiceBusSubscriptions
@@ -2547,6 +2664,7 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::StorageContainers => crate::ui::views::storage_containers::handle(action, state),
         View::StorageBlobs => crate::ui::views::storage_blobs::handle(action, state),
         View::StorageBlobDetail => crate::ui::views::storage_blob_detail::handle(action, state),
+        View::StorageAccessLogs => crate::ui::views::storage_access::handle(action, state),
         View::LogicApps => crate::ui::views::logic_apps::handle(action, state),
         View::LogicAppRuns => crate::ui::views::logic_app_runs::handle(action, state),
         View::LogicAppTriggerHistory => {
@@ -3009,7 +3127,10 @@ fn portal_url_for(state: &AppState) -> Option<String> {
         View::StorageAccountOverview
         | View::StorageContainers
         | View::StorageBlobs
-        | View::StorageBlobDetail => state
+        | View::StorageBlobDetail
+        // The access log's portal counterpart is the account's diagnostics /
+        // logs side nav; the overview blade is the stable entry point.
+        | View::StorageAccessLogs => state
             .storage
             .selected_account
             .as_ref()
@@ -3249,6 +3370,7 @@ fn yank_target(state: &AppState) -> Option<String> {
                 Some(format!("{}/{}/{}", acc.name, cont, blob))
             })
         }
+        View::StorageAccessLogs => crate::ui::views::storage_access::yank_text(state),
         View::Registries => state
             .registry
             .filtered_registries()
@@ -3518,6 +3640,10 @@ fn semantic_parent(view: View) -> Option<View> {
         View::StorageContainers => Some(View::StorageAccountOverview),
         View::StorageBlobs => Some(View::StorageContainers),
         View::StorageBlobDetail => Some(View::StorageBlobs),
+        // The view's own Back handler consumes Esc first (it returns to the
+        // recorded origin — accounts or containers list); this is the static
+        // fallback for the breadcrumb tree.
+        View::StorageAccessLogs => Some(View::StorageAccounts),
         View::Registries => Some(View::Subscriptions),
         View::RegistryRepositories => Some(View::Registries),
         View::RegistryTags => Some(View::RegistryRepositories),
@@ -3599,6 +3725,7 @@ fn after_action(
                     | View::SqlDetail
                     | View::KeyVaultAccessLogs
                     | View::RegistryAccessLogs
+                    | View::StorageAccessLogs
                     | View::SqlAuditPrincipals
                     | View::SqlAuditEvents
             );
@@ -3619,6 +3746,14 @@ fn after_action(
             if state.view == View::RegistryAccessLogs
                 && !state.registry.access_window_input_active
                 && state.registry.access_events.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        }
+        // Same custom-window-commit spawn for the storage access-logs view.
+        Action::OpenSelected
+            if state.view == View::StorageAccessLogs
+                && !state.storage.access_window_input_active
+                && state.storage.access_events.is_none() =>
         {
             kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
@@ -4146,6 +4281,33 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::StorageAccessLogs => {
+            if let Some(account) = state.storage.selected_account.clone() {
+                let cached = state.storage.access_events.is_some();
+                let in_flight = state.storage.access_pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.access_events = None;
+                        state.storage.access_error = None;
+                    }
+                    // Every spawn owns the buffer: bump the generation so an
+                    // older in-flight page is discarded when it lands (see the
+                    // KV access view's kick for the rationale).
+                    state.storage.access_generation =
+                        state.storage.access_generation.wrapping_add(1);
+                    state.storage.access_pending = true;
+                    spawn_load_storage_access(
+                        auth.clone(),
+                        account,
+                        state.storage.access_window.clone(),
+                        state.storage.access_scope.clone(),
+                        state.storage.access_exclude_self,
+                        state.storage.access_generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         View::Registries => {
             let cached = state.registry.registries.is_some();
             let in_flight = state.registry.registries_pending;
@@ -4156,10 +4318,23 @@ fn kick_off_loads_for_view(
                 if force {
                     state.registry.registries = None;
                     state.registry.registries_error = None;
+                    // Totals refetch too: `RegistriesLoaded` re-kicks them
+                    // once the fresh list lands, and the generation bump
+                    // orphans anything still in flight.
+                    state.registry.pull_totals.clear();
+                    state.registry.pull_totals_pending.clear();
+                    state.registry.pull_totals_error.clear();
+                    state.registry.pulls_generation =
+                        state.registry.pulls_generation.wrapping_add(1);
                 }
                 state.registry.registries_pending = true;
                 spawn_load_registries(auth.clone(), state.scope_generation, sub_ids, tx.clone());
             }
+            // PULLS column: per-registry totals for whatever the (cached)
+            // list already shows. Per-id debounce — a no-op when every total
+            // is loaded; the path a window change takes to respawn (the view
+            // handler cleared the maps).
+            kick_registry_pull_totals(state, auth, tx);
         }
         View::RegistryRepositories => {
             if let Some(registry) = state.registry.selected_registry.clone() {
@@ -4213,10 +4388,30 @@ fn kick_off_loads_for_view(
                     state.registry.access_pending = true;
                     spawn_load_registry_access(
                         auth.clone(),
-                        registry,
+                        registry.clone(),
                         state.registry.access_window.clone(),
                         state.registry.access_scope.clone(),
                         state.registry.access_exclude_self,
+                        state.registry.access_generation,
+                        tx.clone(),
+                    );
+                }
+                // The pull/push activity chart rides the same generation but
+                // has its own debounce: it only depends on (registry, window),
+                // so an exclude-me force refetches it redundantly — harmless,
+                // and simpler than tracking a second scope token.
+                let metrics_cached = state.registry.access_metrics.is_some();
+                let metrics_in_flight = state.registry.access_metrics_pending;
+                if force || (!metrics_cached && !metrics_in_flight) {
+                    if force {
+                        state.registry.access_metrics = None;
+                        state.registry.access_metrics_error = None;
+                    }
+                    state.registry.access_metrics_pending = true;
+                    spawn_load_registry_access_metrics(
+                        auth.clone(),
+                        registry,
+                        state.registry.access_window.clone(),
                         state.registry.access_generation,
                         tx.clone(),
                     );
@@ -4778,6 +4973,9 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::storage_containers::render(f, view_area, state, theme)
         }
         View::StorageBlobs => crate::ui::views::storage_blobs::render(f, view_area, state, theme),
+        View::StorageAccessLogs => {
+            crate::ui::views::storage_access::render(f, view_area, state, theme)
+        }
         View::StorageBlobDetail => {
             crate::ui::views::storage_blob_detail::render(f, view_area, state, theme)
         }
@@ -6271,6 +6469,43 @@ fn spawn_load_storage_blob_preview(
     });
 }
 
+/// Fetch one page of `StorageBlobLogs` rows for the storage access-logs view.
+/// `generation` is the query-scope token the result is validated against on
+/// landing (see `AppEvent::StorageAccessLoaded`).
+fn spawn_load_storage_access(
+    auth: AzureAuth,
+    account: crate::azure::storage::StorageAccount,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    container: Option<String>,
+    exclude_self: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageAccessLoaded {
+            generation,
+            result: Ok(crate::azure::demo::storage_access(
+                &window,
+                container.as_deref(),
+                exclude_self,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::storage_logs::fetch(
+            &auth,
+            &account,
+            &window,
+            container.as_deref(),
+            exclude_self,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageAccessLoaded { generation, result });
+    });
+}
+
 fn spawn_load_registries(
     auth: AzureAuth,
     scope: u64,
@@ -6371,6 +6606,99 @@ fn spawn_load_registry_access(
         .await
         .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::RegistryAccessLoaded { generation, result });
+    });
+}
+
+/// Fetch registry-wide pull/push counts from Monitor platform metrics for the
+/// access-logs activity chart. Platform metrics need no diagnostic setting,
+/// so this succeeds (and shows real activity) even on registries whose event
+/// query comes back empty because repository events were never forwarded.
+fn spawn_load_registry_access_metrics(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistryAccessMetricsLoaded {
+            generation,
+            result: Ok(crate::azure::demo::registry_activity(&window)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::registry_metrics::fetch(&auth, &registry, &window)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryAccessMetricsLoaded { generation, result });
+    });
+}
+
+/// Spawn the PULLS-column total fetches for every listed registry that has no
+/// cached total, no recorded failure, and no fetch in flight. Called from the
+/// Registries kick (cheap no-op when settled) and from `RegistriesLoaded` so
+/// a fresh list starts loading its totals without an extra keypress.
+fn kick_registry_pull_totals(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let missing: Vec<crate::azure::registries::Registry> = state
+        .registry
+        .registries
+        .iter()
+        .flatten()
+        .filter(|r| {
+            !state.registry.pull_totals.contains_key(&r.id)
+                && !state.registry.pull_totals_error.contains_key(&r.id)
+                && !state.registry.pull_totals_pending.contains(&r.id)
+        })
+        .cloned()
+        .collect();
+    for registry in missing {
+        state
+            .registry
+            .pull_totals_pending
+            .insert(registry.id.clone());
+        spawn_load_registry_pull_total(
+            auth.clone(),
+            registry,
+            state.registry.pulls_window(),
+            state.registry.pulls_generation,
+            tx.clone(),
+        );
+    }
+}
+
+/// Fetch one registry's total pull count over the PULLS-column window. Rides
+/// the same Monitor metrics call as the access-log chart and just sums it.
+fn spawn_load_registry_pull_total(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistryPullTotalLoaded {
+            registry_id: registry.id.clone(),
+            generation,
+            result: Ok(crate::azure::demo::registry_activity(&window).pull_total()),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let registry_id = registry.id.clone();
+        let result = crate::azure::registry_metrics::fetch(&auth, &registry, &window)
+            .await
+            .map(|a| a.pull_total())
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryPullTotalLoaded {
+            registry_id,
+            generation,
+            result,
+        });
     });
 }
 

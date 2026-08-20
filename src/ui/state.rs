@@ -108,7 +108,8 @@ impl Category {
                     | View::StorageAccountOverview
                     | View::StorageContainers
                     | View::StorageBlobs
-                    | View::StorageBlobDetail,
+                    | View::StorageBlobDetail
+                    | View::StorageAccessLogs,
             ) | (
                 Category::Registries,
                 View::Registries
@@ -298,6 +299,12 @@ pub enum View {
     /// Metadata + bounded body preview for the selected blob. Opened with Enter
     /// from `StorageBlobs`.
     StorageBlobDetail,
+    /// Access (audit) log for the pinned storage account: who read / wrote
+    /// which blob, when, from where — the `StorageBlobLogs` rows the blob
+    /// service's diagnostic setting forwards to Log Analytics. Opened with
+    /// `l` on an account row (account-wide) or a container row (pre-scoped
+    /// to that container). Mirrors `KeyVaultAccessLogs`.
+    StorageAccessLogs,
     /// Top-level "Container registries" mode entry point — lists ACR registries
     /// across the selected subscriptions. Opened with `R` from any non-modal
     /// view.
@@ -886,6 +893,43 @@ pub struct StorageCache {
     pub blob_preview_pending: HashSet<String>,
     pub blob_preview_error: HashMap<String, String>,
     pub blob_preview_scroll: u16,
+
+    // -- access-logs view (`l` on an account or container) -----------------
+    // Mirrors `KeyVaultCache` / `RegistryCache`'s access-log block
+    // field-for-field; see the doc comments there for the invariants.
+    /// Fetched `StorageBlobLogs` rows for the pinned account under the
+    /// *current* query scope (window / container / exclude-me). Dropped
+    /// whenever that scope changes.
+    pub access_events: Option<Vec<crate::azure::storage_logs::AccessEvent>>,
+    pub access_pending: bool,
+    pub access_error: Option<String>,
+    pub access_cursor: usize,
+    /// Persisted table scroll offset — see `accounts_view_top`.
+    pub access_view_top: Cell<usize>,
+    /// Monotonic fetch-scope token — a landing page whose generation is
+    /// stale is discarded (see `KeyVaultCache::access_generation`).
+    pub access_generation: u64,
+    /// Query time window; shares Key Vault's `AccessWindow` type.
+    pub access_window: crate::azure::key_vault_logs::AccessWindow,
+    /// Server-side "exclude me" (your UPN / object id / sign-in IP from the
+    /// token claims). Toggled with `m`.
+    pub access_exclude_self: bool,
+    /// Who the current page actually hid, for the header chip.
+    pub access_hidden: Option<crate::azure::key_vault_logs::SelfIdentity>,
+    /// Scope the query to one container — set when the view was opened with
+    /// `l` on a container row rather than on the account.
+    pub access_scope: Option<String>,
+    /// Client-side `OperationName` filter (`GetBlob`, …), cycled with
+    /// Tab / Shift+Tab through the distinct operations in the fetched page.
+    pub access_operation: Option<String>,
+    /// The page came back at the row cap — older rows in the window exist.
+    pub access_truncated: bool,
+    /// Where Esc should land: `StorageContainers` when opened from a
+    /// container row, `StorageAccounts` when opened from the accounts list.
+    pub access_return_view: Option<View>,
+    /// Free-form custom-window input (`t`), e.g. "6m".
+    pub access_window_input: Input,
+    pub access_window_input_active: bool,
 }
 
 impl StorageCache {
@@ -951,6 +995,55 @@ impl StorageCache {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Access events with the client-side `access_operation` filter applied —
+    /// the view the access-logs table (and its cursor) indexes into. Mirrors
+    /// [`KeyVaultCache::visible_access_events`].
+    pub fn visible_access_events(&self) -> Vec<&crate::azure::storage_logs::AccessEvent> {
+        match self.access_events.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|e| {
+                    self.access_operation
+                        .as_deref()
+                        .is_none_or(|op| e.operation == op)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Distinct `OperationName` values in the fetched page, sorted — the Tab
+    /// cycle order for the operation filter.
+    pub fn access_operations(&self) -> Vec<String> {
+        let mut ops: Vec<String> = self
+            .access_events
+            .iter()
+            .flatten()
+            .map(|e| e.operation.clone())
+            .collect();
+        ops.sort();
+        ops.dedup();
+        ops
+    }
+
+    /// Reset the access-logs view for entering it fresh on the pinned
+    /// account (scoped to `scope` when opened from a container row).
+    /// Mirrors [`KeyVaultCache::enter_access_view`].
+    pub fn enter_access_view(&mut self, scope: Option<String>, return_view: View) {
+        self.access_events = None;
+        self.access_error = None;
+        self.access_pending = false;
+        self.access_cursor = 0;
+        self.access_view_top.set(0);
+        self.access_scope = scope;
+        self.access_operation = None;
+        self.access_truncated = false;
+        self.access_return_view = Some(return_view);
+        self.access_window_input.reset();
+        self.access_window_input_active = false;
+        self.access_generation = self.access_generation.wrapping_add(1);
     }
 }
 
@@ -1034,12 +1127,61 @@ pub struct RegistryCache {
     /// Free-form custom-window input (`t`), e.g. "6m".
     pub access_window_input: Input,
     pub access_window_input_active: bool,
+    /// Pull/push counts over `access_window` from Monitor platform metrics —
+    /// always available (no diagnostic setting needed), so the view can show
+    /// activity even when the event table is empty because repository events
+    /// were never forwarded. Registry-wide regardless of `access_scope`.
+    pub access_metrics: Option<crate::azure::registry_metrics::RegistryActivity>,
+    pub access_metrics_pending: bool,
+    pub access_metrics_error: Option<String>,
+
+    // -- PULLS column on the registries table ------------------------------
+    /// Total pulls per registry over [`Self::pulls_window`], from Monitor
+    /// platform metrics (`TotalPullCount`). Keyed by registry id. A registry
+    /// absent from every map has its fetch still unspawned.
+    pub pull_totals: HashMap<String, f64>,
+    pub pull_totals_pending: HashSet<String>,
+    /// Fetch failures, keyed by registry id — the cell renders "—".
+    pub pull_totals_error: HashMap<String, String>,
+    /// Window for the PULLS column, adjustable with `0`/`1`/`7`/`t` on the
+    /// registries list. `None` = the 7d default (see [`Self::pulls_window`] —
+    /// stored as an `Option` only because `AccessWindow::default()` is 1d and
+    /// this cache derives `Default`).
+    pub pulls_window: Option<crate::azure::key_vault_logs::AccessWindow>,
+    /// Stale-fetch token for the PULLS column, same idea as
+    /// `access_generation`: bumped on every window change so an in-flight
+    /// total from the old window can't land under the new header.
+    pub pulls_generation: u64,
+    /// Free-form custom-window input (`t` on the registries list), e.g. "6m".
+    pub pulls_window_input: Input,
+    pub pulls_window_input_active: bool,
 }
 
 impl RegistryCache {
     /// Cache key for the tags map.
     pub fn tags_key(registry_id: &str, repository: &str) -> String {
         format!("{registry_id}/{repository}")
+    }
+
+    /// The PULLS column's window: what the user picked, defaulting to 7d —
+    /// pull counts are a capacity/usage signal and a day is too twitchy.
+    pub fn pulls_window(&self) -> crate::azure::key_vault_logs::AccessWindow {
+        self.pulls_window
+            .clone()
+            .unwrap_or(crate::azure::key_vault_logs::AccessWindow::Week)
+    }
+
+    /// Change the PULLS window: drop every cached total and orphan in-flight
+    /// fetches so the column refetches under the new window.
+    pub fn set_pulls_window(&mut self, window: crate::azure::key_vault_logs::AccessWindow) {
+        if self.pulls_window() == window {
+            return;
+        }
+        self.pulls_window = Some(window);
+        self.pull_totals.clear();
+        self.pull_totals_pending.clear();
+        self.pull_totals_error.clear();
+        self.pulls_generation = self.pulls_generation.wrapping_add(1);
     }
 
     /// Apply `registries_filter` to `registries` as a case-insensitive
@@ -1137,6 +1279,9 @@ impl RegistryCache {
         self.access_return_view = Some(return_view);
         self.access_window_input.reset();
         self.access_window_input_active = false;
+        self.access_metrics = None;
+        self.access_metrics_pending = false;
+        self.access_metrics_error = None;
         self.access_generation = self.access_generation.wrapping_add(1);
     }
 }

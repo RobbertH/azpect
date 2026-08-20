@@ -1598,7 +1598,7 @@ fn unit_suffix(s: &MetricSeries) -> String {
     }
 }
 
-fn format_count(v: f64) -> String {
+pub(crate) fn format_count(v: f64) -> String {
     // Short-circuit non-positive / NaN before any arithmetic. `v.max(0.0)`
     // doesn't reliably strip negative zero on every platform, which leaks
     // through as `-0` from `format!("{:.0}", -0.0)`.

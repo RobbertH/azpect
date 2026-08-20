@@ -16,7 +16,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter overview  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter overview  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 /// Above this width, the SUB ID column has enough room to spell out the full
@@ -472,6 +472,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 // Drill into the per-account overview panel first; Enter from
                 // there opens the containers list. See `View::StorageAccountOverview`.
                 state.view = View::StorageAccountOverview;
+            }
+            true
+        }
+        Action::OpenLogs => {
+            // `l` on an account: its blob access (audit) log, account-wide.
+            let account = state
+                .storage
+                .filtered_accounts()
+                .get(state.storage.accounts_cursor)
+                .copied()
+                .cloned();
+            if let Some(account) = account {
+                state.storage.selected_account = Some(account);
+                state.storage.enter_access_view(None, View::StorageAccounts);
+                state.view = View::StorageAccessLogs;
             }
             true
         }

@@ -161,12 +161,34 @@ const STORAGE: Section = (
     ],
 );
 
+const STORAGE_ACCESS_LOG: Section = (
+    "Storage access log (l on an account or container)",
+    &[
+        (
+            "l",
+            "blob access log — who read/wrote what, when, how (OAuth / SAS / account key)",
+        ),
+        ("0 / 1 / 7", "window 1h / 1d / 7d"),
+        ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
+        (
+            "m",
+            "hide your own accesses (your user / object id / sign-in IP)",
+        ),
+        ("Tab / S-Tab", "cycle operation filter (GetBlob, …)"),
+        ("y", "yank row (incl. raw identity)"),
+    ],
+);
+
 const REGISTRIES: Section = (
     "Container registries (ACR)",
     &[
         ("R", "enter registries mode"),
         ("Enter", "drill: registries > repositories > tags"),
         ("/", "filter registries / repos / tags by name (substring)"),
+        (
+            "0 / 1 / 7 / t",
+            "PULLS column window: 1h / 1d / 7d (default) / custom, e.g. 30d",
+        ),
         ("y", "yank registry id / repo name / pull ref"),
         ("o", "open registry in Azure Portal"),
         ("r", "refresh current panel"),
@@ -178,7 +200,7 @@ const ACR_ACCESS_LOG: Section = (
     &[
         (
             "l",
-            "access log — who pulled/pushed which image, when (registry-wide or one repo)",
+            "access log — who pulled/pushed which image, when (registry-wide or one repo); pulls/pushes chart on top comes from Monitor metrics (always on)",
         ),
         ("0 / 1 / 7", "window 1h / 1d / 7d"),
         ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
@@ -364,7 +386,7 @@ fn sections_for(origin: Option<View>) -> Vec<Section> {
         Some(Category::Apis) => {
             out.extend([API_RESOURCES, DETAIL_LOGS, HEALTH_BADGE, APIM, APP_GATEWAY])
         }
-        Some(Category::Storage) => out.push(STORAGE),
+        Some(Category::Storage) => out.extend([STORAGE, STORAGE_ACCESS_LOG]),
         Some(Category::Registries) => out.extend([REGISTRIES, ACR_ACCESS_LOG]),
         Some(Category::Cosmos) => out.push(COSMOS),
         Some(Category::KeyVaults) => out.extend([KEY_VAULTS, KV_ACCESS_LOG]),

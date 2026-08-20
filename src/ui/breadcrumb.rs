@@ -183,6 +183,18 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        View::StorageAccessLogs => {
+            let mut s = vec![subscription_segment(state), "storage".to_string()];
+            if let Some(acc) = state.storage.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            if let Some(container) = state.storage.access_scope.as_deref() {
+                s.push(container.to_string());
+            }
+            s.push("access log".to_string());
+            s
+        }
+
         View::Registries => vec![subscription_segment(state), "registries".to_string()],
 
         View::RegistryRepositories => {

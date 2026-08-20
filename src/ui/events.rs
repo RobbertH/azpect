@@ -200,6 +200,14 @@ pub enum AppEvent {
         key: String,
         result: Result<crate::azure::storage::BlobPreview, String>,
     },
+    /// Background load completion: one page of `StorageBlobLogs` rows for the
+    /// storage access-logs view. `generation` mirrors
+    /// `StorageCache::access_generation` — a page fetched under an older
+    /// query scope (window / container / exclude-me) is discarded on landing.
+    StorageAccessLoaded {
+        generation: u64,
+        result: Result<crate::azure::storage_logs::AccessPage, String>,
+    },
     /// Background load completion: list of container registries for the
     /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
     RegistriesLoaded {
@@ -226,6 +234,23 @@ pub enum AppEvent {
     RegistryAccessLoaded {
         generation: u64,
         result: Result<crate::azure::registry_logs::AccessPage, String>,
+    },
+    /// Background load completion: registry-wide pull/push counts from
+    /// Monitor platform metrics for the access-logs view's activity chart.
+    /// Guarded by the same `access_generation` token as the event page —
+    /// the chart depends on the window, which is part of that scope.
+    RegistryAccessMetricsLoaded {
+        generation: u64,
+        result: Result<crate::azure::registry_metrics::RegistryActivity, String>,
+    },
+    /// Background load completion: one registry's total pull count over the
+    /// PULLS-column window, keyed by registry ARM id. `generation` mirrors
+    /// `RegistryCache::pulls_generation` — a total fetched under an older
+    /// window is discarded on landing.
+    RegistryPullTotalLoaded {
+        registry_id: String,
+        generation: u64,
+        result: Result<f64, String>,
     },
     /// Background load completion: list of consumption Logic Apps for the
     /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
@@ -608,6 +633,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::Logs
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
+            | View::StorageAccessLogs
             | View::SqlAuditEvents => Action::CycleSourceFilter,
             _ => Action::NextPanel,
         },
@@ -615,6 +641,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::Logs
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
+            | View::StorageAccessLogs
             | View::SqlAuditEvents => Action::CycleSourceFilterBack,
             _ => Action::PrevPanel,
         },
@@ -635,6 +662,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::EnvVars
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
+            | View::StorageAccessLogs
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents
             | View::SqlAuditEventDetail
@@ -662,12 +690,17 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         },
         // Access-logs-only keys, scoped so they stay free elsewhere.
         KeyCode::Char('m') => match view {
-            View::KeyVaultAccessLogs | View::RegistryAccessLogs => Action::ToggleExcludeSelf,
+            View::KeyVaultAccessLogs | View::RegistryAccessLogs | View::StorageAccessLogs => {
+                Action::ToggleExcludeSelf
+            }
             _ => Action::Noop,
         },
         KeyCode::Char('t') => match view {
+            // On the registries list, `t` adjusts the PULLS column's window.
             View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
+            | View::StorageAccessLogs
+            | View::Registries
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents => Action::SetCustomWindow,
             View::LogicAppRuns => Action::OpenTriggerHistory,
