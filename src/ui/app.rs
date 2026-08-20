@@ -947,6 +947,42 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::RegistryAccessLoaded { generation, result } => {
+                // Same stale-scope rule as `KeyVaultAccessLoaded`.
+                if generation == state.registry.access_generation {
+                    state.registry.access_pending = false;
+                    match result {
+                        Ok(page) => {
+                            // GUID-shaped identities (service principals,
+                            // managed identities) resolve to directory names
+                            // via Graph — best-effort, cached, deduped like
+                            // the SQL audit roll-up's resolution.
+                            for e in &page.events {
+                                let Some(id) =
+                                    crate::azure::sql_audit::graph_candidate(&e.identity)
+                                else {
+                                    continue;
+                                };
+                                if state.principals.by_id.contains_key(&id)
+                                    || state.principals.failed.contains(&id)
+                                    || state.principals.pending.contains(&id)
+                                {
+                                    continue;
+                                }
+                                state.principals.pending.insert(id.clone());
+                                spawn_resolve_principal(auth.clone(), id, tx.clone());
+                            }
+                            state.registry.access_error = None;
+                            state.registry.access_truncated = page.truncated;
+                            state.registry.access_hidden = page.hidden;
+                            state.registry.access_events = Some(page.events);
+                            state.registry.access_cursor = 0;
+                            state.registry.access_view_top.set(0);
+                        }
+                        Err(e) => state.registry.access_error = Some(e),
+                    }
+                }
+            }
             AppEvent::LogicAppsLoaded { scope, result } => {
                 // Stale scope — see the `ResourcesLoaded` arm.
                 if scope != state.scope_generation {
@@ -1603,6 +1639,14 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
             .handle_event(&CtEvent::Key(key));
         return true;
     }
+    // The ACR access-logs custom window input (`t`), same shape.
+    if should_forward_to_registry_access_window_input(state, key) {
+        state
+            .registry
+            .access_window_input
+            .handle_event(&CtEvent::Key(key));
+        return true;
+    }
     // The SQL audit views' custom window input (`t`), same shape.
     if should_forward_to_sql_audit_window_input(state, key) {
         state
@@ -2178,6 +2222,17 @@ fn should_forward_to_access_window_input(
         && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
 }
 
+/// Mirror of `should_forward_to_access_window_input` for the ACR access-logs
+/// custom window input.
+fn should_forward_to_registry_access_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::RegistryAccessLogs
+        && state.registry.access_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
 /// Mirror of `should_forward_to_access_window_input` for the SQL audit views'
 /// custom window input.
 fn should_forward_to_sql_audit_window_input(
@@ -2432,6 +2487,7 @@ fn decide_action(
         || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
         || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
         || (state.view == View::KeyVaultAccessLogs && state.key_vault.access_window_input_active)
+        || (state.view == View::RegistryAccessLogs && state.registry.access_window_input_active)
         || (state.view == View::ServiceBusNamespaces && state.service_bus.namespaces_filter_active)
         || (state.view == View::ServiceBusEntities && state.service_bus.entities_filter_active)
         || (state.view == View::ServiceBusSubscriptions
@@ -2503,6 +2559,7 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
             crate::ui::views::registry_repositories::handle(action, state)
         }
         View::RegistryTags => crate::ui::views::registry_tags::handle(action, state),
+        View::RegistryAccessLogs => crate::ui::views::registry_access::handle(action, state),
         View::CosmosAccounts => crate::ui::views::cosmos_accounts::handle(action, state),
         View::CosmosDatabases => crate::ui::views::cosmos_databases::handle(action, state),
         View::CosmosContainers => crate::ui::views::cosmos_containers::handle(action, state),
@@ -2972,6 +3029,13 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_registry
             .as_ref()
             .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
+        // The access log's portal counterpart is the registry's diagnostics /
+        // logs side nav; the overview blade is the stable entry point.
+        View::RegistryAccessLogs => state
+            .registry
+            .selected_registry
+            .as_ref()
+            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
         // Logic App views land on the workflow's overview blade — that's
         // where the portal shows the run history the TUI was browsing.
         View::LogicApps => state
@@ -3207,6 +3271,7 @@ fn yank_target(state: &AppState) -> Option<String> {
                 repository
             ))
         }),
+        View::RegistryAccessLogs => crate::ui::views::registry_access::yank_text(state),
         // Logic Apps: workflow id at the top level; run / firing ids on the
         // history rows (they're what you paste into `az logic` or a support
         // ticket); the content view yanks the whole rendered payload.
@@ -3456,6 +3521,10 @@ fn semantic_parent(view: View) -> Option<View> {
         View::Registries => Some(View::Subscriptions),
         View::RegistryRepositories => Some(View::Registries),
         View::RegistryTags => Some(View::RegistryRepositories),
+        // The view's own Back handler consumes Esc first (it returns to the
+        // recorded origin — registries or repositories list); this is the
+        // static fallback for the breadcrumb tree.
+        View::RegistryAccessLogs => Some(View::Registries),
         View::CosmosAccounts => Some(View::Subscriptions),
         View::CosmosDatabases => Some(View::CosmosAccounts),
         View::CosmosContainers => Some(View::CosmosDatabases),
@@ -3529,6 +3598,7 @@ fn after_action(
                     | View::Detail
                     | View::SqlDetail
                     | View::KeyVaultAccessLogs
+                    | View::RegistryAccessLogs
                     | View::SqlAuditPrincipals
                     | View::SqlAuditEvents
             );
@@ -3541,6 +3611,14 @@ fn after_action(
             if state.view == View::KeyVaultAccessLogs
                 && !state.key_vault.access_window_input_active
                 && state.key_vault.access_events.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        }
+        // Same custom-window-commit spawn for the ACR access-logs view.
+        Action::OpenSelected
+            if state.view == View::RegistryAccessLogs
+                && !state.registry.access_window_input_active
+                && state.registry.access_events.is_none() =>
         {
             kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
@@ -4118,6 +4196,33 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::RegistryAccessLogs => {
+            if let Some(registry) = state.registry.selected_registry.clone() {
+                let cached = state.registry.access_events.is_some();
+                let in_flight = state.registry.access_pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.registry.access_events = None;
+                        state.registry.access_error = None;
+                    }
+                    // Every spawn owns the buffer: bump the generation so an
+                    // older in-flight page is discarded when it lands (see the
+                    // KV access view's kick for the rationale).
+                    state.registry.access_generation =
+                        state.registry.access_generation.wrapping_add(1);
+                    state.registry.access_pending = true;
+                    spawn_load_registry_access(
+                        auth.clone(),
+                        registry,
+                        state.registry.access_window.clone(),
+                        state.registry.access_scope.clone(),
+                        state.registry.access_exclude_self,
+                        state.registry.access_generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         View::LogicApps => {
             let cached = state.logic_apps.workflows.is_some();
             let in_flight = state.logic_apps.workflows_pending;
@@ -4692,6 +4797,9 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::registry_repositories::render(f, view_area, state, theme)
         }
         View::RegistryTags => crate::ui::views::registry_tags::render(f, view_area, state, theme),
+        View::RegistryAccessLogs => {
+            crate::ui::views::registry_access::render(f, view_area, state, theme)
+        }
         View::CosmosAccounts => {
             crate::ui::views::cosmos_accounts::render(f, view_area, state, theme)
         }
@@ -6226,6 +6334,43 @@ fn spawn_load_tags(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::RegistryTagsLoaded { key, result });
+    });
+}
+
+/// Fetch one page of `ContainerRegistryRepositoryEvents` rows for the
+/// registry access-logs view. `generation` is the query-scope token the
+/// result is validated against on landing (see `AppEvent::RegistryAccessLoaded`).
+fn spawn_load_registry_access(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    repository: Option<String>,
+    exclude_self: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistryAccessLoaded {
+            generation,
+            result: Ok(crate::azure::demo::registry_access(
+                &window,
+                repository.as_deref(),
+                exclude_self,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::registry_logs::fetch(
+            &auth,
+            &registry,
+            &window,
+            repository.as_deref(),
+            exclude_self,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryAccessLoaded { generation, result });
     });
 }
 

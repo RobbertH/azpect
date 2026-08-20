@@ -219,6 +219,14 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::registries::Tag>, String>,
     },
+    /// Background load completion: one page of `ContainerRegistryRepositoryEvents`
+    /// rows for the registry access-logs view. `generation` mirrors
+    /// `RegistryCache::access_generation` — a page fetched under an older
+    /// query scope (window / repository / exclude-me) is discarded on landing.
+    RegistryAccessLoaded {
+        generation: u64,
+        result: Result<crate::azure::registry_logs::AccessPage, String>,
+    },
     /// Background load completion: list of consumption Logic Apps for the
     /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
     LogicAppsLoaded {
@@ -597,15 +605,17 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // action keeps `after_action` from treating it like a panel switch and
         // refetching the log buffer on every keystroke.
         KeyCode::Tab => match view {
-            View::Logs | View::KeyVaultAccessLogs | View::SqlAuditEvents => {
-                Action::CycleSourceFilter
-            }
+            View::Logs
+            | View::KeyVaultAccessLogs
+            | View::RegistryAccessLogs
+            | View::SqlAuditEvents => Action::CycleSourceFilter,
             _ => Action::NextPanel,
         },
         KeyCode::BackTab => match view {
-            View::Logs | View::KeyVaultAccessLogs | View::SqlAuditEvents => {
-                Action::CycleSourceFilterBack
-            }
+            View::Logs
+            | View::KeyVaultAccessLogs
+            | View::RegistryAccessLogs
+            | View::SqlAuditEvents => Action::CycleSourceFilterBack,
             _ => Action::PrevPanel,
         },
 
@@ -624,6 +634,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::LogDetail
             | View::EnvVars
             | View::KeyVaultAccessLogs
+            | View::RegistryAccessLogs
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents
             | View::SqlAuditEventDetail
@@ -651,13 +662,14 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         },
         // Access-logs-only keys, scoped so they stay free elsewhere.
         KeyCode::Char('m') => match view {
-            View::KeyVaultAccessLogs => Action::ToggleExcludeSelf,
+            View::KeyVaultAccessLogs | View::RegistryAccessLogs => Action::ToggleExcludeSelf,
             _ => Action::Noop,
         },
         KeyCode::Char('t') => match view {
-            View::KeyVaultAccessLogs | View::SqlAuditPrincipals | View::SqlAuditEvents => {
-                Action::SetCustomWindow
-            }
+            View::KeyVaultAccessLogs
+            | View::RegistryAccessLogs
+            | View::SqlAuditPrincipals
+            | View::SqlAuditEvents => Action::SetCustomWindow,
             View::LogicAppRuns => Action::OpenTriggerHistory,
             _ => Action::Noop,
         },

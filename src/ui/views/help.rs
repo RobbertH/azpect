@@ -173,6 +173,24 @@ const REGISTRIES: Section = (
     ],
 );
 
+const ACR_ACCESS_LOG: Section = (
+    "Registry access log (l on a registry or repository)",
+    &[
+        (
+            "l",
+            "access log — who pulled/pushed which image, when (registry-wide or one repo)",
+        ),
+        ("0 / 1 / 7", "window 1h / 1d / 7d"),
+        ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
+        (
+            "m",
+            "hide your own pulls (your user / object id / sign-in IP)",
+        ),
+        ("Tab / S-Tab", "cycle operation filter (Pull, Push, …)"),
+        ("y", "yank row (incl. raw identity and full digest)"),
+    ],
+);
+
 const COSMOS: Section = (
     "Cosmos DB (SQL/Core API)",
     &[
@@ -347,7 +365,7 @@ fn sections_for(origin: Option<View>) -> Vec<Section> {
             out.extend([API_RESOURCES, DETAIL_LOGS, HEALTH_BADGE, APIM, APP_GATEWAY])
         }
         Some(Category::Storage) => out.push(STORAGE),
-        Some(Category::Registries) => out.push(REGISTRIES),
+        Some(Category::Registries) => out.extend([REGISTRIES, ACR_ACCESS_LOG]),
         Some(Category::Cosmos) => out.push(COSMOS),
         Some(Category::KeyVaults) => out.extend([KEY_VAULTS, KV_ACCESS_LOG]),
         Some(Category::ServiceBus) => out.push(SERVICE_BUS),

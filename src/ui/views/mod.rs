@@ -190,6 +190,7 @@ pub mod logs;
 pub mod logs_detail;
 pub mod metric_chart;
 pub mod registries;
+pub mod registry_access;
 pub mod registry_repositories;
 pub mod registry_tags;
 pub mod service_bus_entities;

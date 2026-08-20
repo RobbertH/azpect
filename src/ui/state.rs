@@ -111,7 +111,10 @@ impl Category {
                     | View::StorageBlobDetail,
             ) | (
                 Category::Registries,
-                View::Registries | View::RegistryRepositories | View::RegistryTags,
+                View::Registries
+                    | View::RegistryRepositories
+                    | View::RegistryTags
+                    | View::RegistryAccessLogs,
             ) | (
                 Category::Cosmos,
                 View::CosmosAccounts
@@ -307,6 +310,12 @@ pub enum View {
     /// Opened with Enter from `RegistryRepositories`. Same data-plane
     /// permission requirement as the repositories list.
     RegistryTags,
+    /// Access (audit) log for the pinned registry: who pulled / pushed which
+    /// image, when, from where — the `ContainerRegistryRepositoryEvents` rows
+    /// the registry's diagnostic setting forwards to Log Analytics. Opened
+    /// with `l` on a registry row (registry-wide) or a repository row
+    /// (pre-scoped to that repository). Mirrors `KeyVaultAccessLogs`.
+    RegistryAccessLogs,
     /// Top-level "Cosmos DB" mode entry point — lists SQL/Core API Cosmos
     /// accounts across the selected subscriptions. Opened via the `:cosmos`
     /// palette command (no keybind).
@@ -988,6 +997,43 @@ pub struct RegistryCache {
     pub tags_view_top: Cell<usize>,
     pub tags_filter: Input,
     pub tags_filter_active: bool,
+
+    // -- access-logs view (`l` on a registry or repository) ----------------
+    // Mirrors `KeyVaultCache`'s access-log block field-for-field; see the
+    // doc comments there for the invariants (generation guard, scope-drop).
+    /// Fetched `ContainerRegistryRepositoryEvents` rows for the pinned
+    /// registry under the *current* query scope (window / repository /
+    /// exclude-me). Dropped whenever that scope changes.
+    pub access_events: Option<Vec<crate::azure::registry_logs::AccessEvent>>,
+    pub access_pending: bool,
+    pub access_error: Option<String>,
+    pub access_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub access_view_top: Cell<usize>,
+    /// Monotonic fetch-scope token — a landing page whose generation is
+    /// stale is discarded (see `KeyVaultCache::access_generation`).
+    pub access_generation: u64,
+    /// Query time window; shares Key Vault's `AccessWindow` type.
+    pub access_window: crate::azure::key_vault_logs::AccessWindow,
+    /// Server-side "exclude me" (your UPN / object id / sign-in IP from the
+    /// token claims). Toggled with `m`.
+    pub access_exclude_self: bool,
+    /// Who the current page actually hid, for the header chip.
+    pub access_hidden: Option<crate::azure::key_vault_logs::SelfIdentity>,
+    /// Scope the query to one repository — set when the view was opened with
+    /// `l` on a repository row rather than on the registry.
+    pub access_scope: Option<String>,
+    /// Client-side `OperationName` filter (`Pull`, `Push`, …), cycled with
+    /// Tab / Shift+Tab through the distinct operations in the fetched page.
+    pub access_operation: Option<String>,
+    /// The page came back at the row cap — older rows in the window exist.
+    pub access_truncated: bool,
+    /// Where Esc should land: `RegistryRepositories` when opened from a repo
+    /// row, `Registries` when opened from the registries list.
+    pub access_return_view: Option<View>,
+    /// Free-form custom-window input (`t`), e.g. "6m".
+    pub access_window_input: Input,
+    pub access_window_input_active: bool,
 }
 
 impl RegistryCache {
@@ -1043,6 +1089,55 @@ impl RegistryCache {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Access events with the client-side `access_operation` filter applied —
+    /// the view the access-logs table (and its cursor) indexes into. Mirrors
+    /// [`KeyVaultCache::visible_access_events`].
+    pub fn visible_access_events(&self) -> Vec<&crate::azure::registry_logs::AccessEvent> {
+        match self.access_events.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|e| {
+                    self.access_operation
+                        .as_deref()
+                        .is_none_or(|op| e.operation == op)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Distinct `OperationName` values in the fetched page, sorted — the Tab
+    /// cycle order for the operation filter.
+    pub fn access_operations(&self) -> Vec<String> {
+        let mut ops: Vec<String> = self
+            .access_events
+            .iter()
+            .flatten()
+            .map(|e| e.operation.clone())
+            .collect();
+        ops.sort();
+        ops.dedup();
+        ops
+    }
+
+    /// Reset the access-logs view for entering it fresh on the pinned
+    /// registry (scoped to `scope` when opened from a repository row).
+    /// Mirrors [`KeyVaultCache::enter_access_view`].
+    pub fn enter_access_view(&mut self, scope: Option<String>, return_view: View) {
+        self.access_events = None;
+        self.access_error = None;
+        self.access_pending = false;
+        self.access_cursor = 0;
+        self.access_view_top.set(0);
+        self.access_scope = scope;
+        self.access_operation = None;
+        self.access_truncated = false;
+        self.access_return_view = Some(return_view);
+        self.access_window_input.reset();
+        self.access_window_input_active = false;
+        self.access_generation = self.access_generation.wrapping_add(1);
     }
 }
 

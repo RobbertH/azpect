@@ -26,6 +26,7 @@ pub mod logs;
 pub mod metrics;
 pub mod principals;
 pub mod registries;
+pub mod registry_logs;
 pub mod resource_health;
 pub mod resources;
 pub mod service_bus;

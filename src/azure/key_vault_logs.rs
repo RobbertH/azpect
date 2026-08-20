@@ -140,26 +140,32 @@ pub struct AccessEvent {
 
 /// The signed-in principal, decoded from the bearer token's claims. Used by
 /// the "exclude me" filter: a row is *you* when its UPN or caller IP matches.
+/// The ACR access log matches on the object id instead — its `Identity`
+/// column carries oids, not UPNs (see `crate::azure::registry_logs`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SelfIdentity {
     /// `upn` / `unique_name` claim (humans). Lowercased.
     pub upn: Option<String>,
     /// `ipaddr` claim — the client IP Entra saw at sign-in.
     pub ip: Option<String>,
+    /// `oid` claim — the directory object id (present for every principal
+    /// kind, unlike `upn`).
+    pub oid: Option<String>,
 }
 
 impl SelfIdentity {
     pub fn is_empty(&self) -> bool {
-        self.upn.is_none() && self.ip.is_none()
+        self.upn.is_none() && self.ip.is_none() && self.oid.is_none()
     }
 
-    /// Short human description for the header chip.
+    /// Short human description for the header chip. The oid is only shown
+    /// when there's nothing friendlier — it's a GUID.
     pub fn label(&self) -> String {
         match (&self.upn, &self.ip) {
             (Some(u), Some(ip)) => format!("{u} / {ip}"),
             (Some(u), None) => u.clone(),
             (None, Some(ip)) => ip.clone(),
-            (None, None) => "unknown".to_string(),
+            (None, None) => self.oid.clone().unwrap_or_else(|| "unknown".to_string()),
         }
     }
 
@@ -189,6 +195,7 @@ impl SelfIdentity {
                 .or_else(|| s("unique_name"))
                 .map(|u| u.to_lowercase()),
             ip: s("ipaddr"),
+            oid: s("oid").map(|o| o.to_lowercase()),
         }
     }
 }
@@ -269,6 +276,7 @@ fn build_access_kql(scope: Option<&ItemScope>, exclude: Option<&SelfIdentity>) -
 | extend upn_ = iif(isempty(upn_), tolower(tostring(column_ifexists("identity_claim_http_schemas_xmlsoap_org_ws_2005_05_identity_claims_upn_s", ""))), upn_)
 | extend mirid_ = tostring(column_ifexists("identity_claim_xms_mirid_s", ""))
 | extend appid_ = tostring(column_ifexists("identity_claim_appid_g", ""))
+| extend oid_ = tolower(tostring(column_ifexists("identity_claim_oid_g", "")))
 | extend ip_ = tostring(column_ifexists("CallerIPAddress", ""))
 | extend obj_ = tostring(column_ifexists("id_s", ""))
 | extend result_ = tostring(column_ifexists("ResultSignature", ""))
@@ -290,6 +298,9 @@ fn build_access_kql(scope: Option<&ItemScope>, exclude: Option<&SelfIdentity>) -
         }
         if let Some(ip) = &me.ip {
             clauses.push(format!("ip_ == \"{}\"", escape_kql(ip)));
+        }
+        if let Some(oid) = &me.oid {
+            clauses.push(format!("oid_ == \"{}\"", escape_kql(oid)));
         }
         if !clauses.is_empty() {
             kql.push_str(&format!("| where not({})\n", clauses.join(" or ")));
@@ -460,6 +471,7 @@ mod tests {
         let me = SelfIdentity {
             upn: Some("robbert@contoso.com".into()),
             ip: Some("203.0.113.7".into()),
+            oid: None,
         };
         let kql = build_access_kql(Some(&scope), Some(&me));
         assert!(kql.contains(r#"obj_ contains "/secrets/orders-db-connection""#));
@@ -514,12 +526,17 @@ mod tests {
         let payload = serde_json::json!({
             "upn": "Robbert@Contoso.com",
             "ipaddr": "203.0.113.7",
+            "oid": "9E8D7C6B-5A49-4038-B2C1-D0E9F8A7B6C5",
         });
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
         let token = format!("{}.{}.sig", b64(b"{}"), b64(payload.to_string().as_bytes()));
         let me = SelfIdentity::from_token(&token);
         assert_eq!(me.upn.as_deref(), Some("robbert@contoso.com"));
         assert_eq!(me.ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(
+            me.oid.as_deref(),
+            Some("9e8d7c6b-5a49-4038-b2c1-d0e9f8a7b6c5")
+        );
         assert!(SelfIdentity::from_token("garbage").is_empty());
     }
 

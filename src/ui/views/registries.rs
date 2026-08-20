@@ -18,7 +18,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter repos  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter repos  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -349,6 +349,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 state.registry.repositories_cursor = 0;
                 state.registry.repositories_filter = tui_input::Input::default();
                 state.view = View::RegistryRepositories;
+            }
+            true
+        }
+        Action::OpenLogs => {
+            // `l` on a registry: its access (audit) log, registry-wide.
+            let registry = state
+                .registry
+                .filtered_registries()
+                .get(state.registry.registries_cursor)
+                .copied()
+                .cloned();
+            if let Some(registry) = registry {
+                state.registry.selected_registry = Some(registry);
+                state.registry.enter_access_view(None, View::Registries);
+                state.view = View::RegistryAccessLogs;
             }
             true
         }

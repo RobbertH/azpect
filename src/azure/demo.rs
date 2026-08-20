@@ -714,6 +714,8 @@ pub fn principal_display_name(object_id: &str) -> Option<String> {
     match object_id {
         "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c" => Some("sp-orders-deploy".to_string()),
         "aabbccdd-eeff-1122-3344-556677889900" => Some("sp-dbt-warehouse".to_string()),
+        // The ACR access-log demo's kubelet identity — AKS node pulls.
+        "3c5e8a70-9d2f-4b61-8e4a-7f0b1c2d3e4f" => Some("aks-contoso-prod-agentpool".to_string()),
         _ => Some("Contoso CI Pipeline".to_string()),
     }
 }
@@ -1038,6 +1040,156 @@ pub fn tags(_repository: &str) -> Vec<Tag> {
             name: n.to_string(),
         })
         .collect()
+}
+
+/// Synthesized `ContainerRegistryRepositoryEvents` rows: AKS kubelet pulls
+/// (a managed-identity GUID that resolves via [`principal_display_name`]),
+/// CI pushes (a service-principal GUID), and humans (including "yourself"),
+/// spread over the window. Same filter semantics as the real fetch:
+/// repository scope and exclude-me narrow the rows server-side.
+pub fn registry_access(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    repository: Option<&str>,
+    exclude_self: bool,
+) -> crate::azure::registry_logs::AccessPage {
+    use crate::azure::registry_logs::{AccessEvent, AccessPage, CallerKind};
+    let me = self_identity();
+    let now = Utc::now();
+
+    const OID_KUBELET: &str = "3c5e8a70-9d2f-4b61-8e4a-7f0b1c2d3e4f";
+    const OID_CI: &str = "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c";
+    const DIGEST_CHECKOUT: &str =
+        "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    // (operation, identity, kind, ip, repository, tag, digest, result)
+    type Template = (
+        &'static str,
+        &'static str,
+        CallerKind,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        &'static str,
+    );
+    let template: &[Template] = &[
+        (
+            "Pull",
+            OID_KUBELET,
+            CallerKind::Principal,
+            "10.240.0.4",
+            "ca-checkout-api",
+            Some("1.7.3"),
+            Some(DIGEST_CHECKOUT),
+            "",
+        ),
+        (
+            "Pull",
+            OID_KUBELET,
+            CallerKind::Principal,
+            "10.240.0.5",
+            "ca-search-api",
+            Some("1.7.2"),
+            None,
+            "",
+        ),
+        (
+            "Push",
+            OID_CI,
+            CallerKind::Principal,
+            "20.93.10.4",
+            "ca-checkout-api",
+            Some("1.7.3"),
+            Some(DIGEST_CHECKOUT),
+            "",
+        ),
+        (
+            "Pull",
+            "robbert@contoso.com",
+            CallerKind::User,
+            "203.0.113.7",
+            "ca-checkout-api",
+            Some("1.7.3"),
+            None,
+            "",
+        ),
+        (
+            "Pull",
+            "dana@contoso.com",
+            CallerKind::User,
+            "198.51.100.23",
+            "base/dotnet-runtime",
+            Some("latest"),
+            None,
+            "",
+        ),
+        (
+            "Pull",
+            OID_KUBELET,
+            CallerKind::Principal,
+            "10.240.0.6",
+            "func-orders",
+            Some("1.6.0"),
+            None,
+            "",
+        ),
+        (
+            "Push",
+            "dana@contoso.com",
+            CallerKind::User,
+            "198.51.100.23",
+            "base/dotnet-runtime",
+            Some("latest"),
+            None,
+            "denied: requested access to the resource is denied",
+        ),
+        (
+            "Untag",
+            OID_CI,
+            CallerKind::Principal,
+            "20.93.10.4",
+            "ca-checkout-api",
+            Some("1.6.0"),
+            None,
+            "",
+        ),
+    ];
+
+    let total_minutes = window.duration().num_minutes().max(60);
+    // Enough repetitions to fill the window at ~1 event / 8 minutes, capped
+    // well under the page size so demo never looks truncated.
+    let count = (total_minutes / 8).clamp(8, 240) as usize;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let (op, identity, kind, ip, repo, tag, digest, result) = template[i % template.len()];
+        let minutes_ago = (i as i64 * total_minutes) / count as i64 + (i as i64 % 5);
+        events.push(AccessEvent {
+            ts: now - Duration::minutes(minutes_ago),
+            operation: op.to_string(),
+            identity: identity.to_string(),
+            caller_kind: kind,
+            ip: ip.to_string(),
+            repository: repo.to_string(),
+            tag: tag.map(str::to_owned),
+            digest: digest.map(str::to_owned),
+            result: result.to_string(),
+        });
+    }
+    if let Some(repo) = repository {
+        events.retain(|e| e.repository.eq_ignore_ascii_case(repo));
+    }
+    if exclude_self {
+        events.retain(|e| {
+            me.upn.as_deref() != Some(e.identity.as_str())
+                && me.oid.as_deref() != Some(e.identity.as_str())
+                && me.ip.as_deref() != Some(e.ip.as_str())
+        });
+    }
+    AccessPage {
+        events,
+        truncated: false,
+        hidden: exclude_self.then(self_identity),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,6 +2032,7 @@ pub fn self_identity() -> crate::azure::key_vault_logs::SelfIdentity {
     crate::azure::key_vault_logs::SelfIdentity {
         upn: Some("robbert@contoso.com".to_string()),
         ip: Some("203.0.113.7".to_string()),
+        oid: Some("9e8d7c6b-5a49-4038-b2c1-d0e9f8a7b6c5".to_string()),
     }
 }
 
