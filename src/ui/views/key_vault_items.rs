@@ -654,7 +654,7 @@ mod tests {
         );
         state.key_vault.items_error.insert(
             key,
-            "403 from Key Vault data plane on 'imec-kv-rnd3-dev-001': identity \
+            "403 from Key Vault data plane on 'contoso-kv-dev-001': identity \
              lacks `list` permission. If the vault uses RBAC, assign the Key \
              Vault Secrets User role."
                 .into(),

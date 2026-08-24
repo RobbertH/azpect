@@ -30,10 +30,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const PRINCIPALS_FOOTER: &str =
-    "j/k move  Enter events  u sessions ⚠  / filter  0/1/7/3/9 window (1h…1y)  t custom  r refresh  y yank  Esc back  ? help";
-const EVENTS_FOOTER: &str =
-    "j/k move (bottom fetches older)  Enter detail  Tab action  e errors  0/1/7/3/9 window  t custom  r refresh  y yank  Esc back  ? help";
+// Footer texts are assembled span-by-span in [`windowed_footer`] so the
+// active window's key lights up inside the `0/1/7/3/9` ladder.
 const HALF_PAGE: usize = 10;
 
 /// Display form of a raw principal: the Graph-resolved display name when the
@@ -234,7 +232,7 @@ fn render_principals(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         ))
         .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
-        render_footer(frame, chunks[1], PRINCIPALS_FOOTER, theme);
+        principals_footer(frame, chunks[1], state, theme);
         return;
     }
 
@@ -346,7 +344,7 @@ fn render_principals(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
         }
     }
 
-    render_footer(frame, chunks[1], PRINCIPALS_FOOTER, theme);
+    principals_footer(frame, chunks[1], state, theme);
 }
 
 fn build_principal_row<'a>(
@@ -479,7 +477,7 @@ fn render_events(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         ))
         .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
-        render_footer(frame, chunks[1], EVENTS_FOOTER, theme);
+        events_footer(frame, chunks[1], state, theme);
         return;
     }
 
@@ -571,7 +569,7 @@ fn render_events(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         }
     }
 
-    render_footer(frame, chunks[1], EVENTS_FOOTER, theme);
+    events_footer(frame, chunks[1], state, theme);
 }
 
 const DETAIL_FOOTER: &str = "j/k scroll  y yank statement  Esc back  ? help";
@@ -827,6 +825,66 @@ fn render_footer(frame: &mut Frame, area: Rect, hint: &'static str, theme: &Them
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(p, area);
+}
+
+/// The shared windowed footer of the principals / events views: `prefix`,
+/// then the compact `0/1/7/3/9` ladder with the active window's key lit (or
+/// `t custom` lit when a user-typed window matches no rung), then `rest`.
+fn windowed_footer(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    prefix: &'static str,
+    ladder_suffix: &'static str,
+) {
+    let active_key = match state.sql.audit.window.label().as_str() {
+        "1h" => Some("0"),
+        "1d" => Some("1"),
+        "7d" => Some("7"),
+        "30d" => Some("3"),
+        "1y" => Some("9"),
+        _ => None,
+    };
+    let mut spans = vec![Span::styled(prefix, super::hint_style(theme, false))];
+    spans.extend(super::key_ladder_spans(
+        theme,
+        &["0", "1", "7", "3", "9"],
+        active_key,
+        ladder_suffix,
+    ));
+    spans.push(Span::styled("  ", super::hint_style(theme, false)));
+    spans.push(Span::styled(
+        "t custom",
+        super::hint_style(theme, active_key.is_none()),
+    ));
+    spans.push(Span::styled(
+        "  r refresh  y yank  Esc back  ? help",
+        super::hint_style(theme, false),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn principals_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    windowed_footer(
+        frame,
+        area,
+        state,
+        theme,
+        "j/k move  Enter events  u sessions ⚠  / filter  ",
+        " window (1h…1y)",
+    );
+}
+
+fn events_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    windowed_footer(
+        frame,
+        area,
+        state,
+        theme,
+        "j/k move (bottom fetches older)  Enter detail  Tab action  e errors  ",
+        " window",
+    );
 }
 
 /// The `3` key's 30-day window — identical to the view's default, so pressing

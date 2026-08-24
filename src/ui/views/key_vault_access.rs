@@ -28,7 +28,6 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  0 1h  1 1d  7 7d  t custom window  m hide me  Tab operation  y yank  r refresh  Esc back  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -125,7 +124,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))
         .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
-        render_footer(frame, chunks[1], theme);
+        render_footer(frame, chunks[1], state, theme);
         return;
     }
 
@@ -209,7 +208,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
 
-    render_footer(frame, chunks[1], theme);
+    render_footer(frame, chunks[1], state, theme);
 }
 
 fn build_row<'a>(event: &'a AccessEvent, theme: &Theme) -> Row<'a> {
@@ -241,12 +240,25 @@ fn build_row<'a>(event: &'a AccessEvent, theme: &Theme) -> Row<'a> {
     ])
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let p = Paragraph::new(Line::from(Span::styled(
-        FOOTER_HINT,
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let current = state.key_vault.access_window.label();
+    let mut segments = vec![("j/k move".to_string(), false)];
+    segments.extend(super::window_rung_segments(
+        &current,
+        super::WINDOW_RUNGS,
+        Some("t custom window"),
+    ));
+    for hint in [
+        "m hide me",
+        "Tab operation",
+        "y yank",
+        "r refresh",
+        "Esc back",
+        "? help",
+    ] {
+        segments.push((hint.to_string(), false));
+    }
+    frame.render_widget(Paragraph::new(super::footer_line(theme, &segments)), area);
 }
 
 /// Drop the fetched page and bump the generation — the query scope changed

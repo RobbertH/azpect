@@ -550,7 +550,7 @@ mod tests {
         let mut state = fixture();
         // Distinct subscriptions so SUB NAME would otherwise show (show_sub_cols).
         let mut a = pool("database-with-a-long-name");
-        a.server = "imecd365replicationv2".into();
+        a.server = "contoso-replication-1".into();
         let mut b = pool("other");
         b.subscription_id = "s2".into();
         state.sql.resources = Some(vec![a, b]);
@@ -573,7 +573,7 @@ mod tests {
     fn plan_columns_drops_sub_before_chopping_name() {
         let state = fixture();
         let mut a = pool("a-fairly-long-database-name");
-        a.server = "imecd365replicationv2".into();
+        a.server = "contoso-replication-1".into();
         let resources = [a];
         let filtered: Vec<&SqlResource> = resources.iter().collect();
         let names: Vec<String> = filtered.iter().map(|r| r.name.clone()).collect();

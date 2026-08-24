@@ -39,24 +39,31 @@ struct SelectableMeta {
     enter_action: Option<Action>,
 }
 
-/// Base footer hint without a resource-kind-specific Enter clue. The drill-in
-/// segment is appended per-render by [`footer_hint_for`] so Function Apps /
-/// Container Apps don't show an Enter that does nothing.
-const FOOTER_HINT_BASE: &str = "0 1h  1 1d  7 7d  l logs  Esc back  r refresh  ? help  q quit";
-
-fn footer_hint_for(kind: crate::azure::resources::ResourceKind) -> String {
+/// Footer segments: the `0`/`1`/`7` chart-window rungs (the active one
+/// highlighted, so the bar doubles as the window readout) followed by the
+/// static keys. `kind` picks the Enter clue; `None` = no resource selected.
+fn footer_segments_for(
+    kind: Option<crate::azure::resources::ResourceKind>,
+    range: crate::azure::metrics::TimeRange,
+) -> Vec<(String, bool)> {
     use crate::azure::resources::ResourceKind;
-    let enter_clue = match kind {
-        ResourceKind::Apim => "Enter apis",
-        ResourceKind::AppGateway => "Enter backends",
-        // Enter on a section pops its details modal (see `render_modal`),
-        // expanding any inline `+N more`. j/k moves between sections, so it's
-        // worth surfacing here too.
-        ResourceKind::FunctionApp | ResourceKind::WebApp | ResourceKind::ContainerApp => {
-            "j/k section  Enter details"
-        }
-    };
-    format!("0 1h  1 1d  7 7d  l logs  {enter_clue}  Esc back  r refresh  ? help  q quit")
+    let mut segments = super::window_rung_segments(range.label(), super::WINDOW_RUNGS, None);
+    segments.push(("l logs".to_string(), false));
+    if let Some(kind) = kind {
+        let enter_clue = match kind {
+            ResourceKind::Apim => "Enter apis",
+            ResourceKind::AppGateway => "Enter backends",
+            // Enter on a section pops its details modal (see `render_modal`),
+            // expanding any inline `+N more`. j/k moves between sections, so
+            // it's worth surfacing here too.
+            ResourceKind::FunctionApp | ResourceKind::WebApp | ResourceKind::ContainerApp => {
+                "j/k section  Enter details"
+            }
+        };
+        segments.push((enter_clue.to_string(), false));
+    }
+    segments.push(("Esc back  r refresh  ? help  q quit".to_string(), false));
+    segments
 }
 
 const ROW_KINDS: [MetricKind; 5] = [
@@ -149,7 +156,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
         frame.render_widget(p, inner);
-        render_footer(frame, chunks[2], theme, FOOTER_HINT_BASE);
+        render_footer(
+            frame,
+            chunks[2],
+            theme,
+            &footer_segments_for(None, state.metrics.range),
+        );
         return;
     };
 
@@ -543,14 +555,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         );
     }
 
-    let mut hint = footer_hint_for(resource.kind);
+    let mut segments = footer_segments_for(Some(resource.kind), state.metrics.range);
     if matches!(
         resource.kind,
         ResourceKind::ContainerApp | ResourceKind::FunctionApp | ResourceKind::WebApp
     ) {
-        hint = format!("e env vars  {hint}");
+        segments.insert(0, ("e env vars".to_string(), false));
     }
-    render_footer(frame, chunks[2], theme, &hint);
+    render_footer(frame, chunks[2], theme, &segments);
 }
 
 /// How many terminal rows `text` will occupy after `Paragraph` wrapping with
@@ -636,12 +648,8 @@ fn display_width(s: &str) -> usize {
     Span::raw(s).width()
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, hint: &str) {
-    let p = Paragraph::new(Line::from(Span::styled(
-        hint,
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
+fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, segments: &[(String, bool)]) {
+    frame.render_widget(Paragraph::new(super::footer_line(theme, segments)), area);
 }
 
 #[allow(clippy::too_many_arguments)]

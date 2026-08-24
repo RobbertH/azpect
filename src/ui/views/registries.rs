@@ -24,8 +24,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str =
-    "j/k move  Enter repos  l access log  0/1/7/t pulls window  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+// Footer text is assembled span-by-span in `render_footer` so the active
+// PULLS-window key lights up inside the `0/1/7/t` ladder.
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -107,7 +107,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ))
         .wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
-        render_footer(frame, chunks[1], theme);
+        render_footer(frame, chunks[1], state, theme);
         return;
     }
 
@@ -233,7 +233,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
     }
 
-    render_footer(frame, chunks[1], theme);
+    render_footer(frame, chunks[1], state, theme);
 }
 
 fn build_row<'a>(
@@ -311,12 +311,28 @@ fn build_row<'a>(
     Row::new(cells)
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let p = Paragraph::new(Line::from(Span::styled(
-        FOOTER_HINT,
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let active_key = match state.registry.pulls_window().label().as_str() {
+        "1h" => "0",
+        "1d" => "1",
+        "7d" => "7",
+        _ => "t",
+    };
+    let mut spans = vec![Span::styled(
+        "j/k move  Enter repos  l access log  ",
+        super::hint_style(theme, false),
+    )];
+    spans.extend(super::key_ladder_spans(
+        theme,
+        &["0", "1", "7", "t"],
+        Some(active_key),
+        " pulls window",
+    ));
+    spans.push(Span::styled(
+        "  / filter  Esc back  r refresh  y yank id  ? help  q quit",
+        super::hint_style(theme, false),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn format_date(dt: Option<&chrono::DateTime<chrono::Utc>>) -> String {

@@ -1,6 +1,88 @@
 //! Per-screen rendering. Each view module exposes a `render(frame, area, state, theme)`
 //! function and may expose a `handle(action, state)` helper for view-local input.
 
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::ui::theme::Theme;
+
+/// The `0`/`1`/`7` window-rung keys shared by every view with a windowed
+/// fetch, paired with the labels their windows report (`TimeRange::label()` /
+/// `AccessWindow::label()`). Views with more rungs (30d, 1y) extend this.
+pub(crate) const WINDOW_RUNGS: &[(&str, &str)] = &[("0", "1h"), ("1", "1d"), ("7", "7d")];
+
+/// Style for one footer hint token: muted like the rest of the bar, or
+/// accent + bold when the token names the *currently active* choice (e.g. the
+/// selected time window) — the shortcut bar then doubles as a state readout.
+pub(crate) fn hint_style(theme: &Theme, active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    }
+}
+
+/// Assemble a footer line from `(text, active)` segments, joined with the
+/// two-space separator the plain string footers use — the rendered text is
+/// identical to the old constants, only the active token's style differs.
+pub(crate) fn footer_line(theme: &Theme, segments: &[(String, bool)]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(segments.len() * 2);
+    for (i, (text, active)) in segments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", hint_style(theme, false)));
+        }
+        spans.push(Span::styled(text.clone(), hint_style(theme, *active)));
+    }
+    Line::from(spans)
+}
+
+/// The `0 1h  1 1d  …` window-shortcut segments with the active rung marked.
+/// `current` is the active window's label; a label matching no rung means a
+/// custom window is in effect, which lights `custom_token` (e.g.
+/// `"t custom window"`) instead, when the view offers one.
+pub(crate) fn window_rung_segments(
+    current: &str,
+    rungs: &[(&str, &str)],
+    custom_token: Option<&str>,
+) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = rungs
+        .iter()
+        .map(|(key, label)| (format!("{key} {label}"), current == *label))
+        .collect();
+    if let Some(token) = custom_token {
+        let on_rung = rungs.iter().any(|(_, label)| current == *label);
+        out.push((token.to_string(), !on_rung));
+    }
+    out
+}
+
+/// Compact `0/1/7/t`-style key ladder: one span per key so the active
+/// window's key can light up inside an otherwise muted token; the `/`
+/// separators and the trailing `suffix` (e.g. `" pulls window"`) stay muted.
+/// `active_key` is `None` when no key matches (a custom window a separate
+/// `t custom` token accounts for).
+pub(crate) fn key_ladder_spans(
+    theme: &Theme,
+    keys: &[&str],
+    active_key: Option<&str>,
+    suffix: &str,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(keys.len() * 2 + 1);
+    for (i, key) in keys.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("/", hint_style(theme, false)));
+        }
+        spans.push(Span::styled(
+            key.to_string(),
+            hint_style(theme, active_key == Some(*key)),
+        ));
+    }
+    spans.push(Span::styled(suffix.to_string(), hint_style(theme, false)));
+    spans
+}
+
 /// Truncate `s` to at most `max` display columns (counted in chars), replacing
 /// the dropped tail's last column with an ellipsis.
 ///
@@ -77,8 +159,83 @@ pub(crate) fn edge_scroll(
 
 #[cfg(test)]
 mod tests {
-    use super::{edge_scroll, name_col_width, truncate_ellipsis};
+    use super::{
+        edge_scroll, footer_line, hint_style, key_ladder_spans, name_col_width, truncate_ellipsis,
+        window_rung_segments, Theme, WINDOW_RUNGS,
+    };
     use std::cell::Cell;
+
+    #[test]
+    fn window_rung_segments_mark_the_active_rung() {
+        let segs = window_rung_segments("1d", WINDOW_RUNGS, Some("t custom window"));
+        assert_eq!(
+            segs,
+            vec![
+                ("0 1h".to_string(), false),
+                ("1 1d".to_string(), true),
+                ("7 7d".to_string(), false),
+                ("t custom window".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn window_rung_segments_fall_back_to_the_custom_token() {
+        // A user-typed window ("6m") matches no rung — the custom token
+        // lights up instead, so the bar always shows *some* active window.
+        let segs = window_rung_segments("6m", WINDOW_RUNGS, Some("t custom window"));
+        assert!(segs
+            .iter()
+            .all(|(text, active)| { (text == "t custom window") == *active }));
+        // Without a custom token (chart views: 0/1/7 only), nothing extra is
+        // appended and an unmatched label simply marks no rung.
+        let segs = window_rung_segments("1h", WINDOW_RUNGS, None);
+        assert_eq!(segs.len(), 3);
+        assert!(segs[0].1 && !segs[1].1 && !segs[2].1);
+    }
+
+    #[test]
+    fn footer_line_joins_segments_and_styles_the_active_one() {
+        let theme = Theme::catppuccin_mocha();
+        let line = footer_line(
+            &theme,
+            &[
+                ("j/k move".to_string(), false),
+                ("1 1d".to_string(), true),
+                ("? help".to_string(), false),
+            ],
+        );
+        // Rendered text is identical to the old plain constant.
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "j/k move  1 1d  ? help");
+        // Exactly one token carries the active style.
+        let active = hint_style(&theme, true);
+        let highlighted: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.style == active)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, vec!["1 1d"]);
+    }
+
+    #[test]
+    fn key_ladder_highlights_only_the_active_key() {
+        let theme = Theme::catppuccin_mocha();
+        let spans = key_ladder_spans(&theme, &["0", "1", "7", "t"], Some("7"), " pulls window");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "0/1/7/t pulls window");
+        let active = hint_style(&theme, true);
+        let highlighted: Vec<_> = spans
+            .iter()
+            .filter(|s| s.style == active)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(highlighted, vec!["7"]);
+        // No match (custom window): everything stays muted.
+        let spans = key_ladder_spans(&theme, &["0", "1", "7"], None, " window");
+        assert!(spans.iter().all(|s| s.style != active));
+    }
 
     #[test]
     fn edge_scroll_stays_put_while_cursor_moves_inside_the_window() {

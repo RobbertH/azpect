@@ -20,8 +20,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str =
-    "0 1h  1 1d  7 7d  l audit log  u sessions ⚠  r refresh  Esc back  o portal  y yank id  ? help  q quit";
+// Footer text is assembled in `render_footer` so the active chart window's
+// `0`/`1`/`7` token lights up.
 
 /// The utilization rows, in render order: `(kind, label)`. Labels match what
 /// [`crate::azure::sql`] stamps on each `MetricSeries`.
@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             Style::default().fg(theme.muted),
         )));
         frame.render_widget(p, chunks[0]);
-        render_footer(frame, chunks[1], theme);
+        render_footer(frame, chunks[1], state, theme);
         return;
     };
 
@@ -122,7 +122,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         metric_chart::render_time_axis(frame, metric_rows[4], range, theme);
     }
 
-    render_footer(frame, chunks[1], theme);
+    render_footer(frame, chunks[1], state, theme);
 }
 
 /// Number of fixed header lines rendered by [`render_header`].
@@ -208,12 +208,15 @@ fn format_bytes(v: f64) -> String {
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
-    let p = Paragraph::new(Line::from(Span::styled(
-        FOOTER_HINT,
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
+fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let mut segments =
+        super::window_rung_segments(state.sql.metrics_range.label(), super::WINDOW_RUNGS, None);
+    segments.push((
+        "l audit log  u sessions ⚠  r refresh  Esc back  o portal  y yank id  ? help  q quit"
+            .to_string(),
+        false,
+    ));
+    frame.render_widget(Paragraph::new(super::footer_line(theme, &segments)), area);
 }
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {

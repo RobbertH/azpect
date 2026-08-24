@@ -19,8 +19,8 @@ use crate::ui::state::View;
 use crate::ui::state::{AppState, LineAnchor};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str =
-    "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  H hide /health  Tab source  s shell  w wrap  r refresh  0 1h  1 1d  7 7d  Esc back  q quit";
+// The main footer is assembled in [`footer_line_for`] so the active window's
+// `0`/`1`/`7` token lights up; only the search-mode variant stays a constant.
 const FOOTER_HINT_SEARCH: &str = "type to search  Enter jump  Esc cancel";
 const HALF_PAGE: usize = 10;
 const H_SCROLL_STEP: usize = 8;
@@ -269,15 +269,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         frame.render_widget(p, sa);
     }
 
-    let footer_text = if state.logs.search_active {
-        FOOTER_HINT_SEARCH
-    } else {
-        FOOTER_HINT
-    };
+    let footer = footer_line_for(state, theme);
 
     let Some(resource) = selected else {
         center_message(frame, body, "no resource selected.", theme.muted);
-        render_footer(frame, footer_chunk, theme, footer_text);
+        render_footer(frame, footer_chunk, &footer);
         return;
     };
 
@@ -287,7 +283,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             resource.kind.short_tag()
         );
         center_message(frame, body, &msg, theme.muted);
-        render_footer(frame, footer_chunk, theme, footer_text);
+        render_footer(frame, footer_chunk, &footer);
         return;
     }
 
@@ -295,7 +291,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     if state.logs.loading && lines.map(|l| l.is_empty()).unwrap_or(true) {
         center_message(frame, body, "Loading logs…", theme.muted);
-        render_footer(frame, footer_chunk, theme, footer_text);
+        render_footer(frame, footer_chunk, &footer);
         return;
     }
 
@@ -303,14 +299,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         if lines.map(|l| l.is_empty()).unwrap_or(true) {
             let msg = friendly_log_error(err);
             render_error_message(frame, body, &msg, theme.degraded);
-            render_footer(frame, footer_chunk, theme, footer_text);
+            render_footer(frame, footer_chunk, &footer);
             return;
         }
     }
 
     if lines.map(|v| v.is_empty()).unwrap_or(true) {
         center_message(frame, body, "no log lines in window.", theme.muted);
-        render_footer(frame, footer_chunk, theme, footer_text);
+        render_footer(frame, footer_chunk, &footer);
         return;
     }
 
@@ -322,20 +318,40 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let src = state.logs.source_filter.as_deref().unwrap_or_default();
         let msg = format!("no cached lines from source '{src}' — press s to cycle.");
         center_message(frame, body, &msg, theme.muted);
-        render_footer(frame, footer_chunk, theme, footer_text);
+        render_footer(frame, footer_chunk, &footer);
         return;
     }
 
     render_table(frame, body, &visible, state, theme);
-    render_footer(frame, footer_chunk, theme, footer_text);
+    render_footer(frame, footer_chunk, &footer);
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme, text: &str) {
-    let p = Paragraph::new(Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(theme.muted),
-    )));
-    frame.render_widget(p, area);
+/// The footer for the current mode: the search-capture hint while `/` has
+/// focus, otherwise the full keymap with the active `0`/`1`/`7` window token
+/// highlighted (the bar doubles as the window readout).
+fn footer_line_for(state: &AppState, theme: &Theme) -> Line<'static> {
+    if state.logs.search_active {
+        return Line::from(Span::styled(
+            FOOTER_HINT_SEARCH,
+            Style::default().fg(theme.muted),
+        ));
+    }
+    let mut segments: Vec<(String, bool)> = vec![(
+        "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  H hide /health  Tab source  s shell  w wrap  r refresh"
+            .to_string(),
+        false,
+    )];
+    segments.extend(super::window_rung_segments(
+        state.logs.range.label(),
+        super::WINDOW_RUNGS,
+        None,
+    ));
+    segments.push(("Esc back  q quit".to_string(), false));
+    super::footer_line(theme, &segments)
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, line: &Line<'static>) {
+    frame.render_widget(Paragraph::new(line.clone()), area);
 }
 
 /// One-row source tab-bar: `source: [all] auth · console …  (Tab)`. The active
