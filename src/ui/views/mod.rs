@@ -168,6 +168,8 @@ mod tests {
 pub mod apim_apis;
 pub mod apim_operations;
 pub mod apim_policy;
+pub mod app_registration_sign_ins;
+pub mod app_registrations;
 pub mod appgw_backends;
 pub mod cosmos_accounts;
 pub mod cosmos_containers;

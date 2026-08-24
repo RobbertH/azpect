@@ -330,6 +330,19 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        // Tenant-scoped — no subscription segment: app registrations exist
+        // outside any subscription and a pinned sub would be misleading.
+        View::AppRegistrations => vec!["app registrations".to_string()],
+
+        View::AppRegistrationSignIns => {
+            let mut s = vec!["app registrations".to_string()];
+            if let Some(app) = state.app_reg.selected_app.as_ref() {
+                s.push(app.display_name.clone());
+            }
+            s.push("sign-ins".to_string());
+            s
+        }
+
         View::ServiceBusNamespaces => {
             vec![subscription_segment(state), "service bus".to_string()]
         }

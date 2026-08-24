@@ -1306,6 +1306,46 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::AppRegistrationsLoaded { scope, result } => {
+                // Stale scope (a re-login may have changed tenants) — see the
+                // `ResourcesLoaded` arm.
+                if scope != state.scope_generation {
+                    continue;
+                }
+                state.app_reg.apps_pending = false;
+                match result {
+                    Ok(list) => {
+                        state.app_reg.apps_error = None;
+                        state.app_reg.activity_note = list.activity_note;
+                        if !list.apps.is_empty() && state.app_reg.apps_cursor >= list.apps.len() {
+                            state.app_reg.apps_cursor = list.apps.len() - 1;
+                        }
+                        state.app_reg.apps = Some(list.apps);
+                    }
+                    Err(e) => {
+                        state.app_reg.apps = None;
+                        state.app_reg.apps_error = Some(e);
+                    }
+                }
+            }
+            AppEvent::AppRegistrationSignInsLoaded { generation, result } => {
+                // Same stale-scope rule as `KeyVaultAccessLoaded`.
+                if generation == state.app_reg.sign_ins_generation {
+                    state.app_reg.sign_ins_pending = false;
+                    match result {
+                        Ok(page) => {
+                            state.app_reg.sign_ins_error = None;
+                            state.app_reg.sign_ins_truncated = page.truncated;
+                            state.app_reg.sign_ins_hidden = page.hidden;
+                            state.app_reg.sign_ins_note = page.note;
+                            state.app_reg.sign_ins = Some(page.events);
+                            state.app_reg.sign_ins_cursor = 0;
+                            state.app_reg.sign_ins_view_top.set(0);
+                        }
+                        Err(e) => state.app_reg.sign_ins_error = Some(e),
+                    }
+                }
+            }
             AppEvent::SqlAuditPrincipalsLoaded { generation, result } => {
                 // Same stale-scope rule as `KeyVaultAccessLoaded`.
                 if generation == state.sql.audit.generation {
@@ -1853,6 +1893,20 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
         state.key_vault.items_cursor = 0;
         return true;
     }
+    if should_forward_to_app_reg_filter(state, key) {
+        state.app_reg.apps_filter.handle_event(&CtEvent::Key(key));
+        state.app_reg.apps_cursor = 0;
+        return true;
+    }
+    // The app-registration sign-ins custom window input (`t`), same shape as
+    // the KV access window input.
+    if should_forward_to_app_reg_window_input(state, key) {
+        state
+            .app_reg
+            .sign_ins_window_input
+            .handle_event(&CtEvent::Key(key));
+        return true;
+    }
     if should_forward_to_sb_namespaces_filter(state, key) {
         state
             .service_bus
@@ -2315,6 +2369,32 @@ fn should_forward_to_access_window_input(
         && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
 }
 
+/// Mirror of `should_forward_to_filter` for the app-registrations list filter.
+fn should_forward_to_app_reg_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::AppRegistrations
+        && state.app_reg.apps_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_access_window_input` for the app-registration
+/// sign-ins custom window input.
+fn should_forward_to_app_reg_window_input(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::AppRegistrationSignIns
+        && state.app_reg.sign_ins_window_input_active
+        && !matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+}
+
 /// Mirror of `should_forward_to_access_window_input` for the ACR access-logs
 /// custom window input.
 fn should_forward_to_registry_access_window_input(
@@ -2602,6 +2682,9 @@ fn decide_action(
         || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
         || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
         || (state.view == View::KeyVaultAccessLogs && state.key_vault.access_window_input_active)
+        || (state.view == View::AppRegistrations && state.app_reg.apps_filter_active)
+        || (state.view == View::AppRegistrationSignIns
+            && state.app_reg.sign_ins_window_input_active)
         || (state.view == View::RegistryAccessLogs && state.registry.access_window_input_active)
         || (state.view == View::Registries && state.registry.pulls_window_input_active)
         || (state.view == View::StorageAccessLogs && state.storage.access_window_input_active)
@@ -2685,6 +2768,10 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::KeyVaults => crate::ui::views::key_vaults::handle(action, state),
         View::KeyVaultItems => crate::ui::views::key_vault_items::handle(action, state),
         View::KeyVaultAccessLogs => crate::ui::views::key_vault_access::handle(action, state),
+        View::AppRegistrations => crate::ui::views::app_registrations::handle(action, state),
+        View::AppRegistrationSignIns => {
+            crate::ui::views::app_registration_sign_ins::handle(action, state)
+        }
         View::ServiceBusNamespaces => {
             crate::ui::views::service_bus_namespaces::handle(action, state)
         }
@@ -3241,8 +3328,31 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected
             .as_ref()
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        // App registrations have no ARM id — the portal blade is keyed on the
+        // *client id* (appId), not the directory object id.
+        View::AppRegistrations => state
+            .app_reg
+            .filtered_apps()
+            .get(state.app_reg.apps_cursor)
+            .map(|a| app_registration_blade_url(&a.app_id)),
+        // The sign-in view's portal counterpart is the app's "Sign-in logs"
+        // side nav; the overview blade is the stable entry point.
+        View::AppRegistrationSignIns => state
+            .app_reg
+            .selected_app
+            .as_ref()
+            .map(|a| app_registration_blade_url(&a.app_id)),
         View::Help => None,
     }
+}
+
+/// Portal deep link to an app registration's overview blade. App
+/// registrations live outside ARM, so the `#@/resource/{id}` form the other
+/// views use doesn't exist for them.
+fn app_registration_blade_url(app_id: &str) -> String {
+    format!(
+        "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/{app_id}"
+    )
 }
 
 /// Assemble the Azure Monitor Logs blade deep link scoped to `scope_id` (an ARM
@@ -3455,6 +3565,16 @@ fn yank_target(state: &AppState) -> Option<String> {
             Some(vault.id.clone())
         }),
         View::KeyVaultAccessLogs => crate::ui::views::key_vault_access::yank_text(state),
+        // The app id is what sign-in logs, config files, and `az` commands
+        // key on — the natural thing to copy off an app-registration row.
+        View::AppRegistrations => state
+            .app_reg
+            .filtered_apps()
+            .get(state.app_reg.apps_cursor)
+            .map(|a| a.app_id.clone()),
+        View::AppRegistrationSignIns => {
+            crate::ui::views::app_registration_sign_ins::yank_text(state)
+        }
         View::ServiceBusNamespaces => state
             .service_bus
             .filtered_namespaces()
@@ -3682,6 +3802,9 @@ fn semantic_parent(view: View) -> Option<View> {
         // The Back arm above consumes Esc first (returns to the pinned
         // source's origin view); this is the static breadcrumb fallback.
         View::LogicAppContent => Some(View::LogicAppRunDetail),
+        View::AppRegistrations => Some(View::Subscriptions),
+        // The view's own Back handler consumes Esc first; static fallback.
+        View::AppRegistrationSignIns => Some(View::AppRegistrations),
     }
 }
 
@@ -3726,6 +3849,7 @@ fn after_action(
                     | View::KeyVaultAccessLogs
                     | View::RegistryAccessLogs
                     | View::StorageAccessLogs
+                    | View::AppRegistrationSignIns
                     | View::SqlAuditPrincipals
                     | View::SqlAuditEvents
             );
@@ -3754,6 +3878,14 @@ fn after_action(
             if state.view == View::StorageAccessLogs
                 && !state.storage.access_window_input_active
                 && state.storage.access_events.is_none() =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ true);
+        }
+        // Same custom-window-commit spawn for the app-registration sign-ins.
+        Action::OpenSelected
+            if state.view == View::AppRegistrationSignIns
+                && !state.app_reg.sign_ins_window_input_active
+                && state.app_reg.sign_ins.is_none() =>
         {
             kick_off_loads_for_view(state, auth, tx, /* force */ true);
         }
@@ -4763,6 +4895,45 @@ fn kick_off_loads_for_view(
                 }
             }
         }
+        View::AppRegistrations => {
+            let cached = state.app_reg.apps.is_some();
+            let in_flight = state.app_reg.apps_pending;
+            if force || (!cached && !in_flight) {
+                // Tenant-scoped: no `scope_sub_ids` guard — the list exists
+                // even before any subscription loads.
+                if force {
+                    state.app_reg.apps = None;
+                    state.app_reg.apps_error = None;
+                    state.app_reg.activity_note = None;
+                }
+                state.app_reg.apps_pending = true;
+                spawn_load_app_registrations(auth.clone(), state.scope_generation, tx.clone());
+            }
+        }
+        View::AppRegistrationSignIns => {
+            if let Some(app) = state.app_reg.selected_app.clone() {
+                let cached = state.app_reg.sign_ins.is_some();
+                let in_flight = state.app_reg.sign_ins_pending;
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.app_reg.sign_ins = None;
+                        state.app_reg.sign_ins_error = None;
+                    }
+                    // Every spawn owns the buffer — see the KV access arm.
+                    state.app_reg.sign_ins_generation =
+                        state.app_reg.sign_ins_generation.wrapping_add(1);
+                    state.app_reg.sign_ins_pending = true;
+                    spawn_load_app_registration_sign_ins(
+                        auth.clone(),
+                        app,
+                        state.app_reg.sign_ins_window.clone(),
+                        state.app_reg.sign_ins_exclude_self,
+                        state.app_reg.sign_ins_generation,
+                        tx.clone(),
+                    );
+                }
+            }
+        }
         View::ServiceBusNamespaces => {
             let cached = state.service_bus.namespaces.is_some();
             let in_flight = state.service_bus.namespaces_pending;
@@ -5008,6 +5179,12 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
             crate::ui::views::cosmos_containers::render(f, view_area, state, theme)
         }
         View::CosmosItem => crate::ui::views::cosmos_item::render(f, view_area, state, theme),
+        View::AppRegistrations => {
+            crate::ui::views::app_registrations::render(f, view_area, state, theme)
+        }
+        View::AppRegistrationSignIns => {
+            crate::ui::views::app_registration_sign_ins::render(f, view_area, state, theme)
+        }
         View::KeyVaults => crate::ui::views::key_vaults::render(f, view_area, state, theme),
         View::KeyVaultItems => {
             crate::ui::views::key_vault_items::render(f, view_area, state, theme)
@@ -7028,6 +7205,53 @@ fn spawn_load_key_vault_access(
         .await
         .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::KeyVaultAccessLoaded { generation, result });
+    });
+}
+
+fn spawn_load_app_registrations(auth: AzureAuth, scope: u64, tx: UnboundedSender<AppEvent>) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::AppRegistrationsLoaded {
+            scope,
+            result: Ok(crate::azure::demo::app_registrations()),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::app_registrations::list_app_registrations(&auth)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::AppRegistrationsLoaded { scope, result });
+    });
+}
+
+/// Fetch one page of sign-in rows for the pinned app registration.
+/// `generation` is the query-scope token the result is validated against on
+/// landing (see `AppEvent::AppRegistrationSignInsLoaded`).
+fn spawn_load_app_registration_sign_ins(
+    auth: AzureAuth,
+    app: crate::azure::app_registrations::AppRegistration,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    exclude_self: bool,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::AppRegistrationSignInsLoaded {
+            generation,
+            result: Ok(crate::azure::demo::app_registration_sign_ins(
+                &app.app_id,
+                &window,
+                exclude_self,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result =
+            crate::azure::app_registration_logs::fetch(&auth, &app.app_id, &window, exclude_self)
+                .await
+                .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::AppRegistrationSignInsLoaded { generation, result });
     });
 }
 

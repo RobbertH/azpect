@@ -357,6 +357,36 @@ const LOGIC_APPS: Section = (
     ],
 );
 
+const APP_REGISTRATIONS: Section = (
+    "App registrations (Entra ID, tenant-wide)",
+    &[
+        ("Enter / l", "sign-in log — how much is this app used?"),
+        (
+            "LAST SIGN-IN",
+            "from the Graph activity report (needs AuditLog.Read.All + P1)",
+        ),
+        ("/", "filter by display name or app id (substring)"),
+        ("y", "yank app (client) id"),
+        ("o", "open registration in Azure Portal (Entra blade)"),
+        ("r", "refresh"),
+    ],
+);
+
+const APP_REG_SIGN_IN_LOG: Section = (
+    "App registration sign-in log (Graph, retention 7d free / 30d P1)",
+    &[
+        (
+            "kinds",
+            "interactive & non-interactive users, service principal (daemons), managed identity",
+        ),
+        ("0 / 1 / 7 / 3", "window 1h / 1d / 7d / 30d"),
+        ("t", "custom window (e.g. 12h, 30d)"),
+        ("m", "hide your own sign-ins (your UPN / sign-in IP)"),
+        ("Tab / S-Tab", "cycle sign-in kind filter"),
+        ("y", "yank row (incl. client app and failure reason)"),
+    ],
+);
+
 /// How to get everywhere else — always shown, since the scoped help hides the
 /// other categories' sections.
 const GO_TO: Section = (
@@ -371,6 +401,10 @@ const GO_TO: Section = (
         (":servicebus / :sb", "service bus"),
         (":sql / :sqldb", "azure sql"),
         (":logicapps / :logic", "logic apps (run & trigger history)"),
+        (
+            ":appregistrations / :apps",
+            "entra app registrations + sign-ins",
+        ),
         (":subscriptions", "subscription picker (also: s)"),
         (":refresh", "force-refresh current view"),
         (":quit / :q", "quit"),
@@ -393,6 +427,7 @@ fn sections_for(origin: Option<View>) -> Vec<Section> {
         Some(Category::ServiceBus) => out.push(SERVICE_BUS),
         Some(Category::Sql) => out.extend([AZURE_SQL, SQL_AUDIT, SQL_SESSIONS, SQL_AUDIT_CODES]),
         Some(Category::LogicApps) => out.push(LOGIC_APPS),
+        Some(Category::AppRegistrations) => out.extend([APP_REGISTRATIONS, APP_REG_SIGN_IN_LOG]),
         // Subscriptions picker / unknown origin: just the shared sections.
         None => {}
     }
@@ -545,6 +580,12 @@ mod tests {
         assert!(s.contains("Key Vaults"));
         assert!(s.contains("Key vault access log"));
         assert!(!s.contains("Application Gateway"));
+
+        // App registration views bring the list + sign-in-log pair.
+        let s = render_from(Some(View::AppRegistrationSignIns));
+        assert!(s.contains("App registrations"));
+        assert!(s.contains("sign-in log"));
+        assert!(!s.contains("Key vault access log"));
     }
 
     #[test]

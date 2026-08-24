@@ -2380,6 +2380,222 @@ pub fn key_vault_access(
 }
 
 // ---------------------------------------------------------------------------
+// App registrations (Entra ID — tenant-scoped, no subscription filter)
+// ---------------------------------------------------------------------------
+
+/// Fabricated Contoso app registrations, spanning the usage spectrum the
+/// feature exists to expose: a busy daemon, an interactive portal, an app
+/// with an expired secret, and one nobody has touched in a year.
+pub fn app_registrations() -> crate::azure::app_registrations::AppRegistrationList {
+    use crate::azure::app_registrations::{AppRegistration, AppRegistrationList};
+    let now = Utc::now();
+    #[allow(clippy::too_many_arguments)]
+    let app = |object_id: &str,
+               app_id: &str,
+               name: &str,
+               created_days: i64,
+               secrets: usize,
+               certs: usize,
+               expiry_days: Option<i64>,
+               expired: usize,
+               last_sign_in_hours: Option<i64>| AppRegistration {
+        object_id: object_id.to_string(),
+        app_id: app_id.to_string(),
+        display_name: name.to_string(),
+        created: Some(now - Duration::days(created_days)),
+        sign_in_audience: Some("AzureADMyOrg".to_string()),
+        secret_count: secrets,
+        cert_count: certs,
+        next_cred_expiry: expiry_days.map(|d| now + Duration::days(d)),
+        expired_creds: expired,
+        last_sign_in: last_sign_in_hours.map(|h| now - Duration::hours(h)),
+    };
+    AppRegistrationList {
+        apps: vec![
+            app(
+                "3d1f7a92-8b4c-4e6d-a2f1-9c5b7e3d8a40",
+                "aa11bb22-cc33-dd44-ee55-ff6677889900",
+                "Contoso Orders API",
+                812,
+                1,
+                1,
+                Some(204),
+                0,
+                Some(2),
+            ),
+            app(
+                "5e2a8b13-9c4d-4f7e-b3a2-0d6c8f4e9b51",
+                "bb22cc33-dd44-ee55-ff66-778899001122",
+                "Contoso Web Portal",
+                640,
+                2,
+                0,
+                Some(41),
+                0,
+                Some(6),
+            ),
+            app(
+                "7f3b9c24-0d5e-4a8f-c4b3-1e7d9a5f0c62",
+                "cc33dd44-ee55-ff66-7788-990011223344",
+                "contoso-payroll-sync (legacy)",
+                1930,
+                1,
+                0,
+                Some(-95),
+                1,
+                Some(24 * 370),
+            ),
+            app(
+                "9a4c0d35-1e6f-4b90-d5c4-2f8e0b6a1d73",
+                "dd44ee55-ff66-7788-9900-112233445566",
+                "Contoso DevOps Agent",
+                420,
+                0,
+                2,
+                Some(310),
+                0,
+                Some(24 * 3),
+            ),
+            app(
+                "0b5d1e46-2f70-4c01-e6d5-3a9f1c7b2e84",
+                "ee55ff66-7788-9900-1122-334455667788",
+                "Contoso Reporting Sandbox",
+                75,
+                1,
+                0,
+                Some(290),
+                0,
+                None,
+            ),
+        ],
+        activity_note: None,
+    }
+}
+
+/// Synthesized sign-in rows for one app registration: user sign-ins
+/// (including "yourself"), silent refreshes, and daemon client-credential
+/// grants, spread over the window. Same filter semantics as the real fetch —
+/// exclude-me narrows the rows before they land.
+pub fn app_registration_sign_ins(
+    _app_id: &str,
+    window: &crate::azure::key_vault_logs::AccessWindow,
+    exclude_self: bool,
+) -> crate::azure::app_registration_logs::SignInPage {
+    use crate::azure::app_registration_logs::{SignInEvent, SignInKind, SignInPage};
+    let me = self_identity();
+    let now = Utc::now();
+
+    // (kind, caller, ip, resource, client_app, result, location)
+    type Template = (
+        SignInKind,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+    let template: &[Template] = &[
+        (
+            SignInKind::ServicePrincipal,
+            "Contoso Orders API",
+            "20.93.10.4",
+            "Azure Key Vault",
+            "",
+            "OK",
+            "",
+        ),
+        (
+            SignInKind::Interactive,
+            "dana@contoso.com",
+            "198.51.100.23",
+            "Contoso Web Portal",
+            "Browser",
+            "OK",
+            "Amsterdam, NL",
+        ),
+        (
+            SignInKind::Interactive,
+            "robbert@contoso.com",
+            "203.0.113.7",
+            "Contoso Web Portal",
+            "Browser",
+            "OK",
+            "Ghent, BE",
+        ),
+        (
+            SignInKind::NonInteractive,
+            "dana@contoso.com",
+            "198.51.100.23",
+            "Microsoft Graph",
+            "Mobile Apps and Desktop clients",
+            "OK",
+            "Amsterdam, NL",
+        ),
+        (
+            SignInKind::ServicePrincipal,
+            "Contoso Orders API",
+            "20.93.10.4",
+            "Microsoft Graph",
+            "",
+            "OK",
+            "",
+        ),
+        (
+            SignInKind::Interactive,
+            "sam@contoso.com",
+            "192.0.2.44",
+            "Contoso Web Portal",
+            "Browser",
+            "50126",
+            "Lisbon, PT",
+        ),
+        (
+            SignInKind::ManagedIdentity,
+            "ca-checkout-api",
+            "",
+            "Azure Service Bus",
+            "",
+            "OK",
+            "",
+        ),
+    ];
+
+    let total_minutes = window.duration().num_minutes().max(60);
+    let count = (total_minutes / 11).clamp(8, 220) as usize;
+    let mut events = Vec::with_capacity(count);
+    for i in 0..count {
+        let (kind, caller, ip, resource, client_app, result, location) =
+            template[i % template.len()];
+        let minutes_ago = (i as i64 * total_minutes) / count as i64 + (i as i64 % 5);
+        events.push(SignInEvent {
+            ts: now - Duration::minutes(minutes_ago),
+            kind,
+            caller: caller.to_string(),
+            ip: ip.to_string(),
+            resource: resource.to_string(),
+            client_app: client_app.to_string(),
+            result: result.to_string(),
+            failure_reason: (result != "OK").then(|| {
+                "Error validating credentials due to invalid username or password.".to_string()
+            }),
+            location: location.to_string(),
+        });
+    }
+    if exclude_self {
+        events.retain(|e| {
+            me.upn.as_deref() != Some(e.caller.as_str()) && me.ip.as_deref() != Some(e.ip.as_str())
+        });
+    }
+    SignInPage {
+        events,
+        truncated: false,
+        hidden: exclude_self.then(self_identity),
+        note: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Service Bus
 // ---------------------------------------------------------------------------
 
@@ -3171,6 +3387,43 @@ mod tests {
         assert!(!sb_namespaces(&[]).is_empty());
         assert!(!key_vault_items(ItemKind::Secret).is_empty());
         assert!(!key_vault_items(ItemKind::Certificate).is_empty());
+        assert!(!app_registrations().apps.is_empty());
+    }
+
+    #[test]
+    fn app_registration_demo_data_covers_the_usage_spectrum() {
+        let list = app_registrations();
+        // The whole point of the view: some apps are hot, some are stale,
+        // some have never signed in at all.
+        assert!(list.apps.iter().any(|a| a.last_sign_in.is_some()));
+        assert!(list.apps.iter().any(|a| a.last_sign_in.is_none()));
+        assert!(list.apps.iter().any(|a| a.expired_creds > 0));
+        assert!(list.activity_note.is_none());
+
+        let window = crate::azure::key_vault_logs::AccessWindow::Day;
+        let page = app_registration_sign_ins("aa11bb22", &window, false);
+        assert!(!page.events.is_empty());
+        // All four flavors of usage must be demoable.
+        use crate::azure::app_registration_logs::SignInKind;
+        for kind in [
+            SignInKind::Interactive,
+            SignInKind::NonInteractive,
+            SignInKind::ServicePrincipal,
+            SignInKind::ManagedIdentity,
+        ] {
+            assert!(
+                page.events.iter().any(|e| e.kind == kind),
+                "missing {kind:?} in demo sign-ins"
+            );
+        }
+        assert!(page.events.iter().any(|e| e.result != "OK"));
+        // Exclude-me hides the demo identity's rows.
+        let hidden = app_registration_sign_ins("aa11bb22", &window, true);
+        assert!(hidden
+            .events
+            .iter()
+            .all(|e| e.caller != "robbert@contoso.com"));
+        assert!(hidden.hidden.is_some());
     }
 
     #[test]
@@ -3219,12 +3472,13 @@ mod tests {
         // like they came from a real environment. Spot-check the renderable
         // surfaces for the fictional company name instead.
         let everything = format!(
-            "{:?}{:?}{:?}{:?}{:?}",
+            "{:?}{:?}{:?}{:?}{:?}{:?}",
             subscriptions(),
             resources(&[]),
             storage_accounts(&[]),
             key_vaults(&[]),
             sb_namespaces(&[]),
+            app_registrations(),
         );
         assert!(everything.to_lowercase().contains("contoso"));
     }

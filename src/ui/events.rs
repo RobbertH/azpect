@@ -413,6 +413,21 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::service_bus::ServiceBusSubscription>, String>,
     },
+    /// Background load completion: the tenant's app registrations (with
+    /// best-effort last-sign-in enrichment). Microsoft Graph, tenant-scoped —
+    /// `scope` still guards against a re-login changing tenants mid-flight.
+    AppRegistrationsLoaded {
+        scope: u64,
+        result: Result<crate::azure::app_registrations::AppRegistrationList, String>,
+    },
+    /// Background load completion: one page of sign-in rows for the pinned
+    /// app registration. `generation` mirrors
+    /// `AppRegistrationCache::sign_ins_generation` — a page fetched under an
+    /// older query scope (window / exclude-me) is discarded on landing.
+    AppRegistrationSignInsLoaded {
+        generation: u64,
+        result: Result<crate::azure::app_registration_logs::SignInPage, String>,
+    },
     /// Completion of a guarded env-var write (add or edit). On `Ok` the cache is
     /// updated optimistically from `applied` and a confirming refetch is kicked
     /// off; on `Err` the message is shown in the still-open editor so the user
@@ -634,6 +649,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
             | View::StorageAccessLogs
+            | View::AppRegistrationSignIns
             | View::SqlAuditEvents => Action::CycleSourceFilter,
             _ => Action::NextPanel,
         },
@@ -642,6 +658,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
             | View::StorageAccessLogs
+            | View::AppRegistrationSignIns
             | View::SqlAuditEvents => Action::CycleSourceFilterBack,
             _ => Action::PrevPanel,
         },
@@ -663,6 +680,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
             | View::StorageAccessLogs
+            | View::AppRegistrationSignIns
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents
             | View::SqlAuditEventDetail
@@ -690,9 +708,10 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         },
         // Access-logs-only keys, scoped so they stay free elsewhere.
         KeyCode::Char('m') => match view {
-            View::KeyVaultAccessLogs | View::RegistryAccessLogs | View::StorageAccessLogs => {
-                Action::ToggleExcludeSelf
-            }
+            View::KeyVaultAccessLogs
+            | View::RegistryAccessLogs
+            | View::StorageAccessLogs
+            | View::AppRegistrationSignIns => Action::ToggleExcludeSelf,
             _ => Action::Noop,
         },
         KeyCode::Char('t') => match view {
@@ -700,6 +719,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             View::KeyVaultAccessLogs
             | View::RegistryAccessLogs
             | View::StorageAccessLogs
+            | View::AppRegistrationSignIns
             | View::Registries
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents => Action::SetCustomWindow,
@@ -730,7 +750,9 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // something (the audit views); inert elsewhere. `9` is the ladder's
         // top rung — `y` itself is taken by yank.
         KeyCode::Char('3') => match view {
-            View::SqlAuditPrincipals | View::SqlAuditEvents => Action::SetWindowMonth,
+            View::SqlAuditPrincipals | View::SqlAuditEvents | View::AppRegistrationSignIns => {
+                Action::SetWindowMonth
+            }
             _ => Action::Noop,
         },
         KeyCode::Char('9') => match view {

@@ -52,6 +52,11 @@ pub enum Category {
     /// Read-only, control-plane except the pre-signed content links — see
     /// [`crate::azure::logic_apps`].
     LogicApps,
+    /// Entra ID app registrations and the per-app sign-in log drill-in.
+    /// **Tenant-scoped**, unlike every other category: no subscription
+    /// filter, no ARM ids — everything comes from Microsoft Graph. See
+    /// [`crate::azure::app_registrations`].
+    AppRegistrations,
 }
 
 impl Category {
@@ -67,6 +72,7 @@ impl Category {
         Category::ServiceBus,
         Category::Sql,
         Category::LogicApps,
+        Category::AppRegistrations,
     ];
 
     /// The top-level list view for this category — the screen the user lands
@@ -82,6 +88,7 @@ impl Category {
             Category::ServiceBus => View::ServiceBusNamespaces,
             Category::Sql => View::SqlResources,
             Category::LogicApps => View::LogicApps,
+            Category::AppRegistrations => View::AppRegistrations,
         }
     }
 
@@ -145,6 +152,9 @@ impl Category {
                     | View::LogicAppTriggerHistory
                     | View::LogicAppRunDetail
                     | View::LogicAppContent,
+            ) | (
+                Category::AppRegistrations,
+                View::AppRegistrations | View::AppRegistrationSignIns,
             )
         )
     }
@@ -198,6 +208,12 @@ impl Category {
             Category::LogicApps => {
                 state.logic_apps = LogicAppsCache::default();
             }
+            Category::AppRegistrations => {
+                // Tenant-scoped, so a subscription switch doesn't strictly
+                // invalidate it — but a re-login can change tenants, and both
+                // paths funnel through here. Cheap to refetch; keep it simple.
+                state.app_reg = AppRegistrationCache::default();
+            }
         }
     }
 
@@ -214,6 +230,7 @@ impl Category {
             Category::ServiceBus => state.service_bus.namespaces_cursor = 0,
             Category::Sql => state.sql.cursor = 0,
             Category::LogicApps => state.logic_apps.workflows_cursor = 0,
+            Category::AppRegistrations => state.app_reg.apps_cursor = 0,
         }
     }
 
@@ -234,6 +251,7 @@ impl Category {
             Category::ServiceBus => &["servicebus", "sb", "bus"],
             Category::Sql => &["sql", "sqldb", "sqlpools"],
             Category::LogicApps => &["logicapps", "logic", "workflows"],
+            Category::AppRegistrations => &["appregistrations", "appreg", "apps", "entra"],
         }
     }
 }
@@ -411,6 +429,17 @@ pub enum View {
     /// Scrollable inputs/outputs message content for the pinned action or
     /// trigger firing, downloaded from its pre-signed content links.
     LogicAppContent,
+    /// Top-level "App registrations" mode entry point — the tenant's Entra ID
+    /// applications with credential health and best-effort last sign-in.
+    /// Opened via the `:appregistrations` / `:apps` palette command (no
+    /// keybind). Microsoft Graph, tenant-scoped — no subscription filter.
+    AppRegistrations,
+    /// Sign-in (audit) log for the pinned app registration: every interactive
+    /// / non-interactive / service-principal / managed-identity sign-in where
+    /// the app was the client — the "how much is this used" trail. Opened
+    /// with `l` (or Enter) from `AppRegistrations`. Graph `auditLogs/signIns`;
+    /// retention is 7d (Free) / 30d (P1+), unlike the Log Analytics views.
+    AppRegistrationSignIns,
     Help,
 }
 
@@ -1693,6 +1722,155 @@ impl KeyVaultCache {
     }
 }
 
+/// State for the App registrations views: the tenant-wide list plus the
+/// per-app sign-in log drill-in. Mirrors [`KeyVaultCache`]'s access-log
+/// discipline (generation guard, window, exclude-me) — but the rows come
+/// from Microsoft Graph, not Log Analytics, and the Tab filter cycles the
+/// sign-in *kind* rather than an operation name.
+#[derive(Clone)]
+pub struct AppRegistrationCache {
+    /// All app registrations in the tenant. Wrapped in `Option` so the view
+    /// can distinguish "never fetched" from "fetched and empty".
+    pub apps: Option<Vec<crate::azure::app_registrations::AppRegistration>>,
+    /// Why the LAST SIGN-IN column is empty, when it is (no license / no
+    /// AuditLog.Read.All). Shown as a header chip so blank ≠ "unused".
+    pub activity_note: Option<String>,
+    pub apps_pending: bool,
+    pub apps_error: Option<String>,
+    pub apps_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub apps_view_top: Cell<usize>,
+    pub apps_filter: Input,
+    pub apps_filter_active: bool,
+    /// Pinned app the user drilled into.
+    pub selected_app: Option<crate::azure::app_registrations::AppRegistration>,
+
+    // -- sign-ins view (`l` / Enter on an app row) --------------------------
+    /// Fetched sign-in rows for the pinned app under the *current* query
+    /// scope (window / exclude-me). Dropped whenever that scope changes.
+    pub sign_ins: Option<Vec<crate::azure::app_registration_logs::SignInEvent>>,
+    pub sign_ins_pending: bool,
+    pub sign_ins_error: Option<String>,
+    pub sign_ins_cursor: usize,
+    /// Persisted table scroll offset — see `StorageCache::accounts_view_top`.
+    pub sign_ins_view_top: Cell<usize>,
+    /// Monotonic fetch-scope token — see `KeyVaultCache::access_generation`.
+    pub sign_ins_generation: u64,
+    /// Query time window; `0`/`1`/`7`/`3` keys plus a free-form custom entry
+    /// (`t`). Defaults to 7d (see [`Default`] impl note below).
+    pub sign_ins_window: crate::azure::key_vault_logs::AccessWindow,
+    /// Client-side "exclude me" (UPN / sign-in IP from the token claims).
+    /// Toggled with `m`.
+    pub sign_ins_exclude_self: bool,
+    /// Who the current page actually hid, for the header chip.
+    pub sign_ins_hidden: Option<crate::azure::key_vault_logs::SelfIdentity>,
+    /// Client-side sign-in *kind* filter (interactive / service principal /
+    /// …), cycled with Tab / Shift+Tab through the kinds in the fetched page.
+    pub sign_ins_kind: Option<crate::azure::app_registration_logs::SignInKind>,
+    /// The page came back at the row cap — older rows in the window exist.
+    pub sign_ins_truncated: bool,
+    /// Degradation note from the fetch (e.g. interactive-only fallback).
+    pub sign_ins_note: Option<String>,
+    /// Where Esc should land (always `AppRegistrations` today; kept for
+    /// symmetry with the other access-log views).
+    pub sign_ins_return_view: Option<View>,
+    /// Free-form custom-window input (`t`), e.g. "30d". While active, raw
+    /// keystrokes flow into it; Enter parses + applies, Esc cancels.
+    pub sign_ins_window_input: Input,
+    pub sign_ins_window_input_active: bool,
+}
+
+impl Default for AppRegistrationCache {
+    fn default() -> Self {
+        AppRegistrationCache {
+            apps: None,
+            activity_note: None,
+            apps_pending: false,
+            apps_error: None,
+            apps_cursor: 0,
+            apps_view_top: Cell::new(0),
+            apps_filter: Input::default(),
+            apps_filter_active: false,
+            selected_app: None,
+            sign_ins: None,
+            sign_ins_pending: false,
+            sign_ins_error: None,
+            sign_ins_cursor: 0,
+            sign_ins_view_top: Cell::new(0),
+            sign_ins_generation: 0,
+            // 7 days, not the KV default of 1 day: "is this app still used?"
+            // needs lookback, and 7d works on unlicensed tenants too (Entra
+            // Free retains exactly that much).
+            sign_ins_window: crate::azure::key_vault_logs::AccessWindow::Week,
+            sign_ins_exclude_self: false,
+            sign_ins_hidden: None,
+            sign_ins_kind: None,
+            sign_ins_truncated: false,
+            sign_ins_note: None,
+            sign_ins_return_view: None,
+            sign_ins_window_input: Input::default(),
+            sign_ins_window_input_active: false,
+        }
+    }
+}
+
+impl AppRegistrationCache {
+    /// Apply `apps_filter` to `apps` as a case-insensitive substring match on
+    /// the display name and app id. Empty filter passes everything through.
+    pub fn filtered_apps(&self) -> Vec<&crate::azure::app_registrations::AppRegistration> {
+        let needle = self.apps_filter.value().to_lowercase();
+        match self.apps.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|a| {
+                    needle.is_empty()
+                        || a.display_name.to_lowercase().contains(&needle)
+                        || a.app_id.to_lowercase().contains(&needle)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Sign-in events with the client-side kind filter applied — what the
+    /// sign-ins table (and its cursor) indexes into.
+    pub fn visible_sign_ins(&self) -> Vec<&crate::azure::app_registration_logs::SignInEvent> {
+        match self.sign_ins.as_ref() {
+            Some(rows) => rows
+                .iter()
+                .filter(|e| self.sign_ins_kind.is_none_or(|k| e.kind == k))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Distinct sign-in kinds in the fetched page, in label order — the Tab
+    /// cycle order for the kind filter.
+    pub fn sign_in_kinds(&self) -> Vec<crate::azure::app_registration_logs::SignInKind> {
+        let mut kinds: Vec<_> = self.sign_ins.iter().flatten().map(|e| e.kind).collect();
+        kinds.sort_by_key(|k| k.label());
+        kinds.dedup();
+        kinds
+    }
+
+    /// Reset the sign-ins view for entering it fresh on the pinned app —
+    /// mirrors [`KeyVaultCache::enter_access_view`].
+    pub fn enter_sign_ins_view(&mut self, return_view: View) {
+        self.sign_ins = None;
+        self.sign_ins_error = None;
+        self.sign_ins_pending = false;
+        self.sign_ins_cursor = 0;
+        self.sign_ins_view_top.set(0);
+        self.sign_ins_kind = None;
+        self.sign_ins_truncated = false;
+        self.sign_ins_note = None;
+        self.sign_ins_return_view = Some(return_view);
+        self.sign_ins_window_input.reset();
+        self.sign_ins_window_input_active = false;
+        self.sign_ins_generation = self.sign_ins_generation.wrapping_add(1);
+    }
+}
+
 /// State for the Service Bus drill-in views. Three levels: namespaces →
 /// entities (queues / topics, toggled with Tab) → subscriptions (topics only).
 /// Same per-key cache discipline as [`CosmosCache`]. Queues and topics share
@@ -2459,6 +2637,7 @@ pub struct AppState {
     pub key_vault: KeyVaultCache,
     pub service_bus: ServiceBusCache,
     pub sql: SqlCache,
+    pub app_reg: AppRegistrationCache,
 
     pub status_message: Option<String>,
     /// When set, the status bar auto-clears at this point in time. The event
@@ -2574,6 +2753,7 @@ impl AppState {
             key_vault: KeyVaultCache::default(),
             service_bus: ServiceBusCache::default(),
             sql: SqlCache::default(),
+            app_reg: AppRegistrationCache::default(),
             status_message: None,
             status_message_until: None,
             should_quit: false,
@@ -2902,6 +3082,14 @@ mod tests {
             Some(Category::ServiceBus)
         );
         // Subscriptions and Help are modal entry points — outside any chain.
+        assert_eq!(
+            Category::of(View::AppRegistrations),
+            Some(Category::AppRegistrations)
+        );
+        assert_eq!(
+            Category::of(View::AppRegistrationSignIns),
+            Some(Category::AppRegistrations)
+        );
         assert_eq!(Category::of(View::Subscriptions), None);
         assert_eq!(Category::of(View::Help), None);
     }
@@ -2978,6 +3166,7 @@ mod tests {
         state.cosmos.accounts = Some(Vec::new());
         state.key_vault.vaults = Some(Vec::new());
         state.service_bus.namespaces = Some(Vec::new());
+        state.app_reg.apps = Some(Vec::new());
 
         Category::Storage.clear_cache(&mut state);
         assert!(state.storage.accounts.is_none(), "storage cleared");
@@ -3032,9 +3221,26 @@ mod tests {
             state.service_bus.namespaces.is_none(),
             "service bus cleared"
         );
+        assert!(
+            state.app_reg.apps.is_some(),
+            "app registrations untouched by service bus clear"
+        );
+
+        Category::AppRegistrations.clear_cache(&mut state);
+        assert!(state.app_reg.apps.is_none(), "app registrations cleared");
 
         Category::Apis.clear_cache(&mut state);
         assert!(state.resources.is_empty(), "apis cleared");
+    }
+
+    #[test]
+    fn app_reg_sign_ins_default_window_is_a_week() {
+        // A deliberate override of the derived default (1 day): usage
+        // questions need lookback and Entra Free retains exactly 7d.
+        assert_eq!(
+            AppRegistrationCache::default().sign_ins_window,
+            crate::azure::key_vault_logs::AccessWindow::Week
+        );
     }
 
     #[test]

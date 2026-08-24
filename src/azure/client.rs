@@ -34,6 +34,11 @@ pub const LOGS_BASE: &str = "https://api.loganalytics.io";
 /// Base URL for Microsoft Graph v1.0.
 pub const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 
+/// Base URL for Microsoft Graph beta. Used only where v1.0 has no equivalent
+/// (service-principal sign-in activity, non-interactive sign-in event types);
+/// callers must treat beta responses as best-effort.
+pub const GRAPH_BASE_BETA: &str = "https://graph.microsoft.com/beta";
+
 /// Backoff schedule for retries on 429/5xx (in addition to any `Retry-After`).
 const BACKOFF_MS: &[u64] = &[250, 500, 1_000, 2_000];
 
@@ -317,6 +322,48 @@ impl GraphClient {
         })
         .await
     }
+
+    /// `GET https://graph.microsoft.com/beta{path}`. Beta-only surface —
+    /// callers must degrade gracefully when the endpoint changes or 4xxes.
+    pub async fn get_beta(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{GRAPH_BASE_BETA}{path}");
+        send_with_retry(&self.http, &self.auth, SCOPE_GRAPH, |http| {
+            http.request(Method::GET, &url)
+        })
+        .await
+    }
+
+    /// `GET {url}` where `url` is a full Graph URL. Used to follow
+    /// `@odata.nextLink` continuations, which arrive as absolute URLs with the
+    /// skip token already encoded. Refuses URLs not rooted at
+    /// `graph.microsoft.com` so a hostile/typo'd link can't carry the Graph
+    /// bearer to another host.
+    pub async fn get_url(&self, url: &str) -> anyhow::Result<serde_json::Value> {
+        if !url.starts_with("https://graph.microsoft.com/") {
+            return Err(anyhow!("refusing non-Graph nextLink: {url}"));
+        }
+        let url_owned = url.to_string();
+        send_with_retry(&self.http, &self.auth, SCOPE_GRAPH, |http| {
+            http.request(Method::GET, &url_owned)
+        })
+        .await
+    }
+}
+
+/// A Graph collection page: the `value` rows plus the `@odata.nextLink`
+/// continuation, if any. Shared by every Graph list caller.
+pub fn graph_page(resp: &serde_json::Value) -> (Vec<serde_json::Value>, Option<String>) {
+    let rows = resp
+        .get("value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let next = resp
+        .get("@odata.nextLink")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    (rows, next)
 }
 
 /// Outcome of a successful blob data-plane request.
