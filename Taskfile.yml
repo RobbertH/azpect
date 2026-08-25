@@ -7,11 +7,17 @@ tasks:
     silent: true
 
   check:
-    desc: fmt + clippy + test (what CI runs)
+    desc: fmt + clippy + test (what CI runs; run update-toolchain first to match CI's clippy)
     cmds:
       - cargo fmt --all -- --check
       - cargo clippy --all-targets --all-features -- -D warnings
       - cargo test --locked
+
+  update-toolchain:
+    desc: Update stable Rust — CI tracks latest stable, so a lagging local clippy can miss new lints
+    cmds:
+      - rustup update stable
+      - rustc --version
 
   build:
     desc: Release build

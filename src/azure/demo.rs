@@ -2323,7 +2323,9 @@ pub fn key_vault_access(
         ),
         (
             "SecretGet",
-            "1e2f9a34-demo-appid",
+            // A real GUID shape so the demo exercises Graph resolution
+            // (resolves to "sp-orders-deploy" via `principal_display_name`).
+            "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c",
             CallerKind::App,
             "20.93.10.4",
             Some("secrets/payment-api-signing-key"),

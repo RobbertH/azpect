@@ -28,6 +28,8 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
+use super::sql_audit::display_principal;
+
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -163,7 +165,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         Some(_) => {
             let caller_w = visible
                 .iter()
-                .map(|e| e.caller.chars().count() as u16)
+                .map(|e| caller_display(state, e).chars().count() as u16)
                 .max()
                 .unwrap_or(0)
                 .clamp(6, 40);
@@ -195,7 +197,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     .add_modifier(Modifier::BOLD),
             );
             let cursor = state.key_vault.access_cursor.min(visible.len() - 1);
-            let body_rows: Vec<Row> = visible.iter().map(|e| build_row(e, theme)).collect();
+            let body_rows: Vec<Row> = visible.iter().map(|e| build_row(state, e, theme)).collect();
             let table = Table::new(body_rows, widths)
                 .header(header_row)
                 .row_highlight_style(theme.selection())
@@ -211,7 +213,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     render_footer(frame, chunks[1], state, theme);
 }
 
-fn build_row<'a>(event: &'a AccessEvent, theme: &Theme) -> Row<'a> {
+/// Caller column text: App callers carry only the appId GUID claim, shown as
+/// its Graph-resolved display name once `state.principals` has it (same
+/// best-effort flow as the storage access log).
+fn caller_display(state: &AppState, event: &AccessEvent) -> String {
+    match event.caller_kind {
+        CallerKind::App => display_principal(state, &event.caller),
+        _ => event.caller.clone(),
+    }
+}
+
+fn build_row<'a>(state: &AppState, event: &'a AccessEvent, theme: &Theme) -> Row<'a> {
     let when = event
         .ts
         .with_timezone(&chrono::Local)
@@ -233,7 +245,7 @@ fn build_row<'a>(event: &'a AccessEvent, theme: &Theme) -> Row<'a> {
     Row::new(vec![
         Cell::from(when).style(Style::default().fg(theme.muted)),
         Cell::from(event.operation.as_str()).style(Style::default().fg(theme.fg)),
-        Cell::from(event.caller.as_str()).style(caller_style),
+        Cell::from(caller_display(state, event)).style(caller_style),
         Cell::from(event.ip.as_str()).style(Style::default().fg(theme.muted)),
         Cell::from(event.object.as_deref().unwrap_or("—")).style(Style::default().fg(theme.fg)),
         Cell::from(event.result.as_str()).style(result_style),
@@ -309,7 +321,8 @@ fn cycle_operation(state: &mut AppState, direction: i32) {
 }
 
 /// Yank text for the selected row: everything the table shows plus the full
-/// managed-identity ARM id (the table only shows its trailing name).
+/// managed-identity ARM id (the table only shows its trailing name) and the
+/// raw appId when the table shows a resolved name instead.
 pub fn yank_text(state: &AppState) -> Option<String> {
     let visible = state.key_vault.visible_access_events();
     let event = visible.get(
@@ -321,9 +334,12 @@ pub fn yank_text(state: &AppState) -> Option<String> {
     let mut parts = vec![
         event.ts.to_rfc3339(),
         event.operation.clone(),
-        event.caller.clone(),
+        caller_display(state, event),
         event.ip.clone(),
     ];
+    if event.caller_kind == CallerKind::App {
+        parts.push(event.caller.clone());
+    }
     if let Some(obj) = &event.object {
         parts.push(obj.clone());
     }
@@ -562,6 +578,32 @@ mod tests {
         state.view = View::KeyVaultAccessLogs;
         assert!(handle(Action::Back, &mut state));
         assert_eq!(state.view, View::KeyVaults);
+    }
+
+    #[test]
+    fn app_caller_renders_resolved_name_and_yank_keeps_raw_appid() {
+        let mut state = fixture();
+        let appid = "f3c9a2e1-0d4b-4f7e-9a1c-2b5d8e7f6a3c";
+        state.key_vault.access_events.as_mut().unwrap()[0] = AccessEvent {
+            caller: appid.to_string(),
+            caller_kind: CallerKind::App,
+            ..event(1, "SecretGet", "", "20.93.10.4", Some("secrets/a"))
+        };
+        // Unresolved: the raw appId shows.
+        let events = state.key_vault.visible_access_events();
+        assert_eq!(caller_display(&state, events[0]), appid);
+        // Resolved: the directory name replaces it…
+        state
+            .principals
+            .by_id
+            .insert(appid.to_string(), "sp-orders-deploy".to_string());
+        let events = state.key_vault.visible_access_events();
+        assert_eq!(caller_display(&state, events[0]), "sp-orders-deploy");
+        // …and yank carries both the name and the raw appId.
+        state.key_vault.access_cursor = 0;
+        let y = yank_text(&state).unwrap();
+        assert!(y.contains("sp-orders-deploy"));
+        assert!(y.contains(appid));
     }
 
     #[test]

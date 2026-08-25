@@ -1295,6 +1295,26 @@ async fn event_loop(
                     state.key_vault.access_pending = false;
                     match result {
                         Ok(page) => {
+                            // App callers carry only the appId GUID claim —
+                            // resolve to directory names via Graph, best-effort,
+                            // cached and deduped like the storage access log.
+                            for e in &page.events {
+                                if e.caller_kind != crate::azure::key_vault_logs::CallerKind::App {
+                                    continue;
+                                }
+                                let Some(id) = crate::azure::sql_audit::graph_candidate(&e.caller)
+                                else {
+                                    continue;
+                                };
+                                if state.principals.by_id.contains_key(&id)
+                                    || state.principals.failed.contains(&id)
+                                    || state.principals.pending.contains(&id)
+                                {
+                                    continue;
+                                }
+                                state.principals.pending.insert(id.clone());
+                                spawn_resolve_principal(auth.clone(), id, tx.clone());
+                            }
                             state.key_vault.access_error = None;
                             state.key_vault.access_truncated = page.truncated;
                             state.key_vault.access_hidden = page.hidden;
