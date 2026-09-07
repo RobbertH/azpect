@@ -3,22 +3,31 @@
 //! row pins the container name and opens [`View::StorageBlobs`]. `/` filters
 //! the visible list with a case-insensitive substring match on the container
 //! name (the same client-side filter shape used by the storage-accounts view).
+//!
+//! The BLOBS / SIZE columns are on demand: Azure has no per-container
+//! capacity figure, so `c` (selected) / `C` (all listed) walk the container's
+//! entire blob listing in the background — the portal's "Calculate size".
+//! Cells count up live per page, then settle; the spawn lives in `app.rs`
+//! because it needs auth, so this module's `handle` deliberately lets the
+//! two actions fall through to the global handler.
 
 #![allow(dead_code, unused_variables)]
 
 use chrono::{DateTime, Utc};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
 use crate::ui::events::Action;
-use crate::ui::state::{AppState, View};
+use crate::ui::state::{AppState, StorageCache, View};
 use crate::ui::theme::Theme;
+use crate::ui::views::detail::format_count;
+use crate::ui::views::storage_account_overview::human_bytes;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter blobs  l access log  / filter  Esc back  r refresh  y yank name  ? help  q quit";
+    "j/k move  Enter blobs  l access log  c size  C size all  / filter  Esc back  r refresh  y yank name  ? help  q quit";
 const HALF_PAGE: usize = 10;
 
 // Header strip is rendered by `Table::header(...)` and shares the same
@@ -146,9 +155,19 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 Constraint::Length(10), // PUBLIC ("None" / "Blob" / "Container")
                 Constraint::Length(18), // LAST MODIFIED ("YYYY-MM-DD HH:MM")
                 Constraint::Length(10), // IMMUTABLE
+                Constraint::Length(8),  // BLOBS ("4.4M", "1.3k…")
+                Constraint::Length(12), // SIZE ("123.45 GiB…")
             ];
 
-            let header_row = Row::new(vec!["NAME", "PUBLIC", "LAST MODIFIED", "IMMUTABLE"]).style(
+            let header_row = Row::new(vec![
+                Cell::from("NAME"),
+                Cell::from("PUBLIC"),
+                Cell::from("LAST MODIFIED"),
+                Cell::from("IMMUTABLE"),
+                Cell::from(Line::from("BLOBS").alignment(Alignment::Right)),
+                Cell::from(Line::from("SIZE").alignment(Alignment::Right)),
+            ])
+            .style(
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
@@ -163,12 +182,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     };
                     let (public_label, public_color) =
                         public_access_label_and_color(c.public_access.as_deref(), theme);
+                    let (blobs_cell, size_cell) = size_cells(state, &account.name, &c.name, theme);
                     Row::new(vec![
                         Cell::from(c.name.as_str()).style(Style::default().fg(theme.fg)),
                         Cell::from(public_label).style(Style::default().fg(public_color)),
                         Cell::from(format_last_modified(c.last_modified.as_ref()))
                             .style(Style::default().fg(theme.muted)),
                         Cell::from(immut).style(Style::default().fg(theme.accent)),
+                        blobs_cell,
+                        size_cell,
                     ])
                 })
                 .collect();
@@ -198,6 +220,53 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
         Style::default().fg(theme.muted),
     )));
     frame.render_widget(p, area);
+}
+
+/// BLOBS / SIZE cells for one container row. Four states, per row, because
+/// each walk is its own background task:
+///   - never measured → `—` (press `c`),
+///   - walking → running total with a `…` suffix, counting up per page,
+///   - done → final count / GiB figure,
+///   - failed → `error` in the SIZE cell (the message itself is too long for
+///     a table; the status line carried it when the walk was started).
+fn size_cells<'a>(
+    state: &AppState,
+    account_name: &str,
+    container: &str,
+    theme: &Theme,
+) -> (Cell<'a>, Cell<'a>) {
+    let key = StorageCache::blobs_key(account_name, container);
+    let right = |text: String, color: ratatui::style::Color| {
+        Cell::from(Line::from(text).alignment(Alignment::Right)).style(Style::default().fg(color))
+    };
+    if state.storage.container_sizes_error.contains_key(&key) {
+        return (
+            right("—".into(), theme.muted),
+            right("error".into(), theme.critical),
+        );
+    }
+    let pending = state.storage.container_sizes_pending.contains(&key);
+    match state.storage.container_sizes.get(&key) {
+        Some(size) if pending => (
+            right(
+                format!("{}…", format_count(size.blob_count as f64)),
+                theme.muted,
+            ),
+            right(format!("{}…", human_bytes(size.total_bytes)), theme.muted),
+        ),
+        Some(size) => (
+            right(format_count(size.blob_count as f64), theme.fg),
+            right(human_bytes(size.total_bytes), theme.fg),
+        ),
+        None if pending => (
+            right("…".into(), theme.muted),
+            right("…".into(), theme.muted),
+        ),
+        None => (
+            right("—".into(), theme.muted),
+            right("—".into(), theme.muted),
+        ),
+    }
 }
 
 /// `YYYY-MM-DD HH:MM` UTC. Compact enough to keep the column narrow while
@@ -353,7 +422,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::azure::storage::{BlobContainer, StorageAccount};
+    use crate::azure::storage::{BlobContainer, ContainerSize, StorageAccount};
     use crate::config::Config;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -410,6 +479,76 @@ mod tests {
             "header should include LAST MODIFIED"
         );
         assert!(buf.contains("IMMUTABLE"), "header should include IMMUTABLE");
+    }
+
+    #[test]
+    fn renders_size_column_with_per_row_states() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.storage.containers.insert(
+            "/subs/x/rg/y/sa/acct1".into(),
+            vec![
+                container("done"),
+                container("walking"),
+                container("failed"),
+                container("untouched"),
+            ],
+        );
+        let key = |c: &str| StorageCache::blobs_key("acct1", c);
+        state.storage.container_sizes.insert(
+            key("done"),
+            ContainerSize {
+                blob_count: 4_360_000,
+                total_bytes: 5_012_316_192_768,
+            },
+        );
+        state.storage.container_sizes.insert(
+            key("walking"),
+            ContainerSize {
+                blob_count: 1_300,
+                total_bytes: 2 * 1024 * 1024 * 1024,
+            },
+        );
+        state.storage.container_sizes_pending.insert(key("walking"));
+        state
+            .storage
+            .container_sizes_error
+            .insert(key("failed"), "403 forbidden".into());
+
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("BLOBS"), "header should include BLOBS");
+        assert!(buf.contains("SIZE"), "header should include SIZE");
+        assert!(buf.contains("4.4M"), "finished count, got: {buf}");
+        assert!(buf.contains("4.56 TiB"), "finished size, got: {buf}");
+        assert!(
+            buf.contains("1.3k…"),
+            "in-flight count with ellipsis, got: {buf}"
+        );
+        assert!(
+            buf.contains("2.00 GiB…"),
+            "in-flight size with ellipsis, got: {buf}"
+        );
+        assert!(buf.contains("error"), "failed walk shows error, got: {buf}");
+        assert!(
+            !buf.contains("403 forbidden"),
+            "raw error text stays out of the table, got: {buf}"
+        );
+    }
+
+    #[test]
+    fn size_actions_fall_through_to_global_handler() {
+        // The spawn needs auth/tx, which live in app.rs — the view must not
+        // swallow the actions or the walk would never start.
+        let mut state = fixture();
+        state
+            .storage
+            .containers
+            .insert("/subs/x/rg/y/sa/acct1".into(), vec![container("logs")]);
+        assert!(!handle(Action::CalculateSize, &mut state));
+        assert!(!handle(Action::CalculateAllSizes, &mut state));
     }
 
     #[test]

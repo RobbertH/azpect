@@ -99,6 +99,26 @@ pub struct BlobMetadata {
     pub content_md5: Option<String>,
 }
 
+/// Result of walking one container's full blob listing — what the portal's
+/// "Calculate size" button on a container computes. Counts *current* base
+/// blobs only: snapshots and previous versions are not enumerated, so on an
+/// account with versioning or soft delete this can undercount what billing
+/// charges for. On an ADLS Gen2 (HNS) account directory placeholders show up
+/// as zero-byte blobs and inflate `blob_count` slightly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContainerSize {
+    pub blob_count: u64,
+    pub total_bytes: u64,
+}
+
+impl ContainerSize {
+    /// Fold one listing page into the running total.
+    pub fn absorb(&mut self, page: &[Blob]) {
+        self.blob_count += page.len() as u64;
+        self.total_bytes += page.iter().map(|b| b.size).sum::<u64>();
+    }
+}
+
 /// Per-account aggregated stats sourced from Azure Monitor metrics. Mirrors
 /// the "Storage browser → account overview" panel in the Azure portal: a
 /// snapshot of container / blob / file / queue / table counts and totals.
@@ -172,6 +192,11 @@ const STORAGE_CONTROL_API_VERSION: &str = "2023-05-01";
 /// Soft cap for `maxresults` on the list-blobs XML call — matches the warn
 /// threshold in `resources.rs`.
 const LIST_BLOBS_MAX_RESULTS: u32 = 1000;
+
+/// Page size for the container size walk ([`measure_container`]). The
+/// service maximum — the walk wants as few round trips as possible and never
+/// keeps a page around after summing it.
+const SIZE_WALK_PAGE_SIZE: u32 = 5000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -515,6 +540,52 @@ pub async fn list_blobs(
     parse_list_blobs_xml(&body)
 }
 
+/// Walk the *entire* blob listing of `container` page by page and sum it —
+/// the on-demand "calculate size" behind the containers view's SIZE column.
+///
+/// Azure exposes no per-container capacity figure (the `BlobCapacity` metric
+/// only splits by tier / blob type), so enumeration is the only exact route.
+/// A container with millions of blobs means thousands of pages; `on_page`
+/// fires with the running total after each one so the UI can show progress
+/// rather than a spinner, and the caller is expected to run this off the UI
+/// thread. Pages are summed and dropped — memory stays flat however large the
+/// container is.
+pub async fn measure_container(
+    auth: &AzureAuth,
+    account_name: &str,
+    container: &str,
+    mut on_page: impl FnMut(ContainerSize),
+) -> anyhow::Result<ContainerSize> {
+    let client = StorageClient::new(auth.clone())?;
+    let base = format!(
+        "https://{account_name}.blob.core.windows.net/{container}?restype=container&comp=list&maxresults={SIZE_WALK_PAGE_SIZE}"
+    );
+    let mut total = ContainerSize::default();
+    let mut marker: Option<String> = None;
+    loop {
+        let mut url = base.clone();
+        if let Some(m) = marker.as_deref() {
+            url.push_str("&marker=");
+            url.push_str(&urlencode(m));
+        }
+        let body = client
+            .get_xml(&url)
+            .await
+            .map_err(|e| classify_data_plane_error(account_name, e))?;
+        if body.trim().is_empty() {
+            break;
+        }
+        let (page, next) = parse_list_blobs_page(&body)?;
+        total.absorb(&page);
+        on_page(total);
+        match next {
+            Some(m) => marker = Some(m),
+            None => break,
+        }
+    }
+    Ok(total)
+}
+
 /// Fetch metadata + a bounded preview body for one blob.
 ///
 /// Decision rule for the body:
@@ -750,19 +821,28 @@ struct XmlBlobProperties {
     blob_type: Option<String>,
 }
 
-/// Public for tests.
+/// Single-page listing for the blobs view: parses the page and warns (but
+/// does not follow) when the server signals more. Public for tests.
 pub(crate) fn parse_list_blobs_xml(body: &str) -> anyhow::Result<Vec<Blob>> {
-    let parsed: XmlEnumerationResults =
-        quick_xml::de::from_str(body).map_err(|e| anyhow!("parse list-blobs xml: {e}"))?;
-
-    if !parsed.next_marker.is_empty() {
+    let (blobs, next_marker) = parse_list_blobs_page(body)?;
+    if next_marker.is_some() {
         tracing::warn!(
             "list-blobs returned NextMarker (more than {} blobs); pagination not implemented in v1",
             LIST_BLOBS_MAX_RESULTS
         );
     }
+    Ok(blobs)
+}
 
-    Ok(parsed
+/// Parse one list-blobs page into its rows plus the continuation marker
+/// (`None` when this was the last page). The size walk follows the marker;
+/// the blobs view ignores it.
+pub(crate) fn parse_list_blobs_page(body: &str) -> anyhow::Result<(Vec<Blob>, Option<String>)> {
+    let parsed: XmlEnumerationResults =
+        quick_xml::de::from_str(body).map_err(|e| anyhow!("parse list-blobs xml: {e}"))?;
+
+    let next_marker = Some(parsed.next_marker).filter(|m| !m.is_empty());
+    let blobs = parsed
         .blobs
         .blob
         .into_iter()
@@ -780,7 +860,8 @@ pub(crate) fn parse_list_blobs_xml(body: &str) -> anyhow::Result<Vec<Blob>> {
                 blob_type: b.properties.blob_type.unwrap_or_default(),
             }
         })
-        .collect())
+        .collect();
+    Ok((blobs, next_marker))
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1239,58 @@ mod tests {
 </EnumerationResults>"#;
         let blobs = parse_list_blobs_xml(xml).expect("parse should succeed");
         assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn list_blobs_page_surfaces_continuation_marker() {
+        // A non-empty NextMarker means the walk must fetch again; the
+        // single-page parser drops it (with a warning), the page parser
+        // hands it back for the size walk to follow.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="big">
+  <Blobs>
+    <Blob><Name>a</Name><Properties><Content-Length>10</Content-Length></Properties></Blob>
+    <Blob><Name>b</Name><Properties><Content-Length>32</Content-Length></Properties></Blob>
+  </Blobs>
+  <NextMarker>2!72!MDAwMDE0IWE=</NextMarker>
+</EnumerationResults>"#;
+        let (blobs, marker) = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(marker.as_deref(), Some("2!72!MDAwMDE0IWE="));
+        assert_eq!(parse_list_blobs_xml(xml).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn list_blobs_page_last_page_has_no_marker() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="small">
+  <Blobs><Blob><Name>a</Name><Properties><Content-Length>10</Content-Length></Properties></Blob></Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let (_, marker) = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert_eq!(marker, None);
+    }
+
+    #[test]
+    fn container_size_absorb_accumulates_across_pages() {
+        let blob = |size: u64| Blob {
+            name: "x".into(),
+            size,
+            content_type: None,
+            last_modified: None,
+            blob_type: "BlockBlob".into(),
+        };
+        let mut total = ContainerSize::default();
+        total.absorb(&[blob(10), blob(20)]);
+        total.absorb(&[]);
+        total.absorb(&[blob(5)]);
+        assert_eq!(
+            total,
+            ContainerSize {
+                blob_count: 3,
+                total_bytes: 35
+            }
+        );
     }
 
     #[test]

@@ -153,6 +153,10 @@ const STORAGE: Section = (
             "/",
             "filter accounts / containers / blobs by name (substring)",
         ),
+        (
+            "c / C",
+            "calculate container size — selected / all listed (walks every blob)",
+        ),
         ("j/k", "scroll preview (detail)"),
         ("g/G", "preview top / bottom"),
         ("y", "yank account / container / blob / body"),

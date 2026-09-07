@@ -193,6 +193,20 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::storage::Blob>, String>,
     },
+    /// Background progress: the container size walk finished another listing
+    /// page. `partial` is the running total so far; the row shows it with a
+    /// "…" suffix until [`Self::StorageContainerSizeLoaded`] lands. `key` —
+    /// see [`Self::StorageBlobsLoaded`].
+    StorageContainerSizeProgress {
+        key: String,
+        partial: crate::azure::storage::ContainerSize,
+    },
+    /// Background load completion: the container size walk finished (or
+    /// failed). `key` — see [`Self::StorageBlobsLoaded`].
+    StorageContainerSizeLoaded {
+        key: String,
+        result: Result<crate::azure::storage::ContainerSize, String>,
+    },
     /// Background load completion: metadata + body preview for one blob. `key`
     /// is the `(account, container, blob)` triple flattened by
     /// [`crate::ui::state::StorageCache::blob_preview_key`].
@@ -512,6 +526,14 @@ pub enum Action {
     /// Open the top-level Storage mode (blob accounts list). Bound to `S`
     /// (capital so it doesn't collide with `s` = switch subscription).
     OpenStorage,
+    /// Storage containers view: walk the selected container's full blob
+    /// listing and show its blob count / total size in the SIZE column —
+    /// the portal's "Calculate size". Bound to `c` there only; Azure has no
+    /// per-container capacity metric, so this is an on-demand enumeration.
+    CalculateSize,
+    /// Storage containers view: [`Self::CalculateSize`] for every container
+    /// currently listed (after the filter). Bound to `C` there only.
+    CalculateAllSizes,
     /// Open the top-level Container Registries mode. Bound to `R` (capital so
     /// it doesn't collide with `r` = refresh).
     OpenRegistries,
@@ -724,6 +746,17 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents => Action::SetCustomWindow,
             View::LogicAppRuns => Action::OpenTriggerHistory,
+            _ => Action::Noop,
+        },
+        // `c` / `C` measure a container (all listed containers) on the storage
+        // containers list. Scoped so the key stays free elsewhere; Ctrl+C was
+        // already resolved to Back above.
+        KeyCode::Char('c') => match view {
+            View::StorageContainers => Action::CalculateSize,
+            _ => Action::Noop,
+        },
+        KeyCode::Char('C') => match view {
+            View::StorageContainers => Action::CalculateAllSizes,
             _ => Action::Noop,
         },
         KeyCode::Char('x') => Action::DecodeSecret,
@@ -1020,6 +1053,28 @@ mod tests {
     fn help_view_dismisses_on_any_key() {
         assert_eq!(key_to_action(key('x'), View::Help, false), Action::Back);
         assert_eq!(key_to_action(key('?'), View::Help, false), Action::Back);
+    }
+
+    #[test]
+    fn c_measures_containers_only_in_storage_containers_view() {
+        assert_eq!(
+            key_to_action(key('c'), View::StorageContainers, false),
+            Action::CalculateSize
+        );
+        assert_eq!(
+            key_to_action(key_shift('C'), View::StorageContainers, false),
+            Action::CalculateAllSizes
+        );
+        // Free everywhere else — and Ctrl+C keeps its interrupt meaning.
+        assert_eq!(key_to_action(key('c'), View::List, false), Action::Noop);
+        assert_eq!(
+            key_to_action(key('c'), View::StorageBlobs, false),
+            Action::Noop
+        );
+        assert_eq!(
+            key_to_action(key_ctrl('c'), View::StorageContainers, false),
+            Action::Back
+        );
     }
 
     #[test]

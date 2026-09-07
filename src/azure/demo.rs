@@ -44,7 +44,7 @@ use crate::azure::service_bus::{
 };
 use crate::azure::sql::{SqlKind, SqlResource};
 use crate::azure::storage::{
-    Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, StorageAccount,
+    Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, ContainerSize, StorageAccount,
     StorageAccountStats,
 };
 use crate::azure::subscriptions::Subscription;
@@ -953,6 +953,14 @@ pub fn storage_blobs(_account_name: &str, container: &str) -> Vec<Blob> {
             ),
         ],
     }
+}
+
+/// Size walk result for the demo containers — just the sum of the canned
+/// blob list, so the SIZE column agrees with what Enter shows.
+pub fn storage_container_size(account_name: &str, container: &str) -> ContainerSize {
+    let mut size = ContainerSize::default();
+    size.absorb(&storage_blobs(account_name, container));
+    size
 }
 
 pub fn blob_preview(_account_name: &str, _container: &str, blob: &str) -> BlobPreview {

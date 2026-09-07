@@ -899,6 +899,16 @@ pub struct StorageCache {
     /// Pinned container name the user drilled into.
     pub selected_container: Option<String>,
 
+    /// On-demand container sizes (`c` / `C` in the containers view), keyed
+    /// by [`Self::blobs_key`]. While a key is in `container_sizes_pending`
+    /// the entry here is the running partial total (updated per listing
+    /// page); once it leaves the set the entry is final. Kept across `r`
+    /// refreshes of the container list — the walk is expensive and the
+    /// number doesn't go stale the way a listing does.
+    pub container_sizes: HashMap<String, crate::azure::storage::ContainerSize>,
+    pub container_sizes_pending: HashSet<String>,
+    pub container_sizes_error: HashMap<String, String>,
+
     /// Keyed by `"{account_name}/{container_name}"`. The full set of blobs in
     /// the container is fetched once and filtered client-side, so the prefix
     /// is no longer a cache-key dimension.

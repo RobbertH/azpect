@@ -859,6 +859,27 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::StorageContainerSizeProgress { key, partial } => {
+                // Only meaningful while the walk is still running; a late
+                // page after completion (can't happen in order, but cheap
+                // to guard) must not overwrite the final figure.
+                if state.storage.container_sizes_pending.contains(&key) {
+                    state.storage.container_sizes.insert(key, partial);
+                }
+            }
+            AppEvent::StorageContainerSizeLoaded { key, result } => {
+                state.storage.container_sizes_pending.remove(&key);
+                match result {
+                    Ok(size) => {
+                        state.storage.container_sizes_error.remove(&key);
+                        state.storage.container_sizes.insert(key, size);
+                    }
+                    Err(e) => {
+                        state.storage.container_sizes.remove(&key);
+                        state.storage.container_sizes_error.insert(key, e);
+                    }
+                }
+            }
             AppEvent::StorageOverviewLoaded { account_id, result } => {
                 state.storage.overview_pending.remove(&account_id);
                 match result {
@@ -2840,6 +2861,19 @@ fn global_handle(
     // reference can be followed and decoded in place. Routed here for auth/tx.
     if matches!(action, Action::OpenSelected) && state.view == View::EnvVars {
         open_key_vault_ref_from_env_var(state, auth, tx);
+        return;
+    }
+    // `c` / `C` on the storage containers list: walk one / every listed
+    // container's blob listing for its size. Routed here for auth/tx.
+    if matches!(action, Action::CalculateSize | Action::CalculateAllSizes)
+        && state.view == View::StorageContainers
+    {
+        start_storage_container_size_walk(
+            state,
+            auth,
+            tx,
+            matches!(action, Action::CalculateAllSizes),
+        );
         return;
     }
     // `s` on a Container App: queue an `az containerapp exec` shell (drained by
@@ -6577,6 +6611,94 @@ fn spawn_load_storage_containers(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::StorageContainersLoaded { account_id, result });
+    });
+}
+
+/// `c` / `C` in the containers view: start the size walk for the selected
+/// container (or every container passing the filter). A container already
+/// being walked is left alone; a finished one is re-measured from scratch so
+/// `c` doubles as "recalculate".
+fn start_storage_container_size_walk(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    all: bool,
+) {
+    let Some(account) = state.storage.selected_account.clone() else {
+        return;
+    };
+    let listed = state.storage.filtered_containers(&account.id);
+    let targets: Vec<String> = if all {
+        listed.iter().map(|c| c.name.clone()).collect()
+    } else {
+        listed
+            .get(state.storage.containers_cursor)
+            .map(|c| vec![c.name.clone()])
+            .unwrap_or_default()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let mut started = 0usize;
+    for container in targets {
+        let key = crate::ui::state::StorageCache::blobs_key(&account.name, &container);
+        if state.storage.container_sizes_pending.contains(&key) {
+            continue;
+        }
+        state.storage.container_sizes_error.remove(&key);
+        // Seed a zero partial so the row flips to "…" immediately instead of
+        // keeping a stale figure until the first page reports in.
+        state
+            .storage
+            .container_sizes
+            .insert(key.clone(), crate::azure::storage::ContainerSize::default());
+        state.storage.container_sizes_pending.insert(key);
+        spawn_measure_storage_container(auth.clone(), account.name.clone(), container, tx.clone());
+        started += 1;
+    }
+    match started {
+        0 => state.set_status("size calculation already running"),
+        1 => state.set_status(
+            "calculating container size — walks every blob, large containers take a while",
+        ),
+        n => state.set_status(format!(
+            "calculating size of {n} containers — walks every blob, large containers take a while"
+        )),
+    }
+}
+
+/// Walk one container's full blob listing off the UI thread, streaming the
+/// running total back after every page so the SIZE cell counts up live.
+fn spawn_measure_storage_container(
+    auth: AzureAuth,
+    account_name: String,
+    container: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageContainerSizeLoaded {
+            key,
+            result: Ok(crate::azure::demo::storage_container_size(
+                &account_name,
+                &container,
+            )),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let progress_key = key.clone();
+        let result =
+            crate::azure::storage::measure_container(&auth, &account_name, &container, |partial| {
+                let _ = progress_tx.send(AppEvent::StorageContainerSizeProgress {
+                    key: progress_key.clone(),
+                    partial,
+                });
+            })
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageContainerSizeLoaded { key, result });
     });
 }
 
