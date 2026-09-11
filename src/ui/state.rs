@@ -487,6 +487,19 @@ pub struct PendingExec {
     pub container: Option<String>,
 }
 
+/// The `s` container picker: shown when the replica a shell would land in runs
+/// more than one container, so the user chooses which one `az containerapp
+/// exec` targets instead of always getting the first. `target` is the fully
+/// resolved [`PendingExec`] minus its `container`, which Enter fills in from
+/// `containers[cursor]` before queueing it. Owned by the event loop like the
+/// quit / auth overlays: while open it consumes every key.
+#[derive(Clone, Debug, Default)]
+pub struct ExecContainerPicker {
+    pub target: PendingExec,
+    pub containers: Vec<crate::azure::container_app_replicas::ReplicaContainer>,
+    pub cursor: usize,
+}
+
 /// Per-resource cached metrics. The detail view reads these; the loader writes
 /// them when a `MetricsReady` event arrives.
 #[derive(Clone, Default)]
@@ -2700,6 +2713,9 @@ pub struct AppState {
     /// suspends the TUI, and runs `az containerapp exec` for an interactive
     /// shell. Mirrors [`Self::pending_login`].
     pub pending_exec: Option<PendingExec>,
+    /// `Some` while the `s` container picker is open (multi-container replica).
+    /// Enter moves the choice into [`Self::pending_exec`]; Esc drops it.
+    pub exec_picker: Option<ExecContainerPicker>,
     /// When `true`, the input-reader thread parks instead of reading the
     /// terminal. Set while a shell-out child (`az containerapp exec`) owns the
     /// terminal so azpect neither competes for the user's keystrokes nor gets
@@ -2779,6 +2795,7 @@ impl AppState {
             auth_last_error: None,
             pending_login: None,
             pending_exec: None,
+            exec_picker: None,
             input_suspended: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config,
         }

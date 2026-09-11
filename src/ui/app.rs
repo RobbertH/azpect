@@ -42,7 +42,7 @@ use crate::config::Config;
 use crate::ui::events::{is_chord_starter, key_to_action, resolve_chord, Action, AppEvent};
 use crate::ui::state::{
     AppState, AppliedEnvEdit, AuthMenuFocus, AuthPrompt, EnvVarEditMode, EnvVarEditPhase,
-    EnvVarField, PendingExec, PendingLogin, View,
+    EnvVarField, ExecContainerPicker, PendingExec, PendingLogin, View,
 };
 use crate::ui::theme::Theme;
 
@@ -321,6 +321,13 @@ async fn event_loop(
                         }
                         _ => continue,
                     }
+                }
+                // `s` container picker (multi-container replica). Owns every
+                // key while open: j/k move, Enter queues the shell, Esc cancels.
+                // Sits below quit/auth so those overlays win.
+                if state.exec_picker.is_some() {
+                    handle_exec_picker_key(state, key);
+                    continue;
                 }
                 // Guarded env-var editor. While open it owns every key (typing,
                 // field switching, and the final confirm) and routes the write
@@ -3067,34 +3074,57 @@ fn request_container_shell(state: &mut AppState) {
         return;
     };
 
-    // Target the active revision and the busiest-relevant replica/container so
-    // the shell lands where the instances block points. Any unresolved field is
-    // left `None` and `az` fills in its own default (latest revision, a replica,
+    // Target the active revision and the busiest-relevant replica so the shell
+    // lands where the instances block points. Any unresolved field is left
+    // `None` and `az` fills in its own default (latest revision, a replica,
     // first container).
     let revision = state
         .revision_meta
         .by_resource
         .get(&id)
         .map(|m| m.name.clone());
-    let (replica, container) = pick_exec_target(state, &id);
-    state.pending_exec = Some(PendingExec {
+    let (replica, containers) = pick_exec_target(state, &id);
+    let target = PendingExec {
         name,
         resource_group,
         subscription,
         revision,
         replica,
-        container,
+        container: None,
+    };
+
+    // A replica runs every container in the revision template (sidecars,
+    // helpers, …), and `az` would silently pick the first. With a single
+    // container there's nothing to choose — shell straight in. With several,
+    // open the picker and let Enter queue the shell instead.
+    if containers.len() > 1 {
+        state.exec_picker = Some(ExecContainerPicker {
+            target,
+            containers,
+            cursor: 0,
+        });
+        return;
+    }
+    state.pending_exec = Some(PendingExec {
+        container: containers.into_iter().next().map(|c| c.name),
+        ..target
     });
 }
 
-/// Choose which replica + container `az containerapp exec` should target: the
-/// newest *running* replica (falling back to the newest overall), and its first
-/// container — the app container in template order, matching the "first/primary
-/// container" choice. Returns `(None, None)` when no replica is cached, letting
-/// `az` pick its own defaults.
-fn pick_exec_target(state: &AppState, id: &str) -> (Option<String>, Option<String>) {
+/// Choose which replica `az containerapp exec` should target — the newest
+/// *running* replica (falling back to the newest overall) — and return its
+/// containers in template order, so the caller can shell into the first or
+/// offer a choice. Returns `(None, [])` when no replica is cached, letting `az`
+/// pick its own defaults.
+fn pick_exec_target(
+    state: &AppState,
+    id: &str,
+) -> (
+    Option<String>,
+    Vec<crate::azure::container_app_replicas::ReplicaContainer>,
+) {
     let Some(replicas) = state.replica_instances.by_resource.get(id) else {
-        return (None, None);
+        return (None, Vec::new());
     };
     let mut sorted: Vec<&crate::azure::container_app_replicas::ReplicaInstance> =
         replicas.iter().collect();
@@ -3109,15 +3139,66 @@ fn pick_exec_target(state: &AppState, id: &str) -> (Option<String>, Option<Strin
         .or_else(|| sorted.first())
         .copied();
     let Some(rep) = chosen else {
-        return (None, None);
+        return (None, Vec::new());
     };
     let replica = Some(rep.name.clone()).filter(|n| !n.is_empty());
-    let container = rep
+    let containers = rep
         .containers
-        .first()
-        .map(|c| c.name.clone())
-        .filter(|n| !n.is_empty());
-    (replica, container)
+        .iter()
+        .filter(|c| !c.name.is_empty())
+        .cloned()
+        .collect();
+    (replica, containers)
+}
+
+/// Key handler for the `s` container picker. Every key is consumed while the
+/// picker is open. Enter (or a `1`–`9` row shortcut) queues the shell into the
+/// chosen container; Esc / `q` abandons it without shelling anywhere.
+fn handle_exec_picker_key(state: &mut AppState, key: crossterm::event::KeyEvent) {
+    let Some(picker) = state.exec_picker.as_mut() else {
+        return;
+    };
+    let last = picker.containers.len().saturating_sub(1);
+    let chosen = match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.exec_picker = None;
+            return;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            picker.cursor = (picker.cursor + 1).min(last);
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            picker.cursor = picker.cursor.saturating_sub(1);
+            return;
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            picker.cursor = 0;
+            return;
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            picker.cursor = last;
+            return;
+        }
+        KeyCode::Enter => picker.cursor,
+        // Row-number shortcut, matching the numbers shown in the list.
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx > last {
+                return;
+            }
+            idx
+        }
+        _ => return,
+    };
+    let Some(picker) = state.exec_picker.take() else {
+        return;
+    };
+    let container = picker.containers.get(chosen).map(|c| c.name.clone());
+    state.pending_exec = Some(PendingExec {
+        container,
+        ..picker.target
+    });
 }
 
 /// Compute the contextual yank target for the current view, copy it to the
@@ -5273,6 +5354,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
     if state.view == View::KeyVaultItems && state.key_vault.secret_modal.is_some() {
         crate::ui::views::key_vault_items::render_modal(f, view_area, state, theme);
     }
+    // `s` container picker — same stacking as the Detail modal.
+    if state.exec_picker.is_some() {
+        render_exec_picker(f, view_area, state, theme);
+    }
     // Quit-confirmation modal overlays the underlying view AND must beat the
     // command bar to the screen — render it before the command bar. (In
     // practice both flags can't be true at once given input gating.)
@@ -5416,6 +5501,124 @@ fn render_quit_modal(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme
     ];
     let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
     f.render_widget(paragraph, inner);
+}
+
+/// Render the `s` container picker: one row per container in the target
+/// replica (template order), with its live state so the user can tell a
+/// crash-looping sidecar from the app container before shelling in. Caller
+/// invokes only when `state.exec_picker` is `Some`.
+fn render_exec_picker(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &Theme) {
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(picker) = state.exec_picker.as_ref() else {
+        return;
+    };
+
+    let name_w = picker
+        .containers
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(9);
+    let states: Vec<String> = picker
+        .containers
+        .iter()
+        .map(exec_picker_container_state)
+        .collect();
+    let state_w = states.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+
+    let hint = "j/k or 1-9 \u{2014} choose · Enter \u{2014} shell · Esc \u{2014} cancel";
+    // " NN. " prefix + name + two-space gutter + state + trailing pad.
+    let content_w = (5 + name_w + 2 + state_w + 1).max(hint.chars().count() + 1);
+    let width = u16::try_from(content_w + 2).unwrap_or(u16::MAX);
+    // rows + blank + hint, plus the two border lines.
+    let height = u16::try_from(picker.containers.len() + 2 + 2).unwrap_or(u16::MAX);
+    let popup = centered_fixed_rect(width, height, area);
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, popup);
+
+    let title = match picker.target.replica.as_deref() {
+        // The replica name repeats the app/revision prefix; only the trailing
+        // pod hash distinguishes it, so show that.
+        Some(r) => {
+            let short = r.rsplit('-').next().unwrap_or(r);
+            format!(" shell into {} · replica …{short} ", picker.target.name)
+        }
+        None => format!(" shell into {} ", picker.target.name),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg).fg(theme.fg));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let focused = Style::default()
+        .bg(theme.accent)
+        .fg(theme.bg)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = picker
+        .containers
+        .iter()
+        .zip(states.iter())
+        .enumerate()
+        .map(|(i, (c, st))| {
+            if i == picker.cursor {
+                let row = format!(" {:>2}. {:<name_w$}  {:<state_w$} ", i + 1, c.name, st);
+                Line::from(Span::styled(row, focused))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!(" {:>2}. ", i + 1), Style::default().fg(theme.muted)),
+                    Span::styled(
+                        format!("{:<name_w$}", c.name),
+                        Style::default().fg(theme.fg),
+                    ),
+                    Span::styled(format!("  {st}"), Style::default().fg(theme.muted)),
+                ])
+            }
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(" {hint}"),
+        Style::default().fg(theme.muted),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One-line live status for a picker row: `Running · ready · 3 restarts`.
+/// Falls back to `—` when Azure reported no running state.
+fn exec_picker_container_state(
+    c: &crate::azure::container_app_replicas::ReplicaContainer,
+) -> String {
+    let mut s = c
+        .running_state
+        .clone()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "\u{2014}".to_string());
+    match c.ready {
+        Some(true) => s.push_str(" · ready"),
+        Some(false) => s.push_str(" · not ready"),
+        None => {}
+    }
+    if c.restart_count > 0 {
+        s.push_str(&format!(" · {} restarts", c.restart_count));
+    }
+    s
 }
 
 /// Open the auth prompt, optionally with a pre-populated error message that
@@ -8133,16 +8336,165 @@ mod tests {
 
         request_container_shell(&mut state);
 
-        let exec = state.pending_exec.expect("shell queued");
-        assert_eq!(exec.name, "ca-app");
-        assert_eq!(exec.resource_group, "rg-x");
-        assert_eq!(exec.subscription.as_deref(), Some("sub-1"));
-        assert_eq!(exec.revision.as_deref(), Some("ca-app--0000004"));
-        // Newest replica, first (primary) container.
-        assert_eq!(exec.replica.as_deref(), Some("ca-app--0000004-new"));
-        assert_eq!(exec.container.as_deref(), Some("maintenance"));
+        // The newest running replica has two containers, so nothing is queued
+        // yet: the picker opens on it, cursor on the first (primary) container.
+        assert!(state.pending_exec.is_none());
+        let picker = state.exec_picker.as_ref().expect("picker open");
+        assert_eq!(picker.cursor, 0);
+        assert_eq!(picker.target.name, "ca-app");
+        assert_eq!(picker.target.resource_group, "rg-x");
+        assert_eq!(picker.target.subscription.as_deref(), Some("sub-1"));
+        assert_eq!(picker.target.revision.as_deref(), Some("ca-app--0000004"));
+        assert_eq!(
+            picker.target.replica.as_deref(),
+            Some("ca-app--0000004-new")
+        );
+        let names: Vec<&str> = picker.containers.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["maintenance", "http-auth"]);
         // View is unchanged — the shell runs from the event loop.
         assert_eq!(state.view, View::Detail);
+
+        // j moves down (clamped at the end), Enter queues the highlighted one.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_exec_picker_key(&mut state, k('j'));
+        handle_exec_picker_key(&mut state, k('j'));
+        assert_eq!(state.exec_picker.as_ref().unwrap().cursor, 1);
+        handle_exec_picker_key(&mut state, enter);
+        assert!(state.exec_picker.is_none());
+        let exec = state.pending_exec.take().expect("shell queued");
+        assert_eq!(exec.replica.as_deref(), Some("ca-app--0000004-new"));
+        assert_eq!(exec.container.as_deref(), Some("http-auth"));
+        assert_eq!(exec.revision.as_deref(), Some("ca-app--0000004"));
+
+        // Esc abandons the picker without queueing anything.
+        request_container_shell(&mut state);
+        assert!(state.exec_picker.is_some());
+        handle_exec_picker_key(&mut state, esc);
+        assert!(state.exec_picker.is_none());
+        assert!(state.pending_exec.is_none());
+
+        // Row-number shortcut picks directly; out-of-range digits are ignored.
+        request_container_shell(&mut state);
+        handle_exec_picker_key(&mut state, k('5'));
+        assert!(state.exec_picker.is_some());
+        handle_exec_picker_key(&mut state, k('1'));
+        assert!(state.exec_picker.is_none());
+        let exec = state.pending_exec.take().expect("shell queued");
+        assert_eq!(exec.container.as_deref(), Some("maintenance"));
+    }
+
+    #[test]
+    fn exec_picker_renders_rows_with_state_and_hint() {
+        use crate::azure::container_app_replicas::ReplicaContainer;
+        use ratatui::backend::TestBackend;
+
+        let mut state = fresh_state();
+        state.exec_picker = Some(ExecContainerPicker {
+            target: PendingExec {
+                name: "ca-app".into(),
+                resource_group: "rg".into(),
+                subscription: None,
+                revision: Some("ca-app--0000004".into()),
+                replica: Some("ca-app--0000004-b77496699-r58pz".into()),
+                container: None,
+            },
+            containers: vec![
+                ReplicaContainer {
+                    name: "ca-app".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                    running_state_details: None,
+                },
+                ReplicaContainer {
+                    name: "otel-collector".into(),
+                    ready: Some(false),
+                    started: Some(true),
+                    restart_count: 3,
+                    running_state: Some("Waiting".into()),
+                    running_state_details: None,
+                },
+            ],
+            cursor: 1,
+        });
+
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(100, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_exec_picker(f, f.area(), &state, &theme))
+            .unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("shell into ca-app · replica …r58pz"));
+        assert!(buf.contains("1. ca-app"));
+        assert!(buf.contains("Running · ready"));
+        assert!(buf.contains("2. otel-collector"));
+        assert!(buf.contains("Waiting · not ready · 3 restarts"));
+        assert!(buf.contains("Enter — shell"));
+    }
+
+    #[test]
+    fn s_on_single_container_replica_shells_straight_in() {
+        use crate::azure::container_app_replicas::{ReplicaContainer, ReplicaInstance};
+        use crate::azure::container_app_revisions::ActiveRevisionMeta;
+        use crate::azure::resources::{Resource, ResourceKind};
+        use chrono::Utc;
+
+        let mut state = fresh_state();
+        state.resources = vec![Resource {
+            id: "/r/ca".into(),
+            name: "ca-app".into(),
+            kind: ResourceKind::ContainerApp,
+            location: "we".into(),
+            resource_group: "rg-x".into(),
+            subscription_id: "sub-1".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }];
+        state.list_cursor = 0;
+        state.view = View::Logs;
+        state.revision_meta.by_resource.insert(
+            "/r/ca".into(),
+            ActiveRevisionMeta {
+                name: "ca-app--0000004".into(),
+                ..Default::default()
+            },
+        );
+        state.replica_instances.by_resource.insert(
+            "/r/ca".into(),
+            vec![ReplicaInstance {
+                name: "ca-app--0000004-abc".into(),
+                created_at: Some(Utc::now()),
+                running_state: Some("Running".into()),
+                containers: vec![ReplicaContainer {
+                    name: "app".into(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".into()),
+                    running_state_details: None,
+                }],
+            }],
+        );
+
+        request_container_shell(&mut state);
+
+        // One container: no picker, the shell is queued directly.
+        assert!(state.exec_picker.is_none());
+        let exec = state.pending_exec.take().expect("shell queued");
+        assert_eq!(exec.replica.as_deref(), Some("ca-app--0000004-abc"));
+        assert_eq!(exec.container.as_deref(), Some("app"));
+
+        // No replica data at all: still shells straight in with `az` defaults.
+        state.replica_instances.by_resource.clear();
+        request_container_shell(&mut state);
+        assert!(state.exec_picker.is_none());
+        let exec = state.pending_exec.take().expect("shell queued");
+        assert!(exec.replica.is_none());
+        assert!(exec.container.is_none());
     }
 
     #[test]

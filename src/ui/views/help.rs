@@ -57,7 +57,10 @@ const DETAIL_LOGS: Section = (
             "hide health-probe requests (/health, /healthz, /warmup, …) (logs)",
         ),
         ("Tab / S-Tab", "cycle source filter (logs)"),
-        ("s", "shell into container (Container App detail/logs)"),
+        (
+            "s",
+            "shell into container (Container App detail/logs; picks one when several)",
+        ),
         ("x", "reveal / hide env var values (env vars)"),
         ("Ctrl-e / Ctrl-n", "edit / add env var (env vars)"),
         ("/", "search (logs)"),

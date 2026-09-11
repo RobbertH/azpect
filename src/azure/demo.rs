@@ -609,18 +609,33 @@ pub fn replicas(resource_id: &str, revision_name: &str) -> Vec<ReplicaInstance> 
     }
 
     (0..3)
-        .map(|i| ReplicaInstance {
-            name: format!("{revision_name}-{}", ["fl9k2", "x7m4p", "q2v8c"][i]),
-            created_at: Some(now - Duration::hours(14 + 3 * i as i64)),
-            running_state: Some("Running".to_string()),
-            containers: vec![ReplicaContainer {
+        .map(|i| {
+            let mut containers = vec![ReplicaContainer {
                 name: app.to_string(),
                 ready: Some(true),
                 started: Some(true),
                 restart_count: if i == 2 { 1 } else { 0 },
                 running_state: Some("Running".to_string()),
                 running_state_details: None,
-            }],
+            }];
+            // `ca-checkout-api` runs an OpenTelemetry sidecar next to the app
+            // container, so the `s` shell picker has something to choose from.
+            if app == "ca-checkout-api" {
+                containers.push(ReplicaContainer {
+                    name: "otel-collector".to_string(),
+                    ready: Some(true),
+                    started: Some(true),
+                    restart_count: 0,
+                    running_state: Some("Running".to_string()),
+                    running_state_details: None,
+                });
+            }
+            ReplicaInstance {
+                name: format!("{revision_name}-{}", ["fl9k2", "x7m4p", "q2v8c"][i]),
+                created_at: Some(now - Duration::hours(14 + 3 * i as i64)),
+                running_state: Some("Running".to_string()),
+                containers,
+            }
         })
         .collect()
 }
