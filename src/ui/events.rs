@@ -316,12 +316,22 @@ pub enum AppEvent {
         key: String,
         result: Result<Vec<crate::azure::cosmos::CosmosContainer>, String>,
     },
-    /// Background load completion: first-20 item preview for one container.
+    /// Background load completion: one page of items for one container.
     /// `key` is the `(account_id, db, coll)` triple flattened by
-    /// [`crate::ui::state::CosmosCache::items_key`].
+    /// [`crate::ui::state::CosmosCache::items_key`]. `from_token` is the
+    /// continuation the page was fetched with: `None` = first page (replaces
+    /// the cache), `Some` = next page (appended only if the cache still ends
+    /// at that token, so a page racing a refresh is dropped).
     CosmosItemsLoaded {
         key: String,
+        from_token: Option<String>,
         result: Result<crate::azure::cosmos::CosmosItemPreview, String>,
+    },
+    /// Background load completion: document count for one container, keyed
+    /// like [`Self::CosmosItemsLoaded`].
+    CosmosItemCountLoaded {
+        key: String,
+        result: Result<u64, String>,
     },
     /// Background load completion: flat list of Azure SQL elastic pools +
     /// single databases for the current subscription scope. Resource Graph

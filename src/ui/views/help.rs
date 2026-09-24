@@ -224,7 +224,14 @@ const COSMOS: Section = (
     "Cosmos DB (SQL/Core API)",
     &[
         ("Enter", "drill: accounts > databases > containers > items"),
-        ("/", "filter accounts / databases / containers by name"),
+        (
+            "/",
+            "filter accounts / databases / containers by name, items by json",
+        ),
+        (
+            "j/G",
+            "items: scrolling near the bottom loads the next page",
+        ),
         ("y", "yank account id / db name / container / item json"),
         ("o", "open account's Data Explorer in Azure Portal"),
         (

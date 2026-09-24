@@ -2145,7 +2145,41 @@ pub fn cosmos_containers(account: &CosmosAccount, db: &str) -> Vec<CosmosContain
     }
 }
 
-pub fn cosmos_items(coll: &str) -> CosmosItemPreview {
+/// Demo `request-traces` holds this many generated rows so paging has
+/// something to page through.
+const DEMO_TRACE_COUNT: u64 = 65;
+const DEMO_PAGE_SIZE: usize = 20;
+
+pub fn cosmos_item_count(coll: &str) -> u64 {
+    match coll {
+        "request-traces" => DEMO_TRACE_COUNT,
+        "orders" => 2,
+        _ => 1,
+    }
+}
+
+/// One demo page. The continuation token is simply the next row offset.
+pub fn cosmos_items(coll: &str, continuation: Option<&str>) -> CosmosItemPreview {
+    if coll == "request-traces" {
+        let start: u64 = continuation.and_then(|c| c.parse().ok()).unwrap_or(0);
+        let end = (start + DEMO_PAGE_SIZE as u64).min(DEMO_TRACE_COUNT);
+        let items = (start..end)
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("trace_{i:04}"),
+                    "day": "2026-06-09",
+                    "route": if i % 3 == 0 { "/api/orders" } else { "/api/customers" },
+                    "status": if i % 7 == 0 { 500 } else { 200 },
+                    "durationMs": 12 + (i * 37) % 400,
+                })
+            })
+            .collect();
+        return CosmosItemPreview {
+            items,
+            request_charge: Some(3.1),
+            continuation: (end < DEMO_TRACE_COUNT).then(|| end.to_string()),
+        };
+    }
     let items = match coll {
         "orders" => vec![
             serde_json::json!({
@@ -2180,7 +2214,7 @@ pub fn cosmos_items(coll: &str) -> CosmosItemPreview {
     CosmosItemPreview {
         items,
         request_charge: Some(2.83),
-        partial: false,
+        continuation: None,
     }
 }
 

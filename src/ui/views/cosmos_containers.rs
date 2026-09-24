@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::storage_account_overview::human_count;
 use super::{name_col_width, truncate_ellipsis};
 use crate::azure::cosmos::CosmosContainer;
 use crate::ui::events::Action;
@@ -140,16 +141,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             // the non-NAME widths below (the Min(20) counts its minimum); keep
             // the two in sync. Floor at 9 so the "CONTAINER" header always
             // reads.
-            let fixed_w: u16 = 20 + 7 + 10 + 8;
+            let fixed_w: u16 = 9 + 20 + 7 + 10 + 8;
             let longest = filtered
                 .iter()
                 .map(|c| c.name.chars().count() as u16)
                 .max()
                 .unwrap_or(0);
-            let name_w = name_col_width(body_area.width, fixed_w, 5, longest).max(9);
+            let name_w = name_col_width(body_area.width, fixed_w, 6, longest).max(9);
 
             let widths = [
                 Constraint::Length(name_w), // NAME
+                Constraint::Length(9),      // ITEMS
                 Constraint::Min(20),        // PARTITION KEY
                 Constraint::Length(7),      // PK KIND
                 Constraint::Length(10),     // INDEXING
@@ -157,6 +159,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             ];
             let header_row = Row::new(vec![
                 "CONTAINER",
+                "ITEMS",
                 "PARTITION KEY",
                 "PK KIND",
                 "INDEXING",
@@ -182,6 +185,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     Row::new(vec![
                         Cell::from(truncate_ellipsis(&c.name, name_w as usize))
                             .style(Style::default().fg(theme.fg)),
+                        item_count_cell(state, &c.name, theme),
                         Cell::from(pk).style(Style::default().fg(theme.muted)),
                         Cell::from(pk_kind).style(Style::default().fg(theme.muted)),
                         Cell::from(indexing).style(Style::default().fg(theme.muted)),
@@ -207,6 +211,26 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     render_footer(frame, chunks[1], theme);
+}
+
+/// ITEMS cell: the document count once loaded, `…` while in flight, `—` when
+/// it couldn't be read (typically no data-plane role on the account).
+fn item_count_cell<'a>(state: &AppState, coll: &str, theme: &Theme) -> Cell<'a> {
+    let (Some(acc), Some(db)) = (
+        state.cosmos.selected_account.as_ref(),
+        state.cosmos.selected_database.as_deref(),
+    ) else {
+        return Cell::from("");
+    };
+    let key = CosmosCache::items_key(&acc.id, db, coll);
+    match state.cosmos.item_counts.get(&key) {
+        Some(Ok(n)) => Cell::from(human_count(*n)).style(Style::default().fg(theme.fg)),
+        Some(Err(_)) => Cell::from("—").style(Style::default().fg(theme.muted)),
+        None if state.cosmos.item_counts_pending.contains(&key) => {
+            Cell::from("…").style(Style::default().fg(theme.muted))
+        }
+        None => Cell::from("").style(Style::default().fg(theme.muted)),
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -312,6 +336,8 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             if let Some(name) = coll {
                 state.cosmos.selected_container = Some(name);
                 state.cosmos.items_scroll = 0;
+                state.cosmos.items_filter.reset();
+                state.cosmos.items_filter_active = false;
                 state.view = View::CosmosItem;
             }
             true
@@ -381,6 +407,32 @@ mod tests {
         assert!(buf.contains("Hash"));
         assert!(buf.contains("consistent"));
         assert!(buf.contains("3600s"));
+    }
+
+    #[test]
+    fn renders_item_count_column() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let key = CosmosCache::containers_key("/subs/x/rg/y/da/acc", "orders");
+        state
+            .cosmos
+            .containers
+            .insert(key, vec![container("items"), container("denied")]);
+        state.cosmos.item_counts.insert(
+            CosmosCache::items_key("/subs/x/rg/y/da/acc", "orders", "items"),
+            Ok(4_360),
+        );
+        state.cosmos.item_counts.insert(
+            CosmosCache::items_key("/subs/x/rg/y/da/acc", "orders", "denied"),
+            Err("403".into()),
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("ITEMS"));
+        assert!(buf.contains("4.36 k"));
+        assert!(buf.contains("—"));
     }
 
     #[test]

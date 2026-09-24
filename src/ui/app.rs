@@ -1211,6 +1211,7 @@ async fn event_loop(
                     Ok(rows) => {
                         state.cosmos.containers_error.remove(&key);
                         state.cosmos.containers.insert(key, rows);
+                        kick_off_cosmos_item_counts(state, auth, tx);
                     }
                     Err(e) => {
                         state.cosmos.containers.remove(&key);
@@ -1218,18 +1219,14 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::CosmosItemsLoaded { key, result } => {
-                state.cosmos.items_pending.remove(&key);
-                match result {
-                    Ok(preview) => {
-                        state.cosmos.items_error.remove(&key);
-                        state.cosmos.items.insert(key, preview);
-                    }
-                    Err(e) => {
-                        state.cosmos.items.remove(&key);
-                        state.cosmos.items_error.insert(key, e);
-                    }
-                }
+            AppEvent::CosmosItemsLoaded {
+                key,
+                from_token,
+                result,
+            } => apply_cosmos_items_page(state, key, from_token, result),
+            AppEvent::CosmosItemCountLoaded { key, result } => {
+                state.cosmos.item_counts_pending.remove(&key);
+                state.cosmos.item_counts.insert(key, result);
             }
             AppEvent::SqlResourcesLoaded { scope, result } => {
                 // Stale scope — see the `ResourcesLoaded` arm.
@@ -1911,6 +1908,11 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
         state.cosmos.containers_cursor = 0;
         return true;
     }
+    if should_forward_to_cosmos_items_filter(state, key) {
+        state.cosmos.items_filter.handle_event(&CtEvent::Key(key));
+        state.cosmos.items_scroll = 0;
+        return true;
+    }
     if should_forward_to_sql_filter(state, key) {
         state.sql.filter.handle_event(&CtEvent::Key(key));
         state.sql.cursor = 0;
@@ -2372,6 +2374,24 @@ fn should_forward_to_cosmos_containers_filter(
         )
 }
 
+/// Mirror of `should_forward_to_filter` for the cosmos item-JSON filter.
+fn should_forward_to_cosmos_items_filter(
+    state: &AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    state.view == View::CosmosItem
+        && state.cosmos.items_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
 /// Mirror of `should_forward_to_filter` for the key-vault list name filter.
 fn should_forward_to_key_vaults_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
     state.view == View::KeyVaults
@@ -2727,6 +2747,7 @@ fn decide_action(
         || (state.view == View::CosmosAccounts && state.cosmos.accounts_filter_active)
         || (state.view == View::CosmosDatabases && state.cosmos.databases_filter_active)
         || (state.view == View::CosmosContainers && state.cosmos.containers_filter_active)
+        || (state.view == View::CosmosItem && state.cosmos.items_filter_active)
         || (state.view == View::KeyVaults && state.key_vault.vaults_filter_active)
         || (state.view == View::KeyVaultItems && state.key_vault.items_filter_active)
         || (state.view == View::KeyVaultAccessLogs && state.key_vault.access_window_input_active)
@@ -4082,6 +4103,118 @@ fn after_action(
         state.sql.audit.events_fetch_older = false;
         fetch_older_sql_audit_events(state, auth, tx);
     }
+    // Cosmos items: same flag-and-drain for the scroll-near-bottom page.
+    if std::mem::take(&mut state.cosmos.items_fetch_more) {
+        fetch_more_cosmos_items(state, auth, tx);
+    }
+}
+
+/// Land one items page: a first page (`from_token` `None`) replaces the cache
+/// entry; a next page is appended only while the cached buffer still ends at
+/// the token it continued from — a refresh in between replaced the buffer,
+/// and splicing the stale page onto it would duplicate or skip rows.
+fn apply_cosmos_items_page(
+    state: &mut AppState,
+    key: String,
+    from_token: Option<String>,
+    result: Result<crate::azure::cosmos::CosmosItemPreview, String>,
+) {
+    let Some(token) = from_token else {
+        state.cosmos.items_pending.remove(&key);
+        match result {
+            Ok(preview) => {
+                state.cosmos.items_error.remove(&key);
+                state.cosmos.items.insert(key, preview);
+            }
+            Err(e) => {
+                state.cosmos.items.remove(&key);
+                state.cosmos.items_error.insert(key, e);
+            }
+        }
+        return;
+    };
+    let Some(preview) = state
+        .cosmos
+        .items
+        .get_mut(&key)
+        .filter(|p| p.continuation.as_deref() == Some(token.as_str()))
+    else {
+        return;
+    };
+    state.cosmos.items_loading_more.remove(&key);
+    match result {
+        Ok(page) => {
+            state.cosmos.items_more_error.remove(&key);
+            preview.items.extend(page.items);
+            preview.request_charge = match (preview.request_charge, page.request_charge) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            };
+            preview.continuation = page.continuation;
+        }
+        Err(e) => {
+            state.cosmos.items_more_error.insert(key, e);
+        }
+    }
+}
+
+/// Spawn the next items page for the pinned container, continuing from the
+/// cached buffer's continuation token. No-op when nothing more exists or a
+/// fetch (first page or next) is already in flight.
+fn fetch_more_cosmos_items(state: &mut AppState, auth: &AzureAuth, tx: &UnboundedSender<AppEvent>) {
+    let (Some(account), Some(db), Some(coll)) = (
+        state.cosmos.selected_account.clone(),
+        state.cosmos.selected_database.clone(),
+        state.cosmos.selected_container.clone(),
+    ) else {
+        return;
+    };
+    let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+    if state.cosmos.items_pending.contains(&key) || state.cosmos.items_loading_more.contains(&key) {
+        return;
+    }
+    let Some(token) = state
+        .cosmos
+        .items
+        .get(&key)
+        .and_then(|p| p.continuation.clone())
+    else {
+        return;
+    };
+    state.cosmos.items_more_error.remove(&key);
+    state.cosmos.items_loading_more.insert(key);
+    spawn_load_cosmos_items(auth.clone(), account, db, coll, Some(token), tx.clone());
+}
+
+/// Spawn a document-count fetch for every container listed under the pinned
+/// database that has neither a count nor one in flight.
+fn kick_off_cosmos_item_counts(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let (Some(account), Some(db)) = (
+        state.cosmos.selected_account.clone(),
+        state.cosmos.selected_database.clone(),
+    ) else {
+        return;
+    };
+    let key = crate::ui::state::CosmosCache::containers_key(&account.id, &db);
+    let names: Vec<String> = state
+        .cosmos
+        .containers
+        .get(&key)
+        .map(|rows| rows.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
+    for coll in names {
+        let count_key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+        if state.cosmos.item_counts.contains_key(&count_key)
+            || !state.cosmos.item_counts_pending.insert(count_key)
+        {
+            continue;
+        }
+        spawn_load_cosmos_item_count(auth.clone(), account.clone(), db.clone(), coll, tx.clone());
+    }
 }
 
 /// Spawn the *older-than* audit-events page for the scroll-past-bottom fetch:
@@ -4947,11 +5080,18 @@ fn kick_off_loads_for_view(
                     if force {
                         state.cosmos.containers.remove(&key);
                         state.cosmos.containers_error.remove(&key);
+                        // Counts re-fetch once the fresh listing lands.
+                        let prefix = format!("{key}/");
+                        state
+                            .cosmos
+                            .item_counts
+                            .retain(|k, _| !k.starts_with(&prefix));
                     }
                     state.cosmos.containers_pending.insert(key);
                     spawn_load_cosmos_containers(auth.clone(), account, db, tx.clone());
                 }
             }
+            kick_off_cosmos_item_counts(state, auth, tx);
         }
         View::CosmosItem => {
             if let (Some(account), Some(db), Some(coll)) = (
@@ -4966,9 +5106,27 @@ fn kick_off_loads_for_view(
                     if force {
                         state.cosmos.items.remove(&key);
                         state.cosmos.items_error.remove(&key);
+                        state.cosmos.items_more_error.remove(&key);
+                        state.cosmos.items_loading_more.remove(&key);
+                        state.cosmos.items_scroll = 0;
                     }
-                    state.cosmos.items_pending.insert(key);
-                    spawn_load_cosmos_items(auth.clone(), account, db, coll, tx.clone());
+                    state.cosmos.items_pending.insert(key.clone());
+                    spawn_load_cosmos_items(
+                        auth.clone(),
+                        account.clone(),
+                        db.clone(),
+                        coll.clone(),
+                        None,
+                        tx.clone(),
+                    );
+                }
+                if force {
+                    state.cosmos.item_counts.remove(&key);
+                }
+                if !state.cosmos.item_counts.contains_key(&key)
+                    && state.cosmos.item_counts_pending.insert(key)
+                {
+                    spawn_load_cosmos_item_count(auth.clone(), account, db, coll, tx.clone());
                 }
             }
         }
@@ -7452,25 +7610,59 @@ fn spawn_load_cosmos_containers(
     });
 }
 
+/// One items page; `from_token` `None` = first page, `Some` = continue.
 fn spawn_load_cosmos_items(
+    auth: AzureAuth,
+    account: crate::azure::cosmos::CosmosAccount,
+    db: String,
+    coll: String,
+    from_token: Option<String>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::cosmos_items(
+            &coll,
+            from_token.as_deref(),
+        ));
+        let _ = tx.send(AppEvent::CosmosItemsLoaded {
+            key,
+            from_token,
+            result,
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let result =
+            crate::azure::cosmos::query_items(&auth, &account, &db, &coll, from_token.as_deref())
+                .await
+                .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::CosmosItemsLoaded {
+            key,
+            from_token,
+            result,
+        });
+    });
+}
+
+fn spawn_load_cosmos_item_count(
     auth: AzureAuth,
     account: crate::azure::cosmos::CosmosAccount,
     db: String,
     coll: String,
     tx: UnboundedSender<AppEvent>,
 ) {
+    let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
     if auth.is_demo() {
-        let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
-        let result = Ok(crate::azure::demo::cosmos_items(&coll));
-        let _ = tx.send(AppEvent::CosmosItemsLoaded { key, result });
+        let result = Ok(crate::azure::demo::cosmos_item_count(&coll));
+        let _ = tx.send(AppEvent::CosmosItemCountLoaded { key, result });
         return;
     }
     tokio::spawn(async move {
-        let key = crate::ui::state::CosmosCache::items_key(&account.id, &db, &coll);
-        let result = crate::azure::cosmos::query_top_items(&auth, &account, &db, &coll)
+        let result = crate::azure::cosmos::count_items(&auth, &account, &db, &coll)
             .await
             .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::CosmosItemsLoaded { key, result });
+        let _ = tx.send(AppEvent::CosmosItemCountLoaded { key, result });
     });
 }
 
@@ -8017,6 +8209,84 @@ mod tests {
         // `j` after a stale `g` should be MoveDown, not GotoTop.
         assert_eq!(a, Action::MoveDown);
         assert!(input.pending_chord.is_none());
+    }
+
+    fn cosmos_demo_state() -> (AppState, String) {
+        let mut state = fresh_state();
+        let account = crate::azure::demo::cosmos_accounts(&[]).remove(0);
+        let key =
+            crate::ui::state::CosmosCache::items_key(&account.id, "telemetry", "request-traces");
+        state.cosmos.selected_account = Some(account);
+        state.cosmos.selected_database = Some("telemetry".into());
+        state.cosmos.selected_container = Some("request-traces".into());
+        state.view = View::CosmosItem;
+        (state, key)
+    }
+
+    fn recv_cosmos_page(state: &mut AppState, rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        // Skip the count (and any other) events sharing the channel.
+        loop {
+            if let AppEvent::CosmosItemsLoaded {
+                key,
+                from_token,
+                result,
+            } = rx.try_recv().expect("items event")
+            {
+                return apply_cosmos_items_page(state, key, from_token, result);
+            }
+        }
+    }
+
+    #[test]
+    fn cosmos_items_page_through_until_exhausted() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let (mut state, key) = cosmos_demo_state();
+
+        kick_off_loads_for_view(&mut state, &auth, &tx, false);
+        recv_cosmos_page(&mut state, &mut rx);
+        assert_eq!(state.cosmos.items[&key].items.len(), 20);
+
+        for expected in [40, 60, 65] {
+            fetch_more_cosmos_items(&mut state, &auth, &tx);
+            recv_cosmos_page(&mut state, &mut rx);
+            assert_eq!(state.cosmos.items[&key].items.len(), expected);
+        }
+        assert!(state.cosmos.items[&key].continuation.is_none());
+        assert!(state.cosmos.items_loading_more.is_empty());
+
+        // Exhausted: no further fetch is spawned.
+        fetch_more_cosmos_items(&mut state, &auth, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cosmos_stale_next_page_is_dropped_after_refresh() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let (mut state, key) = cosmos_demo_state();
+
+        kick_off_loads_for_view(&mut state, &auth, &tx, false);
+        recv_cosmos_page(&mut state, &mut rx);
+        fetch_more_cosmos_items(&mut state, &auth, &tx);
+        recv_cosmos_page(&mut state, &mut rx);
+        assert_eq!(state.cosmos.items[&key].items.len(), 40);
+
+        // A page continuing from a token the buffer no longer ends at.
+        apply_cosmos_items_page(
+            &mut state,
+            key.clone(),
+            Some("20".into()),
+            Ok(crate::azure::demo::cosmos_items(
+                "request-traces",
+                Some("20"),
+            )),
+        );
+        assert_eq!(
+            state.cosmos.items[&key].items.len(),
+            40,
+            "stale page ignored"
+        );
     }
 
     #[test]

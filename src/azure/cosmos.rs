@@ -2,7 +2,7 @@
 //!
 //! ## Contract (do not change without coordinating with the UI lane)
 //!
-//! Four public functions form the surface the UI consumes:
+//! Five public functions form the surface the UI consumes:
 //!
 //! - [`list_accounts`] — Resource Graph KQL discovery of Cosmos DB accounts
 //!   across the supplied subscriptions, filtered to SQL/Core API accounts
@@ -13,11 +13,15 @@
 //! - [`list_containers`] — ARM control-plane enumeration of containers
 //!   (collections) under one database, including partition key + indexing mode
 //!   + default TTL from `properties.resource`.
-//! - [`query_top_items`] — Cosmos **data plane** `POST /dbs/{db}/colls/{coll}/docs`
-//!   running `SELECT * FROM c` capped to 20 rows via `x-ms-max-item-count`.
+//! - [`query_items`] — Cosmos **data plane** `POST /dbs/{db}/colls/{coll}/docs`
+//!   running `SELECT * FROM c`, one page of 20 rows (`x-ms-max-item-count`)
+//!   per call; pass the previous page's continuation token to get the next.
 //!   Requires the signed-in identity to have
 //!   the `Cosmos DB Built-in Data Reader` role assigned at the account scope
 //!   via `dataPlaneRoleDefinitions` — control-plane `Reader` is NOT enough.
+//! - [`count_items`] — data plane `GET /dbs/{db}/colls/{coll}` with quota info,
+//!   reading `documentsCount` from `x-ms-resource-usage`. No query, so no
+//!   cross-partition aggregate (which the gateway can't serve) and ~no RU.
 //!
 //! ## Scope decisions worth flagging
 //!
@@ -34,9 +38,9 @@
 //!   per the Cosmos REST docs).
 //! - **Read-only**: account list + database list + container list + item query
 //!   only. No item write / DDL / throughput-change codepaths, even stubs.
-//! - **Item preview cap**: first page of `x-ms-max-item-count: 20`; we don't
-//!   follow `x-ms-continuation` even if it appears — the UI sets `partial =
-//!   true` and shows a warning.
+//! - **Item paging**: pages of `x-ms-max-item-count: 20`; the UI requests the
+//!   next page (via the returned `x-ms-continuation`) when the user scrolls
+//!   near the bottom of what's loaded.
 
 #![allow(dead_code, unused_variables)]
 
@@ -116,20 +120,19 @@ pub struct CosmosContainer {
     pub indexing_mode: Option<String>,
 }
 
-/// Output of [`query_top_items`]: the first N documents from the container
-/// plus the Cosmos-reported request charge.
+/// Output of [`query_items`]: one page of documents plus the Cosmos-reported
+/// request charge. The UI accumulates pages into a single value (items
+/// appended, charges summed, continuation replaced).
 #[derive(Clone, Debug)]
 pub struct CosmosItemPreview {
-    /// The raw `Documents[]` rows from the response. Capped at
-    /// [`MAX_ITEMS_PREVIEW`] by the query itself (`SELECT TOP N`); we don't
-    /// follow continuation tokens.
+    /// The raw `Documents[]` rows from the response.
     pub items: Vec<serde_json::Value>,
     /// `x-ms-request-charge` from the response header — useful diagnostic for
     /// "how expensive was this exploratory read".
     pub request_charge: Option<f64>,
-    /// `true` if the response carried an `x-ms-continuation` token we ignored.
-    /// The UI surfaces this as "showing first N (more available)".
-    pub partial: bool,
+    /// `x-ms-continuation` from the response: `Some` while more pages exist.
+    /// Feed it back into [`query_items`] to fetch the next page.
+    pub continuation: Option<String>,
 }
 
 /// Resource Graph KQL for Cosmos DB accounts. Same envelope as
@@ -152,9 +155,9 @@ const COSMOS_API_VERSION: &str = "2024-05-15";
 /// control-plane [`COSMOS_API_VERSION`].
 const COSMOS_DATA_PLANE_VERSION: &str = "2020-07-15";
 
-/// Max items returned by `query_top_items`, sent as `x-ms-max-item-count`
-/// (not `SELECT TOP N` — see the note in `query_top_items`).
-const MAX_ITEMS_PREVIEW: usize = 20;
+/// Page size for `query_items`, sent as `x-ms-max-item-count` (not `SELECT
+/// TOP N` — see the note in `query_items`).
+const ITEMS_PAGE_SIZE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -234,52 +237,55 @@ pub async fn list_containers(
     Ok(parse_containers_json(&resp))
 }
 
-/// Run `SELECT * FROM c` against `coll_name` in `db_name`, capped to
-/// [`MAX_ITEMS_PREVIEW`] rows via `x-ms-max-item-count` (the first page only).
-/// Data-plane call — requires the identity to have
-/// `Cosmos DB Built-in Data Reader` (or stronger) at the account scope.
-pub async fn query_top_items(
+/// Run `SELECT * FROM c` against `coll_name` in `db_name`, returning one page
+/// of up to [`ITEMS_PAGE_SIZE`] rows. `continuation` is the previous page's
+/// token (`None` for the first page). Data-plane call — requires the identity
+/// to have `Cosmos DB Built-in Data Reader` (or stronger) at the account scope.
+pub async fn query_items(
     auth: &AzureAuth,
     account: &CosmosAccount,
     db_name: &str,
     coll_name: &str,
+    continuation: Option<&str>,
+) -> anyhow::Result<CosmosItemPreview> {
+    /// Cross-partition queries can return empty pages that still carry a
+    /// continuation (a partition range with nothing to give). Skip past a
+    /// bounded number of those so the caller always gets rows or the end.
+    const MAX_EMPTY_PAGES: usize = 10;
+
+    let mut page = query_items_page(auth, account, db_name, coll_name, continuation).await?;
+    for _ in 0..MAX_EMPTY_PAGES {
+        let Some(token) = page.continuation.clone().filter(|_| page.items.is_empty()) else {
+            break;
+        };
+        let next = query_items_page(auth, account, db_name, coll_name, Some(&token)).await?;
+        page = CosmosItemPreview {
+            items: next.items,
+            request_charge: match (page.request_charge, next.request_charge) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => a.or(b),
+            },
+            continuation: next.continuation,
+        };
+    }
+    Ok(page)
+}
+
+async fn query_items_page(
+    auth: &AzureAuth,
+    account: &CosmosAccount,
+    db_name: &str,
+    coll_name: &str,
+    continuation: Option<&str>,
 ) -> anyhow::Result<CosmosItemPreview> {
     let endpoint = account.document_endpoint_or_default();
     let host = endpoint_host(&endpoint).unwrap_or_else(|| account.name.clone());
     let url = items_url(&endpoint, db_name, coll_name);
-    let bearer = auth
-        .token(SCOPE_COSMOS)
-        .await
-        .context("acquire Cosmos data-plane token")?;
     let http = build_http()?;
-
-    let auth_header = format!(
-        "type%3Daad%26ver%3D1.0%26sig%3D{}",
-        urlencode_token(&bearer)
-    );
-    tracing::debug!(
-        "cosmos query: POST {url}, auth-format type=aad&ver=1.0&sig=<redacted, len={}>",
-        bearer.len()
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&auth_header)
-            .map_err(|_| anyhow!("cosmos AAD authorization header contained invalid chars"))?,
-    );
+    let mut headers = data_plane_headers(auth, &url).await?;
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/query+json"),
-    );
-    headers.insert(
-        "x-ms-version",
-        HeaderValue::from_static(COSMOS_DATA_PLANE_VERSION),
-    );
-    headers.insert(
-        "x-ms-date",
-        HeaderValue::from_str(&rfc1123_now())
-            .map_err(|_| anyhow!("rfc1123 date contained invalid chars"))?,
     );
     headers.insert("x-ms-documentdb-isquery", HeaderValue::from_static("true"));
     headers.insert(
@@ -288,11 +294,18 @@ pub async fn query_top_items(
     );
     headers.insert(
         "x-ms-max-item-count",
-        HeaderValue::from_str(&MAX_ITEMS_PREVIEW.to_string()).unwrap(),
+        HeaderValue::from_str(&ITEMS_PAGE_SIZE.to_string()).unwrap(),
     );
+    if let Some(token) = continuation {
+        headers.insert(
+            "x-ms-continuation",
+            HeaderValue::from_str(token)
+                .map_err(|_| anyhow!("cosmos continuation token contained invalid chars"))?,
+        );
+    }
 
     // No `TOP N`: it makes a multi-partition query un-servable by the gateway
-    // (400 + query plan). `x-ms-max-item-count` caps the first page instead.
+    // (400 + query plan). `x-ms-max-item-count` caps each page instead.
     let body = serde_json::json!({
         "query": "SELECT * FROM c",
         "parameters": [],
@@ -309,30 +322,18 @@ pub async fn query_top_items(
     .await
     .map_err(|e| anyhow!("cosmos data-plane network error: {e}"))
     .map_err(|e| classify_data_plane_error(&account.name, &host, e))?;
+    let resp = ensure_success(resp, &account.name, &host).await?;
 
-    let status = resp.status();
     let response_headers = resp.headers().clone();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(classify_data_plane_error(
-            &account.name,
-            &host,
-            anyhow!(
-                "cosmos data-plane returned {}: {}",
-                status.as_u16(),
-                truncate_error_body(&body)
-            ),
-        ));
-    }
-
     let request_charge = response_headers
         .get("x-ms-request-charge")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok());
-    let partial = response_headers
+    let continuation = response_headers
         .get("x-ms-continuation")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
 
     let raw = resp
         .text()
@@ -345,7 +346,107 @@ pub async fn query_top_items(
     Ok(CosmosItemPreview {
         items,
         request_charge,
-        partial,
+        continuation,
+    })
+}
+
+/// Number of documents in `coll_name`, from the container's quota info
+/// (`x-ms-resource-usage: …;documentsCount=N;…`). A metadata read rather than
+/// a `COUNT(1)` query: the gateway refuses cross-partition aggregates, and
+/// this costs next to no RU. The figure comes from partition statistics, so
+/// it can trail very recent writes slightly.
+pub async fn count_items(
+    auth: &AzureAuth,
+    account: &CosmosAccount,
+    db_name: &str,
+    coll_name: &str,
+) -> anyhow::Result<u64> {
+    let endpoint = account.document_endpoint_or_default();
+    let host = endpoint_host(&endpoint).unwrap_or_else(|| account.name.clone());
+    let url = container_url(&endpoint, db_name, coll_name);
+    let http = build_http()?;
+    let mut headers = data_plane_headers(auth, &url).await?;
+    headers.insert(
+        "x-ms-documentdb-populatequotainfo",
+        HeaderValue::from_static("true"),
+    );
+
+    let resp = send_with_retry(|| http.get(&url).headers(headers.clone()))
+        .await
+        .map_err(|e| anyhow!("cosmos data-plane network error: {e}"))
+        .map_err(|e| classify_data_plane_error(&account.name, &host, e))?;
+    let resp = ensure_success(resp, &account.name, &host).await?;
+
+    resp.headers()
+        .get("x-ms-resource-usage")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_documents_count)
+        .ok_or_else(|| anyhow!("cosmos response carried no documentsCount"))
+}
+
+/// Auth + version + date headers shared by every data-plane request.
+async fn data_plane_headers(auth: &AzureAuth, url: &str) -> anyhow::Result<HeaderMap> {
+    let bearer = auth
+        .token(SCOPE_COSMOS)
+        .await
+        .context("acquire Cosmos data-plane token")?;
+    let auth_header = format!(
+        "type%3Daad%26ver%3D1.0%26sig%3D{}",
+        urlencode_token(&bearer)
+    );
+    tracing::debug!(
+        "cosmos data plane: {url}, auth-format type=aad&ver=1.0&sig=<redacted, len={}>",
+        bearer.len()
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&auth_header)
+            .map_err(|_| anyhow!("cosmos AAD authorization header contained invalid chars"))?,
+    );
+    headers.insert(
+        "x-ms-version",
+        HeaderValue::from_static(COSMOS_DATA_PLANE_VERSION),
+    );
+    headers.insert(
+        "x-ms-date",
+        HeaderValue::from_str(&rfc1123_now())
+            .map_err(|_| anyhow!("rfc1123 date contained invalid chars"))?,
+    );
+    Ok(headers)
+}
+
+/// Turn a non-2xx data-plane response into a classified error.
+async fn ensure_success(
+    resp: reqwest::Response,
+    account_name: &str,
+    host: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    Err(classify_data_plane_error(
+        account_name,
+        host,
+        anyhow!(
+            "cosmos data-plane returned {}: {}",
+            status.as_u16(),
+            truncate_error_body(&body)
+        ),
+    ))
+}
+
+/// Pull `documentsCount` out of an `x-ms-resource-usage` header value
+/// (`functions=0;documentsSize=12;documentsCount=34;…`).
+pub(crate) fn parse_documents_count(usage: &str) -> Option<u64> {
+    usage.split(';').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim() == "documentsCount")
+            .then(|| v.trim().parse().ok())
+            .flatten()
     })
 }
 
@@ -484,6 +585,17 @@ pub(crate) fn items_url(endpoint: &str, db: &str, coll: &str) -> String {
     let trimmed = endpoint.trim_end_matches('/');
     format!(
         "{trimmed}/dbs/{}/colls/{}/docs",
+        encode_path_segment(db),
+        encode_path_segment(coll)
+    )
+}
+
+/// `{endpoint}/dbs/{db}/colls/{coll}` — the container resource itself, for
+/// the quota-info read in [`count_items`].
+pub(crate) fn container_url(endpoint: &str, db: &str, coll: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    format!(
+        "{trimmed}/dbs/{}/colls/{}",
         encode_path_segment(db),
         encode_path_segment(coll)
     )
@@ -984,6 +1096,23 @@ mod tests {
             items_url("https://acc.documents.azure.com:443", "db", "c"),
             "https://acc.documents.azure.com:443/dbs/db/colls/c/docs"
         );
+    }
+
+    #[test]
+    fn container_url_drops_docs_suffix() {
+        assert_eq!(
+            container_url("https://acc.documents.azure.com:443/", "db", "c"),
+            "https://acc.documents.azure.com:443/dbs/db/colls/c"
+        );
+    }
+
+    #[test]
+    fn parses_documents_count_from_resource_usage() {
+        let usage = "functions=0;storedProcedures=0;triggers=0;documentSize=0;\
+                     documentsSize=1294;documentsCount=42;collectionSize=1400";
+        assert_eq!(parse_documents_count(usage), Some(42));
+        assert_eq!(parse_documents_count("documentsSize=10"), None);
+        assert_eq!(parse_documents_count(""), None);
     }
 
     #[test]

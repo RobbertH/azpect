@@ -1387,8 +1387,25 @@ pub struct CosmosCache {
     pub items: HashMap<String, crate::azure::cosmos::CosmosItemPreview>,
     pub items_pending: HashSet<String>,
     pub items_error: HashMap<String, String>,
+    /// Keys whose next page is in flight (the scroll-to-bottom fetch).
+    pub items_loading_more: HashSet<String>,
+    /// Keys whose next-page fetch failed; shown in the title, cleared on the
+    /// next attempt.
+    pub items_more_error: HashMap<String, String>,
+    /// Set by the item view's handler when the user scrolls near the bottom
+    /// of what's loaded (view handlers can't spawn tasks); drained in
+    /// `apply_action`.
+    pub items_fetch_more: bool,
     /// Vertical scroll offset inside the item preview pane.
     pub items_scroll: u16,
+    /// Case-insensitive substring filter over each item's JSON.
+    pub items_filter: Input,
+    pub items_filter_active: bool,
+
+    /// Document count per container, keyed like `items`. `Err` holds a short
+    /// reason (usually a missing data-plane role).
+    pub item_counts: HashMap<String, Result<u64, String>>,
+    pub item_counts_pending: HashSet<String>,
 }
 
 impl CosmosCache {
@@ -1425,6 +1442,27 @@ impl CosmosCache {
             Some(rows) => rows
                 .iter()
                 .filter(|d| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Items of the preview under `key` that match `items_filter`
+    /// (case-insensitive substring over the pretty-printed JSON, i.e. what the
+    /// view shows). Empty filter passes everything through.
+    pub fn filtered_items(&self, key: &str) -> Vec<&serde_json::Value> {
+        let needle = self.items_filter.value().to_lowercase();
+        match self.items.get(key) {
+            Some(p) => p
+                .items
+                .iter()
+                .filter(|v| {
+                    needle.is_empty()
+                        || serde_json::to_string_pretty(v)
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&needle)
+                })
                 .collect(),
             None => Vec::new(),
         }
