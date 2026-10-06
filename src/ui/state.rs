@@ -1195,6 +1195,14 @@ pub struct RegistryCache {
     pub pull_totals_pending: HashSet<String>,
     /// Fetch failures, keyed by registry id — the cell renders "—".
     pub pull_totals_error: HashMap<String, String>,
+    /// Per-repository logged activity over [`Self::pulls_window`] (the
+    /// repositories list's PULLS / PUSHES / LAST PULL columns), keyed by
+    /// registry id, then repository name. Same window and generation as the
+    /// registries PULLS column. Unlike those metrics totals this is *logged*
+    /// events, so it needs the registry's diagnostic setting.
+    pub repo_activity: HashMap<String, HashMap<String, crate::azure::registry_logs::RepoActivity>>,
+    pub repo_activity_pending: HashSet<String>,
+    pub repo_activity_error: HashMap<String, String>,
     /// Window for the PULLS column, adjustable with `0`/`1`/`7`/`t` on the
     /// registries list. `None` = the 7d default (see [`Self::pulls_window`] —
     /// stored as an `Option` only because `AccessWindow::default()` is 1d and
@@ -1233,6 +1241,9 @@ impl RegistryCache {
         self.pull_totals.clear();
         self.pull_totals_pending.clear();
         self.pull_totals_error.clear();
+        self.repo_activity.clear();
+        self.repo_activity_pending.clear();
+        self.repo_activity_error.clear();
         self.pulls_generation = self.pulls_generation.wrapping_add(1);
     }
 

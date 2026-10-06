@@ -141,11 +141,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!("error: {err}"),
             Style::default().fg(theme.critical),
         ))];
-        // A workspace that never received registry logs fails KQL table
-        // resolution — same root cause as the empty page, so same hint.
+        // No readable workspace holds the table at all — narrower than the
+        // empty page: nothing ever arrived, or it arrived somewhere we can't
+        // read. Timing / cap / retention can't produce this.
         if err.contains("Failed to resolve table") || err.contains("SEM0100") {
             lines.push(Line::default());
-            lines.extend(diagnostics_warning_lines(state, theme));
+            lines.extend(missing_table_lines(theme));
         }
         let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         frame.render_widget(p, body_area);
@@ -170,18 +171,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         Some(rows) if rows.is_empty() => {
             // Zero rows is ambiguous: nothing happened, or nothing is being
-            // recorded. Almost always it's the latter — forwarding repository
-            // events is opt-in and most registries never got the diagnostic
-            // setting — so warn loudly instead of shrugging, and let the
-            // metrics chart prove pulls are happening but going unlogged.
-            let mut lines = vec![
-                Line::from(Span::styled(
-                    "no repository events in this window.",
-                    Style::default().fg(theme.muted),
-                )),
-                Line::default(),
-            ];
-            lines.extend(diagnostics_warning_lines(state, theme));
+            // recorded — and the view can't tell which from here. Don't
+            // assert a cause: a repo-scoped page is usually just a quiet
+            // repository, and a registry-wide one can be any of several
+            // config gaps. List them so nobody walks away thinking either
+            // "nobody pulls" or "logging is off" when the truth is elsewhere.
+            let lines = match state.registry.access_scope.as_deref() {
+                Some(repo) => repo_empty_lines(state, repo, theme),
+                None => registry_empty_lines(state, theme),
+            };
             let p = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
             frame.render_widget(p, body_area);
         }
@@ -296,51 +294,96 @@ fn render_activity_charts(frame: &mut Frame, area: Rect, state: &AppState, theme
     );
 }
 
-/// The "your registry probably isn't logging anything" warning, shared by the
-/// empty page and the no-such-table error. Orange (`client_error`) rather than
-/// muted: an auditor who trusts an empty page here walks away thinking nobody
-/// pulls their images, and forwarding repository events is OFF by default on
-/// ACR, so the empty page is almost always a configuration gap — not quiet.
-/// When Monitor metrics counted activity in the same window, say so: that's
-/// proof pulls are happening but going unrecorded.
-fn diagnostics_warning_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
-    let warn = Style::default().fg(theme.client_error);
+/// Empty page scoped to one repository. The metrics chart above is
+/// registry-wide, so pulls counted there may all belong to other repos —
+/// the likeliest reading is "this repository was quiet", not a logging gap.
+fn repo_empty_lines(state: &AppState, repo: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(theme.muted);
     let mut lines = vec![
         Line::from(Span::styled(
-            "⚠ most likely cause: this registry is not forwarding its repository events anywhere.",
-            warn.add_modifier(Modifier::BOLD),
+            format!("no events for repository {repo} in this window."),
+            muted,
         )),
-        Line::from(Span::styled(
-            "ACR does NOT record pull/push logs by default. A diagnostic setting on the registry must",
-            warn,
-        )),
-        Line::from(Span::styled(
-            "explicitly send the ContainerRegistryRepositoryEvents category to a Log Analytics",
-            warn,
-        )),
-        Line::from(Span::styled(
-            "workspace, and only events from after that point are captured",
-            warn,
-        )),
-        Line::from(Span::styled(
-            "(Portal: registry → Monitoring → Diagnostic settings).",
-            warn,
-        )),
+        Line::default(),
     ];
     if let Some(activity) = state.registry.access_metrics.as_ref() {
         if activity.any_activity() {
-            lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 format!(
-                    "monitor metrics count ~{} pulls / ~{} pushes in this window — images ARE being pulled, but nothing records by whom.",
+                    "the ~{} pulls / ~{} pushes in the chart are for the whole registry — they may all be other repositories.",
+                    format_count(activity.pull_total()),
+                    format_count(activity.push_total()),
+                ),
+                muted,
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "widen the window (7 / t), or press l on the registry row instead of a repository to see whether anything is logged at all.",
+        muted,
+    )));
+    lines
+}
+
+/// Empty page for the whole registry. Several distinct gaps produce zero
+/// rows and the view can't tell them apart, so list them rather than
+/// guess. Orange (`client_error`): an auditor who trusts an empty page here
+/// walks away thinking nobody pulls their images.
+fn registry_empty_lines(state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(theme.client_error);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "no repository events recorded for this registry in this window.",
+            Style::default().fg(theme.muted),
+        )),
+        Line::default(),
+    ];
+    if let Some(activity) = state.registry.access_metrics.as_ref() {
+        if activity.any_activity() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "⚠ monitor metrics count ~{} pulls / ~{} pushes in this window, so activity is happening but none of it is in the log.",
                     format_count(activity.pull_total()),
                     format_count(activity.push_total()),
                 ),
                 warn.add_modifier(Modifier::BOLD),
             )));
+            lines.push(Line::default());
         }
     }
+    lines.push(Line::from(Span::styled(
+        "possible causes:",
+        warn.add_modifier(Modifier::BOLD),
+    )));
+    for cause in [
+        "• no diagnostic setting sends RepositoryEvent logs (category group audit or allLogs) to a Log Analytics workspace. ACR doesn't log pulls/pushes by default (Portal: registry → Monitoring → Diagnostic settings).",
+        "• the diagnostic setting is newer than this window: only events after it was created are recorded.",
+        "• the workspace dropped them: its daily cap was hit, or its retention is shorter than this window.",
+        "• you can read the registry but not the workspace (workspace access control mode \"Require workspace permissions\").",
+    ] {
+        lines.push(Line::from(Span::styled(cause, warn)));
+    }
     lines
+}
+
+/// The no-such-table error: no workspace you can read has ever held this
+/// registry's repository events. Only two causes fit that.
+fn missing_table_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(theme.client_error);
+    vec![
+        Line::from(Span::styled(
+            "⚠ no Log Analytics workspace you can read holds repository events for this registry. Either:",
+            warn.add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "• no diagnostic setting sends RepositoryEvent logs (category group audit or allLogs) to a workspace. ACR doesn't log pulls/pushes by default (Portal: registry → Monitoring → Diagnostic settings), or",
+            warn,
+        )),
+        Line::from(Span::styled(
+            "• one does, but you lack read access to that workspace.",
+            warn,
+        )),
+    ]
 }
 
 /// Caller column text: the Graph-resolved display name when the identity is a
@@ -762,17 +805,39 @@ mod tests {
     }
 
     #[test]
-    fn renders_empty_state_with_explicit_forwarding_warning() {
+    fn registry_wide_empty_state_lists_causes_without_asserting_one() {
         let theme = crate::ui::theme::Theme::catppuccin_mocha();
-        let backend = TestBackend::new(120, 16);
+        let backend = TestBackend::new(200, 24);
         let mut term = Terminal::new(backend).unwrap();
         let mut state = fixture();
         state.registry.access_events = Some(Vec::new());
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
-        assert!(s.contains("not forwarding its repository events"));
-        assert!(s.contains("NOT record pull/push logs by default"));
-        assert!(s.contains("ContainerRegistryRepositoryEvents"));
+        assert!(s.contains("possible causes:"));
+        assert!(s.contains("RepositoryEvent logs"));
+        assert!(s.contains("newer than this window"));
+        assert!(s.contains("daily cap"));
+        assert!(s.contains("Require workspace permissions"));
+    }
+
+    #[test]
+    fn repo_scoped_empty_state_blames_quiet_repo_not_forwarding() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(200, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.access_scope = Some("ca-checkout-api".to_string());
+        state.registry.access_events = Some(Vec::new());
+        state.registry.access_metrics =
+            Some(crate::azure::demo::registry_activity(&AccessWindow::Day));
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("no events for repository ca-checkout-api"));
+        assert!(s.contains("may all be other repositories"));
+        assert!(
+            !s.contains("possible causes"),
+            "no logging-gap warning on a repo page"
+        );
     }
 
     #[test]
@@ -787,7 +852,7 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(
-            s.contains("images ARE being pulled"),
+            s.contains("none of it is in the log"),
             "metrics corroboration line missing"
         );
     }
@@ -852,6 +917,6 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("error:"));
-        assert!(s.contains("not forwarding its repository events"));
+        assert!(s.contains("no Log Analytics workspace you can read"));
     }
 }

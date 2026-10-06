@@ -266,6 +266,17 @@ pub enum AppEvent {
         generation: u64,
         result: Result<f64, String>,
     },
+    /// Background load completion: per-repository logged activity for one
+    /// registry over the PULLS window. `generation` as in
+    /// [`AppEvent::RegistryPullTotalLoaded`].
+    RegistryRepoActivityLoaded {
+        registry_id: String,
+        generation: u64,
+        result: Result<
+            std::collections::HashMap<String, crate::azure::registry_logs::RepoActivity>,
+            String,
+        >,
+    },
     /// Background load completion: list of consumption Logic Apps for the
     /// current subscription scope. `scope` — see [`AppEvent::SubscriptionsLoaded`].
     LogicAppsLoaded {

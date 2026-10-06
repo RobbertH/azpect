@@ -16,6 +16,8 @@
 
 #![allow(dead_code, unused_variables)]
 
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -127,6 +129,94 @@ pub async fn fetch(
         truncated,
         hidden,
     })
+}
+
+/// Per-repository activity over a window, from one `summarize` over
+/// `ContainerRegistryRepositoryEvents` — the repositories list's PULLS /
+/// PUSHES / LAST PULL columns. Only *logged* events: zero here can also mean
+/// the registry isn't forwarding (see the access view's empty-page causes).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoActivity {
+    pub pulls: u64,
+    pub pushes: u64,
+    pub last_pull: Option<DateTime<Utc>>,
+}
+
+/// Activity for every repository that logged at least one event in the
+/// window, keyed by repository name as logged. Repositories absent from the
+/// map had no logged events.
+pub async fn fetch_repo_activity(
+    auth: &AzureAuth,
+    registry: &Registry,
+    window: &AccessWindow,
+) -> anyhow::Result<HashMap<String, RepoActivity>> {
+    let client = LogsClient::new(auth.clone())?;
+    let resp = client
+        .query(&registry.id, REPO_ACTIVITY_KQL, &window.timespan())
+        .await?;
+    parse_repo_activity(&resp)
+}
+
+/// `first` / `last` are reserved in KQL — hence the `last_pull` name.
+const REPO_ACTIVITY_KQL: &str = r#"ContainerRegistryRepositoryEvents
+| extend repo_ = tostring(column_ifexists("Repository", ""))
+| where isnotempty(repo_)
+| summarize pulls = countif(OperationName == "Pull"), pushes = countif(OperationName == "Push"), last_pull = maxif(TimeGenerated, OperationName == "Pull") by repo_
+"#;
+
+fn parse_repo_activity(value: &serde_json::Value) -> anyhow::Result<HashMap<String, RepoActivity>> {
+    let table = value
+        .get("tables")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| anyhow!("no tables in repository-activity response"))?;
+    let columns: Vec<&str> = table
+        .get("columns")
+        .and_then(|c| c.as_array())
+        .map(|cols| {
+            cols.iter()
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let idx = |name: &str| columns.iter().position(|c| *c == name);
+    let (Some(i_repo), Some(i_pulls), Some(i_pushes), Some(i_last)) =
+        (idx("repo_"), idx("pulls"), idx("pushes"), idx("last_pull"))
+    else {
+        return Err(anyhow!(
+            "repository-activity response missing expected columns"
+        ));
+    };
+    let count = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut out = HashMap::new();
+    for row in table
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(row) = row.as_array() else { continue };
+        let Some(repo) = row.get(i_repo).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // `maxif` over zero matching rows yields null — a repo with pushes
+        // but no pulls in the window.
+        let last_pull = row
+            .get(i_last)
+            .and_then(|v| v.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        out.insert(
+            repo.to_string(),
+            RepoActivity {
+                pulls: count(row.get(i_pulls)),
+                pushes: count(row.get(i_pushes)),
+                last_pull,
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// Escape a value for interpolation inside a double-quoted KQL string literal.
@@ -292,6 +382,42 @@ mod tests {
         // The table's optional columns must all be schema-drift-guarded.
         assert!(kql.contains(r#"column_ifexists("Identity""#));
         assert!(kql.contains(r#"column_ifexists("Digest""#));
+    }
+
+    #[test]
+    fn repo_activity_parses_counts_and_null_last_pull() {
+        let resp = serde_json::json!({
+            "tables": [{
+                "name": "PrimaryResult",
+                "columns": [
+                    { "name": "repo_", "type": "string" },
+                    { "name": "pulls", "type": "long" },
+                    { "name": "pushes", "type": "long" },
+                    { "name": "last_pull", "type": "datetime" }
+                ],
+                "rows": [
+                    ["team/svc", 412, 2, "2026-10-06T08:37:26.966Z"],
+                    ["base/runtime", 0, 1, null]
+                ]
+            }]
+        });
+        let map = parse_repo_activity(&resp).unwrap();
+        let svc = &map["team/svc"];
+        assert_eq!((svc.pulls, svc.pushes), (412, 2));
+        assert_eq!(
+            svc.last_pull.unwrap().to_rfc3339(),
+            "2026-10-06T08:37:26.966+00:00"
+        );
+        let base = &map["base/runtime"];
+        assert_eq!((base.pulls, base.pushes, base.last_pull), (0, 1, None));
+    }
+
+    #[test]
+    fn repo_activity_kql_avoids_reserved_names() {
+        // `first` / `last` as column names are a KQL syntax error.
+        assert!(!REPO_ACTIVITY_KQL.contains(" last ="));
+        assert!(!REPO_ACTIVITY_KQL.contains(" first ="));
+        assert!(REPO_ACTIVITY_KQL.contains("by repo_"));
     }
 
     #[test]

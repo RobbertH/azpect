@@ -1209,6 +1209,27 @@ pub fn repositories(_registry: &Registry) -> Vec<Repository> {
     .collect()
 }
 
+/// Per-repository roll-up of [`registry_access`]'s rows, so the repositories
+/// list agrees with the access view.
+pub fn registry_repo_activity(
+    window: &crate::azure::key_vault_logs::AccessWindow,
+) -> std::collections::HashMap<String, crate::azure::registry_logs::RepoActivity> {
+    let mut out: std::collections::HashMap<String, crate::azure::registry_logs::RepoActivity> =
+        std::collections::HashMap::new();
+    for e in registry_access(window, None, false).events {
+        let a = out.entry(e.repository.clone()).or_default();
+        match e.operation.as_str() {
+            "Pull" => {
+                a.pulls += 1;
+                a.last_pull = a.last_pull.max(Some(e.ts));
+            }
+            "Push" => a.pushes += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
 pub fn tags(_repository: &str) -> Vec<Tag> {
     ["1.7.3", "1.7.2", "1.7.1", "1.6.0", "latest"]
         .iter()

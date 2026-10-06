@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
+use super::detail::format_count;
+use crate::azure::sql_audit::humanize_ago;
 use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
@@ -50,6 +52,15 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!("/{filter_value} "),
             Style::default().fg(theme.accent),
         ));
+    }
+    // Say why the activity columns are blank rather than leave bare dashes.
+    if let Some(note) = state
+        .registry
+        .selected_registry
+        .as_ref()
+        .and_then(|r| activity_note(state, &r.id))
+    {
+        title_spans.push(Span::styled(note, Style::default().fg(theme.client_error)));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -128,21 +139,36 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             frame.render_widget(p, body_area);
         }
         Some(_) => {
-            // Just one column for now — image counts / pushed-at require
-            // per-repo manifest fetches that we don't make.
-            let widths = [Constraint::Min(20)];
-            let header_row = Row::new(vec!["REPOSITORY"]).style(
+            // Activity columns come from one summarize over the registry's
+            // logged events (see `RepoActivity`), over the same window as
+            // the registries list's PULLS column.
+            let window = state.registry.pulls_window().label();
+            let widths = [
+                Constraint::Min(20),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(9),
+            ];
+            let header_row = Row::new(vec![
+                "REPOSITORY".to_string(),
+                format!("PULLS {window}"),
+                format!("PUSHES {window}"),
+                "LAST PULL".to_string(),
+            ])
+            .style(
                 Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             );
 
+            let now = chrono::Utc::now();
             let body_rows: Vec<Row> = filtered
                 .iter()
                 .map(|r| {
-                    Row::new(vec![
-                        Cell::from(r.name.as_str()).style(Style::default().fg(theme.fg))
-                    ])
+                    let mut cells =
+                        vec![Cell::from(r.name.as_str()).style(Style::default().fg(theme.fg))];
+                    cells.extend(activity_cells(state, &registry.id, &r.name, now, theme));
+                    Row::new(cells)
                 })
                 .collect();
 
@@ -164,6 +190,59 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     render_footer(frame, chunks[1], theme);
+}
+
+/// PULLS / PUSHES / LAST PULL for one repository. A repository missing from
+/// a loaded map logged nothing in the window ("0"). But an entirely empty map
+/// means the registry logged nothing at all, which is more likely a logging
+/// gap than a quiet registry, so those cells stay "—" rather than "0".
+fn activity_cells(
+    state: &AppState,
+    registry_id: &str,
+    repo: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    theme: &Theme,
+) -> [Cell<'static>; 3] {
+    let muted = Style::default().fg(theme.muted);
+    let fg = Style::default().fg(theme.fg);
+    let dash = || Cell::from("—").style(muted);
+    let Some(map) = state.registry.repo_activity.get(registry_id) else {
+        if state.registry.repo_activity_pending.contains(registry_id) {
+            let dots = || Cell::from("…").style(muted);
+            return [dots(), dots(), dots()];
+        }
+        return [dash(), dash(), dash()];
+    };
+    if map.is_empty() {
+        return [dash(), dash(), dash()];
+    }
+    let a = map.get(repo).cloned().unwrap_or_default();
+    let count = |n: u64| {
+        if n == 0 {
+            Cell::from("0").style(muted)
+        } else {
+            Cell::from(format_count(n as f64)).style(fg)
+        }
+    };
+    let last = match a.last_pull {
+        Some(ts) => Cell::from(humanize_ago(ts, now)).style(fg),
+        None => dash(),
+    };
+    [count(a.pulls), count(a.pushes), last]
+}
+
+/// Title chip explaining blank activity columns, or `None` when they're fine.
+fn activity_note(state: &AppState, registry_id: &str) -> Option<String> {
+    let window = state.registry.pulls_window().label();
+    if state.registry.repo_activity_error.contains_key(registry_id) {
+        return Some("· pull counts unavailable (log query failed) ".to_string());
+    }
+    match state.registry.repo_activity.get(registry_id) {
+        Some(map) if map.is_empty() => Some(format!(
+            "· no pulls/pushes logged in {window}. Open l on the registry for possible causes "
+        )),
+        _ => None,
+    }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -288,6 +367,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 mod tests {
     use super::*;
     use crate::azure::registries::{Registry, Repository};
+    use crate::azure::registry_logs::RepoActivity;
     use crate::config::Config;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -348,6 +428,57 @@ mod tests {
         let buf = format!("{:?}", term.backend().buffer());
         assert!(buf.contains("alpine"));
         assert!(buf.contains("team/svc"));
+    }
+
+    #[test]
+    fn renders_activity_columns_with_zero_for_quiet_repo() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(120, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.registry.repositories.insert(
+            "/subs/x/rg/y/cr/myreg".into(),
+            vec![repo("alpine"), repo("team/svc")],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "team/svc".to_string(),
+            RepoActivity {
+                pulls: 412,
+                pushes: 2,
+                last_pull: Some(chrono::Utc::now() - chrono::Duration::hours(3)),
+            },
+        );
+        state
+            .registry
+            .repo_activity
+            .insert("/subs/x/rg/y/cr/myreg".into(), map);
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("PULLS 7d"));
+        assert!(buf.contains("412"));
+        assert!(buf.contains("3h"));
+        assert!(!buf.contains("no pulls/pushes logged"));
+    }
+
+    #[test]
+    fn empty_activity_map_renders_dashes_and_note_not_zeros() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state
+            .registry
+            .repositories
+            .insert("/subs/x/rg/y/cr/myreg".into(), vec![repo("alpine")]);
+        state
+            .registry
+            .repo_activity
+            .insert("/subs/x/rg/y/cr/myreg".into(), Default::default());
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(buf.contains("no pulls/pushes logged in 7d"));
+        assert!(buf.contains("—"));
     }
 
     #[test]

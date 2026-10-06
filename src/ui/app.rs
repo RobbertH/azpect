@@ -1006,6 +1006,26 @@ async fn event_loop(
                     }
                 }
             }
+            AppEvent::RegistryRepoActivityLoaded {
+                registry_id,
+                generation,
+                result,
+            } => {
+                // Same stale-window rule as `RegistryPullTotalLoaded`.
+                if generation == state.registry.pulls_generation {
+                    state.registry.repo_activity_pending.remove(&registry_id);
+                    match result {
+                        Ok(map) => {
+                            state.registry.repo_activity_error.remove(&registry_id);
+                            state.registry.repo_activity.insert(registry_id, map);
+                        }
+                        Err(e) => {
+                            state.registry.repo_activity.remove(&registry_id);
+                            state.registry.repo_activity_error.insert(registry_id, e);
+                        }
+                    }
+                }
+            }
             AppEvent::RegistryRepositoriesLoaded {
                 registry_id,
                 result,
@@ -4749,7 +4769,27 @@ fn kick_off_loads_for_view(
                         .registry
                         .repositories_pending
                         .insert(registry.id.clone());
-                    spawn_load_repositories(auth.clone(), registry, tx.clone());
+                    spawn_load_repositories(auth.clone(), registry.clone(), tx.clone());
+                }
+                // PULLS / PUSHES / LAST PULL columns: one summarize over the
+                // registry's logged events, independent of the repo listing.
+                let id = &registry.id;
+                if force {
+                    state.registry.repo_activity.remove(id);
+                    state.registry.repo_activity_error.remove(id);
+                }
+                if !state.registry.repo_activity.contains_key(id)
+                    && !state.registry.repo_activity_error.contains_key(id)
+                    && !state.registry.repo_activity_pending.contains(id)
+                {
+                    state.registry.repo_activity_pending.insert(id.clone());
+                    spawn_load_registry_repo_activity(
+                        auth.clone(),
+                        registry,
+                        state.registry.pulls_window(),
+                        state.registry.pulls_generation,
+                        tx.clone(),
+                    );
                 }
             }
         }
@@ -7375,6 +7415,35 @@ fn spawn_load_registry_pull_total(
             .map(|a| a.pull_total())
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::RegistryPullTotalLoaded {
+            registry_id,
+            generation,
+            result,
+        });
+    });
+}
+
+/// Fetch per-repository logged pull / push counts for the repositories list.
+fn spawn_load_registry_repo_activity(
+    auth: AzureAuth,
+    registry: crate::azure::registries::Registry,
+    window: crate::azure::key_vault_logs::AccessWindow,
+    generation: u64,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::RegistryRepoActivityLoaded {
+            registry_id: registry.id.clone(),
+            generation,
+            result: Ok(crate::azure::demo::registry_repo_activity(&window)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let registry_id = registry.id.clone();
+        let result = crate::azure::registry_logs::fetch_repo_activity(&auth, &registry, &window)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RegistryRepoActivityLoaded {
             registry_id,
             generation,
             result,
