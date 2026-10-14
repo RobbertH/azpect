@@ -6,8 +6,9 @@
 //! Cursor movement uses `h j k` and chords like `g g`. Vertical movement is
 //! the only direction the views use, so `l` is repurposed (k9s-style) to open
 //! the logs view. Single-letter actions (`l` logs, `f` favorite, `s`
-//! subscription, `r` refresh, `1/7` window, `w` wrap, `e` errors-only, `q`
-//! quit) avoid clobbering `j`/`k`. Lane 3 is responsible for the chord state
+//! subscription, `r` refresh, `1/7` window, `w` wrap, `e` errors-only) avoid
+//! clobbering `j`/`k`. Esc is the only back / quit key; `q` stays free for
+//! view-scoped actions (queues on the storage account overview). Lane 3 is responsible for the chord state
 //! machine (e.g. tracking the first `g` of `g g`).
 
 #![allow(dead_code, unused_variables)]
@@ -206,6 +207,18 @@ pub enum AppEvent {
     StorageContainerSizeLoaded {
         key: String,
         result: Result<crate::azure::storage::ContainerSize, String>,
+    },
+    /// Background load completion: queues (with approximate message counts)
+    /// for one storage account, keyed by ARM id.
+    StorageQueuesLoaded {
+        account_id: String,
+        result: Result<crate::azure::storage::QueueListing, String>,
+    },
+    /// Background load completion: peeked messages for one queue. `key` is
+    /// [`crate::ui::state::StorageCache::messages_key`].
+    StorageQueueMessagesLoaded {
+        key: String,
+        result: Result<Vec<crate::azure::storage::QueueMessage>, String>,
     },
     /// Background load completion: metadata + body preview for one blob. `key`
     /// is the `(account, container, blob)` triple flattened by
@@ -547,6 +560,9 @@ pub enum Action {
     /// Open the top-level Storage mode (blob accounts list). Bound to `S`
     /// (capital so it doesn't collide with `s` = switch subscription).
     OpenStorage,
+    /// Storage account overview: open the account's queues list. Bound to `q`
+    /// there only (Enter on the overview opens the blob containers).
+    OpenQueues,
     /// Storage containers view: walk the selected container's full blob
     /// listing and show its blob count / total size in the SIZE column —
     /// the portal's "Calculate size". Bound to `c` there only; Azure has no
@@ -617,9 +633,9 @@ pub enum Action {
 pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
     // Ctrl+C first, before any mode-specific capture: raw mode disables
     // SIGINT, so the reflexive interrupt press must be honoured as a key or
-    // it does nothing during a slow fetch. It mirrors `q` exactly (Back —
-    // quit-confirm at the root, one level up elsewhere), and while the search
-    // input owns printable keys it cancels the input like Esc.
+    // it does nothing during a slow fetch. It mirrors Esc exactly (Back —
+    // quit-confirm at the root, one level up elsewhere), including while the
+    // search input owns printable keys.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Back;
     }
@@ -641,10 +657,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
 
     // Help view: any key dismisses.
     if view == View::Help {
-        return match key.code {
-            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => Action::Back,
-            _ => Action::Back,
-        };
+        return Action::Back;
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -793,6 +806,13 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             _ => Action::SwitchSubscription,
         },
         KeyCode::Char('S') => Action::OpenStorage,
+        // `q` opens the queues list from the storage account overview (Enter
+        // there opens the blob containers); inert elsewhere. Esc is the only
+        // back / quit key, so `q` carries no global meaning.
+        KeyCode::Char('q') => match view {
+            View::StorageAccountOverview => Action::OpenQueues,
+            _ => Action::Noop,
+        },
         KeyCode::Char('R') => Action::OpenRegistries,
         KeyCode::Char('r') => Action::Refresh,
         // Digit-keyed time-range shortcuts, grouped numerically:
@@ -827,7 +847,6 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         // views let it fall through to the global handler as a no-op.
         KeyCode::Char('V') => Action::ToggleVisualLine,
         KeyCode::Char('o') => Action::OpenInBrowser,
-        KeyCode::Char('q') => Action::Back,
 
         _ => Action::Noop,
     }
@@ -1008,7 +1027,6 @@ mod tests {
         assert_eq!(key_to_action(key('w'), v, false), Action::ToggleWrap);
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
         assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
-        assert_eq!(key_to_action(key('q'), v, false), Action::Back);
         assert_eq!(key_to_action(key('o'), v, false), Action::OpenInBrowser);
     }
 
@@ -1048,9 +1066,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_mirrors_q_everywhere() {
+    fn ctrl_c_mirrors_esc_everywhere() {
         // Raw mode swallows SIGINT, so Ctrl+C must be an in-band key that
-        // behaves exactly like `q` (Back) — in every view…
+        // behaves exactly like Esc (Back) — in every view…
         for v in [View::List, View::Detail, View::Logs, View::EnvVars] {
             assert_eq!(key_to_action(key_ctrl('c'), v, false), Action::Back);
         }
@@ -1095,6 +1113,23 @@ mod tests {
         assert_eq!(
             key_to_action(key_ctrl('c'), View::StorageContainers, false),
             Action::Back
+        );
+    }
+
+    #[test]
+    fn q_opens_queues_only_from_storage_overview() {
+        assert_eq!(
+            key_to_action(key('q'), View::StorageAccountOverview, false),
+            Action::OpenQueues
+        );
+        // `q` is no longer back / quit anywhere — Esc owns that.
+        for v in [View::Subscriptions, View::List, View::StorageContainers] {
+            assert_eq!(key_to_action(key('q'), v, false), Action::Noop);
+        }
+        // Uppercase `Q` is unbound.
+        assert_eq!(
+            key_to_action(key_shift('Q'), View::StorageAccountOverview, false),
+            Action::Noop
         );
     }
 

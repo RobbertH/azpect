@@ -13,7 +13,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, RegistryCache};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  / filter  Esc back  r refresh  y yank ref  ? help  q quit";
+const FOOTER_HINT: &str = "j/k move  / filter  Esc back  r refresh  y yank ref  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -208,14 +208,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         .filtered_tags(&registry_id, &repository)
         .len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.registry.tags_filter_active || !state.registry.tags_filter.value().is_empty())
+    {
+        state.registry.tags_filter_active = false;
+        state.registry.tags_filter.reset();
+        state.registry.tags_cursor = 0;
+        return true;
+    }
+
     if state.registry.tags_filter_active {
         match action {
-            Action::Back => {
-                state.registry.tags_filter_active = false;
-                state.registry.tags_filter.reset();
-                state.registry.tags_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.registry.tags_filter_active = false;
                 return true;

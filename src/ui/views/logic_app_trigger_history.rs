@@ -18,7 +18,7 @@ use crate::ui::state::{AppState, LogicContentSource, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter content  Esc back  r refresh  y yank run id  o portal  ? help  q quit";
+    "j/k move  Enter content  Esc back  r refresh  y yank run id  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

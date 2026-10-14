@@ -365,4 +365,6 @@ pub mod storage_accounts;
 pub mod storage_blob_detail;
 pub mod storage_blobs;
 pub mod storage_containers;
+pub mod storage_queue_messages;
+pub mod storage_queues;
 pub mod subscriptions;

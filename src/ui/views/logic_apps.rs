@@ -18,7 +18,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter runs  / filter  Esc back  r refresh  y yank id  o portal  ? help  q quit";
+    "j/k move  Enter runs  / filter  Esc back  r refresh  y yank id  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -215,14 +215,21 @@ fn format_date(dt: Option<&chrono::DateTime<chrono::Utc>>) -> String {
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let len = state.logic_apps.filtered_workflows().len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.logic_apps.workflows_filter_active
+            || !state.logic_apps.workflows_filter.value().is_empty())
+    {
+        state.logic_apps.workflows_filter_active = false;
+        state.logic_apps.workflows_filter.reset();
+        state.logic_apps.workflows_cursor = 0;
+        return true;
+    }
+
     if state.logic_apps.workflows_filter_active {
         match action {
-            Action::Back => {
-                state.logic_apps.workflows_filter_active = false;
-                state.logic_apps.workflows_filter.reset();
-                state.logic_apps.workflows_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.logic_apps.workflows_filter_active = false;
                 return true;

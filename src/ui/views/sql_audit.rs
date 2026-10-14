@@ -1038,14 +1038,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
 fn handle_principals(action: Action, state: &mut AppState) -> bool {
     // Filter-input focus: printable keys flow into the input via app.rs; only
     // the carved-out keys land here as actions (same contract as the SQL list).
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.sql.audit.principals_filter_active
+            || !state.sql.audit.principals_filter.value().is_empty())
+    {
+        state.sql.audit.principals_filter_active = false;
+        state.sql.audit.principals_filter.reset();
+        state.sql.audit.cursor = 0;
+        return true;
+    }
+
     if state.sql.audit.principals_filter_active {
         match action {
-            Action::Back => {
-                state.sql.audit.principals_filter_active = false;
-                state.sql.audit.principals_filter.reset();
-                state.sql.audit.cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 // Enter applies: close the input, keep the narrowing.
                 state.sql.audit.principals_filter_active = false;

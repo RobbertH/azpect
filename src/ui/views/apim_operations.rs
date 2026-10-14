@@ -16,7 +16,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter policy  / filter  y yank  o portal  Esc back  r refresh  ? help  q quit";
+    "j/k move  Enter policy  / filter  y yank  o portal  Esc back  r refresh  ? help";
 const HALF_PAGE: usize = 10;
 
 const METHOD_COL_WIDTH: usize = 7;
@@ -323,14 +323,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // dispatcher's filter-forwarding gate push raw chars into the buffer.
     // Esc cancels (deactivates AND clears); Enter commits (deactivates, keeps
     // the value). Down hands focus back to the filtered list.
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.apim.operations_filter_active || !state.apim.operations_filter.value().is_empty())
+    {
+        state.apim.operations_filter_active = false;
+        state.apim.operations_filter.reset();
+        state.apim.operations_cursor = 0;
+        return true;
+    }
+
     if state.apim.operations_filter_active {
         match action {
-            Action::Back => {
-                state.apim.operations_filter_active = false;
-                state.apim.operations_filter.reset();
-                state.apim.operations_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.apim.operations_filter_active = false;
                 return true;

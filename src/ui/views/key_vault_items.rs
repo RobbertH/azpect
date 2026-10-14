@@ -25,7 +25,7 @@ use crate::ui::state::{AppState, KeyVaultCache, SecretRevealStatus, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter/x reveal  l access log  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
+    "j/k move  Enter/x reveal  l access log  Tab toggle kind  / filter  Esc back  r refresh  y yank name  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Items expiring within this window are flagged red. Matches typical secret
@@ -334,14 +334,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     };
     let len = state.key_vault.filtered_items(&vault_id).len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.key_vault.items_filter_active || !state.key_vault.items_filter.value().is_empty())
+    {
+        state.key_vault.items_filter_active = false;
+        state.key_vault.items_filter.reset();
+        state.key_vault.items_cursor = 0;
+        return true;
+    }
+
     if state.key_vault.items_filter_active {
         match action {
-            Action::Back => {
-                state.key_vault.items_filter_active = false;
-                state.key_vault.items_filter.reset();
-                state.key_vault.items_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.key_vault.items_filter_active = false;
                 return true;

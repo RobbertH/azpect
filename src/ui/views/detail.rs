@@ -62,7 +62,7 @@ fn footer_segments_for(
         };
         segments.push((enter_clue.to_string(), false));
     }
-    segments.push(("Esc back  r refresh  ? help  q quit".to_string(), false));
+    segments.push(("Esc back  r refresh  ? help".to_string(), false));
     segments
 }
 

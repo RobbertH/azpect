@@ -23,7 +23,7 @@ use crate::ui::events::Action;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k move  Esc back  r refresh  y yank  o open in portal  ? help  q quit";
+const FOOTER_HINT: &str = "j/k move  Esc back  r refresh  y yank  o open in portal  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Resource id of the Application Gateway we're drilling into. Resolved off

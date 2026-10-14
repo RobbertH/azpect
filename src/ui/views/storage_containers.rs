@@ -27,7 +27,7 @@ use crate::ui::views::detail::format_count;
 use crate::ui::views::storage_account_overview::human_bytes;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter blobs  l access log  c size  C size all  / filter  Esc back  r refresh  y yank name  ? help  q quit";
+    "j/k move  Enter blobs  l access log  c size  C size all  / filter  Esc back  r refresh  y yank name  ? help";
 const HALF_PAGE: usize = 10;
 
 // Header strip is rendered by `Table::header(...)` and shares the same
@@ -316,14 +316,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // dispatcher's filter-forwarding gate push raw chars into the buffer.
     // Esc cancels (deactivates AND clears); Enter commits (deactivates,
     // keeps the value). Down hands focus back to the filtered list.
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.storage.containers_filter_active
+            || !state.storage.containers_filter.value().is_empty())
+    {
+        state.storage.containers_filter_active = false;
+        state.storage.containers_filter.reset();
+        state.storage.containers_cursor = 0;
+        return true;
+    }
+
     if state.storage.containers_filter_active {
         match action {
-            Action::Back => {
-                state.storage.containers_filter_active = false;
-                state.storage.containers_filter.reset();
-                state.storage.containers_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.storage.containers_filter_active = false;
                 return true;
@@ -603,6 +610,22 @@ mod tests {
         assert!(handle(Action::Back, &mut state));
         assert!(!state.storage.containers_filter_active);
         assert_eq!(state.storage.containers_filter.value(), "");
+    }
+
+    #[test]
+    fn esc_clears_applied_filter_after_defocus() {
+        // `/lo`, Enter to browse the narrowed list, then Esc clears the filter
+        // instead of leaving the view.
+        let mut state = fixture();
+        state
+            .storage
+            .containers
+            .insert("/subs/x/rg/y/sa/acct1".into(), vec![container("logs")]);
+        state.storage.containers_filter = tui_input::Input::default().with_value("lo".to_string());
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.storage.containers_filter.value(), "");
+        // With the filter gone, Esc falls through to breadcrumb navigation.
+        assert!(!handle(Action::Back, &mut state));
     }
 
     #[test]

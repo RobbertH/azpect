@@ -15,7 +15,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter containers  / filter  Esc back  r refresh  y yank name  ? help  q quit";
+    "j/k move  Enter containers  / filter  Esc back  r refresh  y yank name  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -176,14 +176,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     };
     let len = state.cosmos.filtered_databases(&account_id).len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.cosmos.databases_filter_active
+            || !state.cosmos.databases_filter.value().is_empty())
+    {
+        state.cosmos.databases_filter_active = false;
+        state.cosmos.databases_filter.reset();
+        state.cosmos.databases_cursor = 0;
+        return true;
+    }
+
     if state.cosmos.databases_filter_active {
         match action {
-            Action::Back => {
-                state.cosmos.databases_filter_active = false;
-                state.cosmos.databases_filter.reset();
-                state.cosmos.databases_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.cosmos.databases_filter_active = false;
                 return true;

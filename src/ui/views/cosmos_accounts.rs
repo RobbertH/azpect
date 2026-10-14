@@ -18,7 +18,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter databases  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter databases  / filter  Esc back  r refresh  y yank id  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -226,14 +226,20 @@ fn format_date(dt: Option<&chrono::DateTime<chrono::Utc>>) -> String {
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let len = state.cosmos.filtered_accounts().len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.cosmos.accounts_filter_active || !state.cosmos.accounts_filter.value().is_empty())
+    {
+        state.cosmos.accounts_filter_active = false;
+        state.cosmos.accounts_filter.reset();
+        state.cosmos.accounts_cursor = 0;
+        return true;
+    }
+
     if state.cosmos.accounts_filter_active {
         match action {
-            Action::Back => {
-                state.cosmos.accounts_filter_active = false;
-                state.cosmos.accounts_filter.reset();
-                state.cosmos.accounts_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.cosmos.accounts_filter_active = false;
                 return true;

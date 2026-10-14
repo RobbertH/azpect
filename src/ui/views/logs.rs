@@ -346,7 +346,7 @@ fn footer_line_for(state: &AppState, theme: &Theme) -> Line<'static> {
         super::WINDOW_RUNGS,
         None,
     ));
-    segments.push(("Esc back  q quit".to_string(), false));
+    segments.push(("Esc back".to_string(), false));
     super::footer_line(theme, &segments)
 }
 

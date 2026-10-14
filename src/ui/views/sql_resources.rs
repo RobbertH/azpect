@@ -18,7 +18,7 @@ use crate::ui::state::{subscription_display_name, AppState, SqlCache, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter metrics  l audit log  u sessions ⚠  / filter  Esc back  r refresh  o portal  y yank id  ? help  q quit";
+    "j/k move  Enter metrics  l audit log  u sessions ⚠  / filter  Esc back  r refresh  o portal  y yank id  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

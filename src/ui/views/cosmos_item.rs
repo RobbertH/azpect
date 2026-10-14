@@ -19,7 +19,7 @@ use crate::ui::state::{AppState, CosmosCache};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k scroll  g/G top/bottom  / filter  Esc back  r refresh  y yank  ? help  q quit";
+    "j/k scroll  g/G top/bottom  / filter  Esc back  r refresh  y yank  ? help";
 const HALF_PAGE: u16 = 10;
 /// Request the next page once the view is within this many lines of the
 /// bottom of the loaded rows, so it usually lands before the user gets there.
@@ -260,14 +260,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // invisibly for thousands of presses before the window moved.
     let max_scroll = state.scroll_max.get();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.cosmos.items_filter_active || !state.cosmos.items_filter.value().is_empty())
+    {
+        state.cosmos.items_filter_active = false;
+        state.cosmos.items_filter.reset();
+        state.cosmos.items_scroll = 0;
+        return true;
+    }
+
     if state.cosmos.items_filter_active {
         match action {
-            Action::Back => {
-                state.cosmos.items_filter_active = false;
-                state.cosmos.items_filter.reset();
-                state.cosmos.items_scroll = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.cosmos.items_filter_active = false;
                 return true;

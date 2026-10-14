@@ -329,7 +329,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         " pulls window",
     ));
     spans.push(Span::styled(
-        "  / filter  Esc back  r refresh  y yank id  ? help  q quit",
+        "  / filter  Esc back  r refresh  y yank id  ? help",
         super::hint_style(theme, false),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -373,14 +373,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
     }
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.registry.registries_filter_active
+            || !state.registry.registries_filter.value().is_empty())
+    {
+        state.registry.registries_filter_active = false;
+        state.registry.registries_filter.reset();
+        state.registry.registries_cursor = 0;
+        return true;
+    }
+
     if state.registry.registries_filter_active {
         match action {
-            Action::Back => {
-                state.registry.registries_filter_active = false;
-                state.registry.registries_filter.reset();
-                state.registry.registries_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.registry.registries_filter_active = false;
                 return true;

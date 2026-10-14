@@ -18,7 +18,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter open  l logs  f fav  F favs-only  / search  y yank  o portal  s sub  r refresh  ? help  q quit";
+    "j/k move  Enter open  l logs  f fav  F favs-only  / search  y yank  o portal  s sub  r refresh  ? help";
 
 const HALF_PAGE: usize = 10;
 

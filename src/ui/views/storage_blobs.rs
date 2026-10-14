@@ -24,7 +24,7 @@ use crate::ui::state::{AppState, StorageCache, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter preview  / filter  Esc back  r refresh  y yank name  ? help  q quit";
+    "j/k move  Enter preview  / filter  Esc back  r refresh  y yank name  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -265,14 +265,20 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // dispatcher's filter-forwarding gate push raw chars into the buffer.
     // Esc cancels (deactivates AND clears); Enter commits (deactivates,
     // keeps the value). Down hands focus back to the filtered list.
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.storage.blobs_filter_active || !state.storage.blobs_filter.value().is_empty())
+    {
+        state.storage.blobs_filter_active = false;
+        state.storage.blobs_filter.reset();
+        state.storage.blobs_cursor = 0;
+        return true;
+    }
+
     if state.storage.blobs_filter_active {
         match action {
-            Action::Back => {
-                state.storage.blobs_filter_active = false;
-                state.storage.blobs_filter.reset();
-                state.storage.blobs_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.storage.blobs_filter_active = false;
                 return true;
@@ -492,6 +498,18 @@ mod tests {
         assert!(handle(Action::Back, &mut state));
         assert!(!state.storage.blobs_filter_active);
         assert_eq!(state.storage.blobs_filter.value(), "");
+    }
+
+    #[test]
+    fn esc_clears_applied_filter_after_defocus() {
+        // `/foo`, Enter to browse the narrowed list, then Esc clears the
+        // filter instead of leaving the view.
+        let mut state = fixture();
+        state.storage.blobs_filter = tui_input::Input::default().with_value("foo".to_string());
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.storage.blobs_filter.value(), "");
+        // With the filter gone, Esc falls through to breadcrumb navigation.
+        assert!(!handle(Action::Back, &mut state));
     }
 
     #[test]

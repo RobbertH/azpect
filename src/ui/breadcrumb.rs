@@ -169,6 +169,27 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             s
         }
 
+        // Queues mirror the containers → blobs pair: the list's leaf is the
+        // account, the peek adds the queue name.
+        View::StorageQueues => {
+            let mut s = vec![subscription_segment(state), "storage".to_string()];
+            if let Some(acc) = state.storage.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            s
+        }
+
+        View::StorageQueueMessages => {
+            let mut s = vec![subscription_segment(state), "storage".to_string()];
+            if let Some(acc) = state.storage.selected_account.as_ref() {
+                s.push(acc.name.clone());
+            }
+            if let Some(queue) = state.storage.selected_queue.as_deref() {
+                s.push(queue.to_string());
+            }
+            s
+        }
+
         View::StorageBlobDetail => {
             let mut s = vec![subscription_segment(state), "storage".to_string()];
             if let Some(acc) = state.storage.selected_account.as_ref() {
@@ -814,6 +835,22 @@ mod tests {
         assert_eq!(
             breadcrumb(&state),
             "sub:my-sub > storage > my-account > my-container"
+        );
+    }
+
+    #[test]
+    fn storage_queue_messages_breadcrumb_includes_queue() {
+        let mut state = fresh_state();
+        state.subscriptions = vec![sub_fixture()];
+        state.selected_subscription = Some(sub_fixture().id);
+        state.storage.selected_account = Some(storage_account_fixture());
+        state.storage.selected_queue = Some("orders-poison".into());
+        state.view = View::StorageQueues;
+        assert_eq!(breadcrumb(&state), "sub:my-sub > storage > my-account");
+        state.view = View::StorageQueueMessages;
+        assert_eq!(
+            breadcrumb(&state),
+            "sub:my-sub > storage > my-account > orders-poison"
         );
     }
 

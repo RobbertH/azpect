@@ -44,8 +44,8 @@ use crate::azure::service_bus::{
 };
 use crate::azure::sql::{SqlKind, SqlResource};
 use crate::azure::storage::{
-    Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, ContainerSize, StorageAccount,
-    StorageAccountStats,
+    Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, ContainerSize, QueueListing,
+    QueueMessage, StorageAccount, StorageAccountStats, StorageQueue,
 };
 use crate::azure::subscriptions::Subscription;
 
@@ -917,7 +917,7 @@ pub fn storage_overview(_account: &StorageAccount) -> StorageAccountStats {
         file_share_count: Some(1),
         file_count: Some(112),
         file_capacity_bytes: Some(1_073_741_824),
-        queue_count: Some(2),
+        queue_count: Some(3),
         queue_message_count: Some(14),
         queue_capacity_bytes: Some(65_536),
         table_count: Some(4),
@@ -967,6 +967,64 @@ pub fn storage_blobs(_account_name: &str, container: &str) -> Vec<Blob> {
                 26,
             ),
         ],
+    }
+}
+
+/// Two queues of an order pipeline plus the poison queue its Function
+/// writes failures to. Counts sum to the overview tile's 14 messages.
+pub fn storage_queues(_account: &StorageAccount) -> QueueListing {
+    let queue = |name: &str, n: u64| StorageQueue {
+        name: name.to_string(),
+        approximate_message_count: Some(n),
+    };
+    QueueListing {
+        queues: vec![
+            queue("email-outbox", 0),
+            queue("order-events", 12),
+            queue("order-events-poison", 2),
+        ],
+        count_error: None,
+    }
+}
+
+/// Peeked messages for [`storage_queues`]. Bodies are base64 JSON, the way
+/// the Functions queue binding stores them, so the view's decoding shows.
+pub fn storage_queue_messages(_account_name: &str, queue: &str) -> Vec<QueueMessage> {
+    use base64::Engine;
+    let now = Utc::now();
+    let msg = |i: i64, dequeues: u64, body: String| QueueMessage {
+        message_id: format!("6f1c2a9e-4b7d-4e0a-9c3f-{:012x}", 0x5eed_0000 + i),
+        insertion_time: Some(now - Duration::minutes(3 + 7 * i)),
+        expiration_time: Some(now - Duration::minutes(3 + 7 * i) + Duration::days(7)),
+        dequeue_count: dequeues,
+        text: base64::engine::general_purpose::STANDARD.encode(body),
+    };
+    match queue {
+        "order-events" => (0..12)
+            .map(|i| {
+                let body = format!(
+                    r#"{{"type":"order.created","orderId":"ord_{}","total":{}.90,"currency":"EUR"}}"#,
+                    18_460 - i,
+                    40 + 13 * i
+                );
+                msg(i, if i == 0 { 1 } else { 0 }, body)
+            })
+            .collect(),
+        "order-events-poison" => vec![
+            msg(
+                40,
+                5,
+                r#"{"type":"order.created","orderId":"ord_18390","total":null,"currency":"EUR"}"#
+                    .to_string(),
+            ),
+            msg(
+                95,
+                5,
+                r#"{"type":"order.paid","orderId":"ord_18311","provider":"unknown-psp"}"#
+                    .to_string(),
+            ),
+        ],
+        _ => Vec::new(),
     }
 }
 

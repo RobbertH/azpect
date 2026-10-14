@@ -16,7 +16,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter actions  t trigger history  Esc back  r refresh  y yank run id  o portal  ? help  q quit";
+    "j/k move  Enter actions  t trigger history  Esc back  r refresh  y yank run id  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Style a Logic Apps status word (shared by the runs / trigger-history /

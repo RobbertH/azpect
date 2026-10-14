@@ -16,8 +16,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, ServiceBusCache};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str =
-    "j/k move  / filter  Esc back  r refresh  y yank name  o portal  ? help  q quit";
+const FOOTER_HINT: &str = "j/k move  / filter  Esc back  r refresh  y yank name  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -252,14 +251,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         .filtered_subscriptions(&ns_id, &topic)
         .len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.service_bus.subscriptions_filter_active
+            || !state.service_bus.subscriptions_filter.value().is_empty())
+    {
+        state.service_bus.subscriptions_filter_active = false;
+        state.service_bus.subscriptions_filter.reset();
+        state.service_bus.subscriptions_cursor = 0;
+        return true;
+    }
+
     if state.service_bus.subscriptions_filter_active {
         match action {
-            Action::Back => {
-                state.service_bus.subscriptions_filter_active = false;
-                state.service_bus.subscriptions_filter.reset();
-                state.service_bus.subscriptions_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.service_bus.subscriptions_filter_active = false;
                 return true;

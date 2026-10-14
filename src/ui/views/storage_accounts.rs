@@ -16,7 +16,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter overview  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter overview  l access log  / filter  Esc back  r refresh  y yank id  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Above this width, the SUB ID column has enough room to spell out the full
@@ -391,14 +391,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     // Esc cancels (deactivates AND clears); Enter commits (deactivates,
     // keeps the value). Down hands focus back to the filtered list, the
     // same Vim-ish handoff the resource list does.
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.storage.accounts_filter_active
+            || !state.storage.accounts_filter.value().is_empty())
+    {
+        state.storage.accounts_filter_active = false;
+        state.storage.accounts_filter.reset();
+        state.storage.accounts_cursor = 0;
+        return true;
+    }
+
     if state.storage.accounts_filter_active {
         match action {
-            Action::Back => {
-                state.storage.accounts_filter_active = false;
-                state.storage.accounts_filter.reset();
-                state.storage.accounts_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.storage.accounts_filter_active = false;
                 return true;
@@ -998,6 +1005,19 @@ mod tests {
         assert!(handle(Action::Back, &mut state));
         assert!(!state.storage.accounts_filter_active);
         assert_eq!(state.storage.accounts_filter.value(), "");
+    }
+
+    #[test]
+    fn esc_clears_applied_filter_after_defocus() {
+        // `/ac`, Enter to browse the narrowed list, then Esc clears the filter
+        // instead of leaving the view.
+        let mut state = fixture();
+        state.storage.accounts = Some(vec![account("acct1")]);
+        state.storage.accounts_filter = tui_input::Input::default().with_value("ac".to_string());
+        assert!(handle(Action::Back, &mut state));
+        assert_eq!(state.storage.accounts_filter.value(), "");
+        // With the filter gone, Esc falls through to breadcrumb navigation.
+        assert!(!handle(Action::Back, &mut state));
     }
 
     #[test]

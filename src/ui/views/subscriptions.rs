@@ -13,7 +13,7 @@ use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  / search  Enter select  y yank id  o portal  r refresh  ? help  q quit";
+    "j/k move  / search  Enter select  y yank id  o portal  r refresh  ? help  Esc quit";
 
 /// Label for the synthetic top row that clears the subscription filter.
 const ALL_LABEL: &str = "All subscriptions";

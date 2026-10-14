@@ -292,10 +292,7 @@ async fn event_loop(
                             state.should_quit = true;
                             break;
                         }
-                        KeyCode::Char('n')
-                        | KeyCode::Char('N')
-                        | KeyCode::Esc
-                        | KeyCode::Char('q') => {
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                             state.quit_confirm = false;
                             continue;
                         }
@@ -923,6 +920,32 @@ async fn event_loop(
                     Err(e) => {
                         state.storage.blob_preview.remove(&key);
                         state.storage.blob_preview_error.insert(key, e);
+                    }
+                }
+            }
+            AppEvent::StorageQueuesLoaded { account_id, result } => {
+                state.storage.queues_pending.remove(&account_id);
+                match result {
+                    Ok(listing) => {
+                        state.storage.queues_error.remove(&account_id);
+                        state.storage.queues.insert(account_id, listing);
+                    }
+                    Err(e) => {
+                        state.storage.queues.remove(&account_id);
+                        state.storage.queues_error.insert(account_id, e);
+                    }
+                }
+            }
+            AppEvent::StorageQueueMessagesLoaded { key, result } => {
+                state.storage.messages_pending.remove(&key);
+                match result {
+                    Ok(messages) => {
+                        state.storage.messages_error.remove(&key);
+                        state.storage.messages.insert(key, messages);
+                    }
+                    Err(e) => {
+                        state.storage.messages.remove(&key);
+                        state.storage.messages_error.insert(key, e);
                     }
                 }
             }
@@ -1859,6 +1882,11 @@ fn forward_to_focused_text_input(state: &mut AppState, key: crossterm::event::Ke
         state.storage.blobs_cursor = 0;
         return true;
     }
+    if should_forward_to_queues_filter(state, key) {
+        state.storage.queues_filter.handle_event(&CtEvent::Key(key));
+        state.storage.queues_cursor = 0;
+        return true;
+    }
     if should_forward_to_containers_filter(state, key) {
         state
             .storage
@@ -2219,6 +2247,22 @@ fn should_forward_to_blobs_filter(state: &AppState, key: crossterm::event::KeyEv
 fn should_forward_to_containers_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
     state.view == View::StorageContainers
         && state.storage.containers_filter_active
+        && !matches!(
+            key.code,
+            KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        )
+}
+
+/// Mirror of `should_forward_to_filter` for the storage-queues name filter;
+/// same carve-outs as [`should_forward_to_containers_filter`].
+fn should_forward_to_queues_filter(state: &AppState, key: crossterm::event::KeyEvent) -> bool {
+    state.view == View::StorageQueues
+        && state.storage.queues_filter_active
         && !matches!(
             key.code,
             KeyCode::Esc
@@ -2759,6 +2803,7 @@ fn decide_action(
         || (state.view == View::Subscriptions && state.subscription_filter_active)
         || (state.view == View::StorageBlobs && state.storage.blobs_filter_active)
         || (state.view == View::StorageContainers && state.storage.containers_filter_active)
+        || (state.view == View::StorageQueues && state.storage.queues_filter_active)
         || (state.view == View::StorageAccounts && state.storage.accounts_filter_active)
         || (state.view == View::LogicApps && state.logic_apps.workflows_filter_active)
         || (state.view == View::Registries && state.registry.registries_filter_active)
@@ -2836,6 +2881,10 @@ fn view_handle(action: Action, state: &mut AppState) -> bool {
         View::StorageContainers => crate::ui::views::storage_containers::handle(action, state),
         View::StorageBlobs => crate::ui::views::storage_blobs::handle(action, state),
         View::StorageBlobDetail => crate::ui::views::storage_blob_detail::handle(action, state),
+        View::StorageQueues => crate::ui::views::storage_queues::handle(action, state),
+        View::StorageQueueMessages => {
+            crate::ui::views::storage_queue_messages::handle(action, state)
+        }
         View::StorageAccessLogs => crate::ui::views::storage_access::handle(action, state),
         View::LogicApps => crate::ui::views::logic_apps::handle(action, state),
         View::LogicAppRuns => crate::ui::views::logic_app_runs::handle(action, state),
@@ -3194,14 +3243,14 @@ fn pick_exec_target(
 
 /// Key handler for the `s` container picker. Every key is consumed while the
 /// picker is open. Enter (or a `1`–`9` row shortcut) queues the shell into the
-/// chosen container; Esc / `q` abandons it without shelling anywhere.
+/// chosen container; Esc abandons it without shelling anywhere.
 fn handle_exec_picker_key(state: &mut AppState, key: crossterm::event::KeyEvent) {
     let Some(picker) = state.exec_picker.as_mut() else {
         return;
     };
     let last = picker.containers.len().saturating_sub(1);
     let chosen = match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
             state.exec_picker = None;
             return;
         }
@@ -3391,6 +3440,8 @@ fn portal_url_for(state: &AppState) -> Option<String> {
         | View::StorageContainers
         | View::StorageBlobs
         | View::StorageBlobDetail
+        | View::StorageQueues
+        | View::StorageQueueMessages
         // The access log's portal counterpart is the account's diagnostics /
         // logs side nav; the overview blade is the stable entry point.
         | View::StorageAccessLogs => state
@@ -3656,6 +3707,13 @@ fn yank_target(state: &AppState) -> Option<String> {
                 Some(format!("{}/{}/{}", acc.name, cont, blob))
             })
         }
+        View::StorageQueues => crate::ui::views::storage_queues::yank_text(state),
+        View::StorageQueueMessages => crate::ui::views::storage_queue_messages::yank_text(state)
+            .or_else(|| {
+                let acc = state.storage.selected_account.as_ref()?;
+                let queue = state.storage.selected_queue.as_deref()?;
+                Some(format!("{}/{}", acc.name, queue))
+            }),
         View::StorageAccessLogs => crate::ui::views::storage_access::yank_text(state),
         View::Registries => state
             .registry
@@ -3845,7 +3903,7 @@ fn apply_navigation_action(action: Action, state: &mut AppState) -> bool {
             true
         }
         Action::Back => {
-            // Esc / q goes one abstraction level *up* in the breadcrumb tree —
+            // Esc goes one abstraction level *up* in the breadcrumb tree —
             // not back through navigation history. So opening Storage with `S`
             // from a Function-App Logs view and then pressing Esc takes you to
             // `Subscriptions` (the parent of `StorageAccounts`), not back to
@@ -3936,6 +3994,8 @@ fn semantic_parent(view: View) -> Option<View> {
         View::StorageContainers => Some(View::StorageAccountOverview),
         View::StorageBlobs => Some(View::StorageContainers),
         View::StorageBlobDetail => Some(View::StorageBlobs),
+        View::StorageQueues => Some(View::StorageAccountOverview),
+        View::StorageQueueMessages => Some(View::StorageQueues),
         // The view's own Back handler consumes Esc first (it returns to the
         // recorded origin — accounts or containers list); this is the static
         // fallback for the breadcrumb tree.
@@ -4101,6 +4161,7 @@ fn after_action(
         | Action::OpenLogs
         | Action::OpenSessions
         | Action::OpenStorage
+        | Action::OpenQueues
         | Action::OpenRegistries
         // `t` in the Logic App runs view opens the trigger history — a view
         // transition like OpenSelected, so kick its (debounced) load too.
@@ -4698,6 +4759,39 @@ fn kick_off_loads_for_view(
                         blob,
                         tx.clone(),
                     );
+                }
+            }
+        }
+        View::StorageQueues => {
+            if let Some(account) = state.storage.selected_account.clone() {
+                let cached = state.storage.queues.contains_key(&account.id);
+                let in_flight = state.storage.queues_pending.contains(&account.id);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.queues.remove(&account.id);
+                        state.storage.queues_error.remove(&account.id);
+                    }
+                    state.storage.queues_pending.insert(account.id.clone());
+                    spawn_load_storage_queues(auth.clone(), account, tx.clone());
+                }
+            }
+        }
+        View::StorageQueueMessages => {
+            if let (Some(acc), Some(queue)) = (
+                state.storage.selected_account.clone(),
+                state.storage.selected_queue.clone(),
+            ) {
+                let key = crate::ui::state::StorageCache::messages_key(&acc.name, &queue);
+                let cached = state.storage.messages.contains_key(&key);
+                let in_flight = state.storage.messages_pending.contains(&key);
+                if force || (!cached && !in_flight) {
+                    if force {
+                        state.storage.messages.remove(&key);
+                        state.storage.messages_error.remove(&key);
+                        state.storage.messages_scroll = 0;
+                    }
+                    state.storage.messages_pending.insert(key);
+                    spawn_peek_storage_queue(auth.clone(), acc.name, queue, tx.clone());
                 }
             }
         }
@@ -5482,6 +5576,10 @@ fn dispatch_view(f: &mut ratatui::Frame, area: Rect, state: &AppState, theme: &T
         }
         View::StorageBlobDetail => {
             crate::ui::views::storage_blob_detail::render(f, view_area, state, theme)
+        }
+        View::StorageQueues => crate::ui::views::storage_queues::render(f, view_area, state, theme),
+        View::StorageQueueMessages => {
+            crate::ui::views::storage_queue_messages::render(f, view_area, state, theme)
         }
         View::LogicApps => crate::ui::views::logic_apps::render(f, view_area, state, theme),
         View::LogicAppRuns => crate::ui::views::logic_app_runs::render(f, view_area, state, theme),
@@ -7148,6 +7246,50 @@ fn spawn_load_storage_blobs(
             .await
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::StorageBlobsLoaded { key, result });
+    });
+}
+
+fn spawn_load_storage_queues(
+    auth: AzureAuth,
+    account: crate::azure::storage::StorageAccount,
+    tx: UnboundedSender<AppEvent>,
+) {
+    if auth.is_demo() {
+        let _ = tx.send(AppEvent::StorageQueuesLoaded {
+            account_id: account.id.clone(),
+            result: Ok(crate::azure::demo::storage_queues(&account)),
+        });
+        return;
+    }
+    tokio::spawn(async move {
+        let account_id = account.id.clone();
+        let result = crate::azure::storage::list_queues(&auth, &account)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageQueuesLoaded { account_id, result });
+    });
+}
+
+fn spawn_peek_storage_queue(
+    auth: AzureAuth,
+    account_name: String,
+    queue: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    let key = crate::ui::state::StorageCache::messages_key(&account_name, &queue);
+    if auth.is_demo() {
+        let result = Ok(crate::azure::demo::storage_queue_messages(
+            &account_name,
+            &queue,
+        ));
+        let _ = tx.send(AppEvent::StorageQueueMessagesLoaded { key, result });
+        return;
+    }
+    tokio::spawn(async move {
+        let result = crate::azure::storage::peek_messages(&auth, &account_name, &queue)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageQueueMessagesLoaded { key, result });
     });
 }
 

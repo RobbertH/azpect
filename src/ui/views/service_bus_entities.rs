@@ -22,7 +22,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Tab queues/topics  Enter subs (topics)  / filter  Esc back  r refresh  y yank  o portal  ? help  q quit";
+    "j/k move  Tab queues/topics  Enter subs (topics)  / filter  Esc back  r refresh  y yank  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -390,14 +390,21 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
     let len = current_len(state);
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.service_bus.entities_filter_active
+            || !state.service_bus.entities_filter.value().is_empty())
+    {
+        state.service_bus.entities_filter_active = false;
+        state.service_bus.entities_filter.reset();
+        state.service_bus.entities_cursor = 0;
+        return true;
+    }
+
     if state.service_bus.entities_filter_active {
         match action {
-            Action::Back => {
-                state.service_bus.entities_filter_active = false;
-                state.service_bus.entities_filter.reset();
-                state.service_bus.entities_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.service_bus.entities_filter_active = false;
                 return true;

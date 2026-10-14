@@ -18,7 +18,7 @@ use crate::ui::state::{AppState, LogicAppsCache, LogicContentSource, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter content  Esc back  r refresh  y yank action  o portal  ? help  q quit";
+    "j/k move  Enter content  Esc back  r refresh  y yank action  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Rows shown for the pinned run: the synthetic trigger row (when the run

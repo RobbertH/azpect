@@ -1,8 +1,8 @@
-//! Read-only Azure Storage **blob** inspection (no queues/tables/files).
+//! Read-only Azure Storage **blob** and **queue** inspection (no tables/files).
 //!
 //! ## Contract (do not change without coordinating with the UI lane)
 //!
-//! Four public functions form the surface the UI consumes:
+//! The public functions the UI consumes:
 //!
 //! - [`list_accounts`] — Resource Graph KQL discovery of storage accounts
 //!   across the supplied subscriptions.
@@ -13,6 +13,11 @@
 //! - [`preview_blob`] — Data-plane HEAD + optional ranged GET that yields
 //!   metadata plus a UTF-8 text preview (or a textual marker for binary
 //!   content) for one blob.
+//! - [`list_queues`] — ARM control-plane GET for the queue names, plus a
+//!   data-plane HEAD per queue for its approximate message count (requires
+//!   `Storage Queue Data Reader`; names still list without it).
+//! - [`peek_messages`] — Data-plane *peek* of up to 32 messages at the front
+//!   of one queue. Peek never dequeues or hides a message.
 //!
 //! ## Scope decisions worth flagging
 //!
@@ -26,7 +31,9 @@
 //!   explicitly so the UI can surface it.
 //! - **Pagination**: matches `resources.rs` precedent — we cap at 1000 results
 //!   per call and `tracing::warn!` if the server signals more.
-//! - **Read-only**: no DELETE/PUT codepaths, even stubs.
+//! - **Read-only**: no DELETE/PUT codepaths, even stubs. Queue messages are
+//!   only ever *peeked* (`peekonly=true`) — never received, which would make
+//!   them invisible to the real consumer and bump their dequeue count.
 
 #![allow(dead_code, unused_variables)]
 
@@ -170,6 +177,69 @@ pub struct BlobPreview {
     pub body: BlobPreviewBody,
 }
 
+/// One queue under a storage account.
+#[derive(Clone, Debug)]
+pub struct StorageQueue {
+    pub name: String,
+    /// `x-ms-approximate-messages-count` — never lower than the real count,
+    /// and it includes messages currently invisible (in flight / delayed).
+    /// `None` when the data-plane lookup failed (see
+    /// [`QueueListing::count_error`]).
+    pub approximate_message_count: Option<u64>,
+}
+
+impl StorageQueue {
+    /// Azure Functions (and the WebJobs SDK) move a message that keeps
+    /// failing to `<queue>-poison` — a non-empty one is the queue analogue of
+    /// a Service Bus dead-letter count.
+    pub fn is_poison(&self) -> bool {
+        self.name.ends_with("-poison")
+    }
+}
+
+/// Result of [`list_queues`]: the names come from the control plane, the
+/// counts from the data plane, so the second can fail while the first works.
+#[derive(Clone, Debug, Default)]
+pub struct QueueListing {
+    pub queues: Vec<StorageQueue>,
+    /// Why message counts are missing — typically a 403 because the identity
+    /// has `Reader` but not `Storage Queue Data Reader`.
+    pub count_error: Option<String>,
+}
+
+/// One message returned by [`peek_messages`].
+#[derive(Clone, Debug)]
+pub struct QueueMessage {
+    pub message_id: String,
+    pub insertion_time: Option<DateTime<Utc>>,
+    /// `None` when absent; never-expiring messages carry year 9999.
+    pub expiration_time: Option<DateTime<Utc>>,
+    /// How often the message has been received and not deleted. Above zero
+    /// on a peek means a consumer picked it up and failed (or is slow).
+    pub dequeue_count: u64,
+    /// The body exactly as stored — often base64, see [`Self::decoded_text`].
+    pub text: String,
+}
+
+impl QueueMessage {
+    /// The body base64-decoded, when it is base64 of printable UTF-8. The
+    /// Functions queue binding and the v12 SDKs' default encoder store bodies
+    /// that way, so the raw text is unreadable. `None` → show [`Self::text`].
+    pub fn decoded_text(&self) -> Option<String> {
+        use base64::Engine;
+        let raw = self.text.trim();
+        if raw.is_empty() || !raw.len().is_multiple_of(4) {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        let printable = text
+            .chars()
+            .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'));
+        printable.then_some(text)
+    }
+}
+
 /// Resource Graph KQL for storage accounts. Same body/`subscriptions` envelope
 /// as [`super::resources::KQL`]. The extra `sku` / `properties.*` projections
 /// feed the metadata columns rendered by `views::storage_accounts` — they
@@ -192,6 +262,12 @@ const STORAGE_CONTROL_API_VERSION: &str = "2023-05-01";
 /// Soft cap for `maxresults` on the list-blobs XML call — matches the warn
 /// threshold in `resources.rs`.
 const LIST_BLOBS_MAX_RESULTS: u32 = 1000;
+
+/// The service maximum for `numofmessages` on a peek.
+pub const PEEK_MAX_MESSAGES: u32 = 32;
+
+/// Concurrent data-plane HEADs while filling in queue message counts.
+const QUEUE_COUNT_CONCURRENCY: usize = 8;
 
 /// Page size for the container size walk ([`measure_container`]). The
 /// service maximum — the walk wants as few round trips as possible and never
@@ -648,6 +724,117 @@ pub async fn preview_blob(
     }
 }
 
+/// List the queues under `account` with their approximate message counts.
+///
+/// Names come from the ARM control plane (`Reader` suffices, like
+/// [`list_containers`]). Counts need one data-plane HEAD per queue, which
+/// requires `Storage Queue Data Reader`: the first queue is probed alone and,
+/// if that fails (missing role, firewalled account), the rest are skipped and
+/// the listing carries the reason in [`QueueListing::count_error`] instead of
+/// failing outright.
+pub async fn list_queues(
+    auth: &AzureAuth,
+    account: &StorageAccount,
+) -> anyhow::Result<QueueListing> {
+    use futures::StreamExt;
+
+    let arm = ArmClient::new(auth.clone())?;
+    let path = format!(
+        "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}/queueServices/default/queues",
+        account.subscription_id, account.resource_group, account.name
+    );
+    let resp = arm
+        .get(&path, &[("api-version", STORAGE_CONTROL_API_VERSION)])
+        .await
+        .with_context(|| format!("list queues for storage account '{}'", account.name))?;
+    if resp.get("nextLink").and_then(|v| v.as_str()).is_some() {
+        tracing::warn!(
+            "list-queues for '{}' returned a nextLink; pagination not implemented in v1",
+            account.name
+        );
+    }
+    let mut queues = parse_queues_json(&resp);
+
+    let Some(first) = queues.first() else {
+        return Ok(QueueListing::default());
+    };
+    let data = StorageClient::new(auth.clone())?;
+    let probe = queue_message_count(&data, &account.name, &first.name).await;
+    let count_error = match probe {
+        Ok(n) => {
+            queues[0].approximate_message_count = Some(n);
+            // Owned names: a stream over `&StorageQueue` trips the
+            // higher-ranked lifetime check once this future is `tokio::spawn`ed.
+            let names: Vec<String> = queues[1..].iter().map(|q| q.name.clone()).collect();
+            let (data, account_name) = (&data, account.name.as_str());
+            let rest: Vec<anyhow::Result<u64>> = futures::stream::iter(names)
+                .map(|name| async move { queue_message_count(data, account_name, &name).await })
+                .buffered(QUEUE_COUNT_CONCURRENCY)
+                .collect()
+                .await;
+            let mut first_err = None;
+            for (q, r) in queues[1..].iter_mut().zip(rest) {
+                match r {
+                    Ok(n) => q.approximate_message_count = Some(n),
+                    Err(e) => {
+                        first_err.get_or_insert_with(|| format!("{e:#}"));
+                    }
+                }
+            }
+            first_err
+        }
+        Err(e) => Some(format!("{e:#}")),
+    };
+    Ok(QueueListing {
+        queues,
+        count_error,
+    })
+}
+
+/// Data-plane `HEAD {queue}?comp=metadata`; the count rides in the
+/// `x-ms-approximate-messages-count` response header.
+async fn queue_message_count(
+    client: &StorageClient,
+    account_name: &str,
+    queue: &str,
+) -> anyhow::Result<u64> {
+    let url = format!("https://{account_name}.queue.core.windows.net/{queue}?comp=metadata");
+    let headers = client
+        .head(&url)
+        .await
+        .map_err(|e| classify_queue_error(account_name, e))?;
+    headers
+        .get("x-ms-approximate-messages-count")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("queue '{queue}': response had no approximate message count"))
+}
+
+/// Peek up to [`PEEK_MAX_MESSAGES`] messages from the front of `queue`.
+///
+/// Peek is the read-only primitive: no visibility timeout is set, the dequeue
+/// count is untouched, and the consumer never notices. The flip side is that
+/// it only sees *visible* messages — ones a consumer is processing right now,
+/// or that were enqueued with an initial delay, are skipped.
+pub async fn peek_messages(
+    auth: &AzureAuth,
+    account_name: &str,
+    queue: &str,
+) -> anyhow::Result<Vec<QueueMessage>> {
+    let client = StorageClient::new(auth.clone())?;
+    let url = format!(
+        "https://{account_name}.queue.core.windows.net/{queue}/messages?peekonly=true&numofmessages={PEEK_MAX_MESSAGES}"
+    );
+    let body = client
+        .get_xml(&url)
+        .await
+        .map_err(|e| classify_queue_error(account_name, e))?;
+    if body.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    parse_peek_messages_xml(&body)
+}
+
 // ---------------------------------------------------------------------------
 // Parsers — JSON
 // ---------------------------------------------------------------------------
@@ -783,6 +970,24 @@ pub(crate) fn parse_containers_json(v: &serde_json::Value) -> Vec<BlobContainer>
         .collect()
 }
 
+/// Public for tests — parses the ARM `value: []` response from the
+/// list-queues endpoint. Counts are left `None`; the data plane fills them.
+pub(crate) fn parse_queues_json(v: &serde_json::Value) -> Vec<StorageQueue> {
+    let Some(items) = v.get("value").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(|n| n.as_str())?;
+            (!name.is_empty()).then(|| StorageQueue {
+                name: name.to_string(),
+                approximate_message_count: None,
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Parsers — XML (list_blobs)
 // ---------------------------------------------------------------------------
@@ -865,6 +1070,47 @@ pub(crate) fn parse_list_blobs_page(body: &str) -> anyhow::Result<(Vec<Blob>, Op
 }
 
 // ---------------------------------------------------------------------------
+// Parsers — XML (peek_messages)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct XmlQueueMessagesList {
+    #[serde(rename = "QueueMessage", default)]
+    messages: Vec<XmlQueueMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XmlQueueMessage {
+    #[serde(rename = "MessageId", default)]
+    message_id: String,
+    #[serde(rename = "InsertionTime", default)]
+    insertion_time: Option<String>,
+    #[serde(rename = "ExpirationTime", default)]
+    expiration_time: Option<String>,
+    #[serde(rename = "DequeueCount", default)]
+    dequeue_count: Option<u64>,
+    #[serde(rename = "MessageText", default)]
+    message_text: Option<String>,
+}
+
+/// Public for tests — parses the `QueueMessagesList` body of a peek.
+pub(crate) fn parse_peek_messages_xml(body: &str) -> anyhow::Result<Vec<QueueMessage>> {
+    let parsed: XmlQueueMessagesList =
+        quick_xml::de::from_str(body).map_err(|e| anyhow!("parse peek-messages xml: {e}"))?;
+    Ok(parsed
+        .messages
+        .into_iter()
+        .map(|m| QueueMessage {
+            message_id: m.message_id,
+            insertion_time: m.insertion_time.as_deref().and_then(parse_http_date),
+            expiration_time: m.expiration_time.as_deref().and_then(parse_http_date),
+            dequeue_count: m.dequeue_count.unwrap_or(0),
+            text: m.message_text.unwrap_or_default(),
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Parsers — HEAD headers
 // ---------------------------------------------------------------------------
 
@@ -905,14 +1151,30 @@ fn parse_blob_metadata(headers: &HeaderMap) -> BlobMetadata {
 
 /// Convert raw transport errors into a clearer, role-aware message for the UI.
 fn classify_data_plane_error(account_name: &str, e: anyhow::Error) -> anyhow::Error {
+    classify_service_error(account_name, "blob", "Storage Blob Data Reader", e)
+}
+
+/// [`classify_data_plane_error`] for the queue endpoint.
+fn classify_queue_error(account_name: &str, e: anyhow::Error) -> anyhow::Error {
+    classify_service_error(account_name, "queue", "Storage Queue Data Reader", e)
+}
+
+/// Shared body of the per-service classifiers: `service` is the endpoint's
+/// subdomain (`blob`, `queue`) and `role` the data-plane role it needs.
+fn classify_service_error(
+    account_name: &str,
+    service: &str,
+    role: &str,
+    e: anyhow::Error,
+) -> anyhow::Error {
     let msg = format!("{e}");
     let lower = msg.to_lowercase();
     if msg.contains("azure api error 403") || lower.contains(" 403 ") || lower.contains("forbidden")
     {
         return anyhow!(
-            "403 from storage data plane: identity likely lacks 'Storage Blob Data Reader' role \
-             on account '{account_name}'. Control-plane access (Reader) is not sufficient for blob \
-             enumeration."
+            "403 from storage data plane: identity likely lacks '{role}' role \
+             on account '{account_name}' (or the account's firewall blocks this network). \
+             Control-plane access (Reader) is not sufficient for {service} data."
         );
     }
     if lower.contains("dns")
@@ -921,7 +1183,7 @@ fn classify_data_plane_error(account_name: &str, e: anyhow::Error) -> anyhow::Er
         || lower.contains("name or service not known")
     {
         return anyhow!(
-            "DNS lookup failed for '{account_name}.blob.core.windows.net' — does the storage \
+            "DNS lookup failed for '{account_name}.{service}.core.windows.net' — does the storage \
              account '{account_name}' exist (or is it firewalled to a private endpoint)? \
              underlying error: {msg}"
         );
@@ -1348,6 +1610,111 @@ mod tests {
         );
         let msg = format!("{err}");
         assert!(msg.contains("ghost.blob.core.windows.net"), "got: {msg}");
+    }
+
+    #[test]
+    fn parses_list_queues_json() {
+        // Trimmed ARM response from
+        // `/queueServices/default/queues?api-version=2023-05-01`.
+        let payload = json!({
+            "value": [
+                {
+                    "id": "/subscriptions/s/resourceGroups/r/providers/Microsoft.Storage/storageAccounts/a/queueServices/default/queues/orders",
+                    "name": "orders",
+                    "type": "Microsoft.Storage/storageAccounts/queueServices/queues",
+                    "properties": { "metadata": {} }
+                },
+                { "name": "orders-poison" },
+                { "properties": {} }
+            ]
+        });
+        let queues = parse_queues_json(&payload);
+        let names: Vec<&str> = queues.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, vec!["orders", "orders-poison"]);
+        assert!(queues.iter().all(|q| q.approximate_message_count.is_none()));
+        assert!(!queues[0].is_poison());
+        assert!(queues[1].is_poison());
+        assert!(parse_queues_json(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn parses_peek_messages_xml() {
+        // Shape from the Peek Messages REST API. Bodies are XML-escaped on
+        // the wire; never-expiring messages carry year 9999.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<QueueMessagesList>
+  <QueueMessage>
+    <MessageId>5974b586-0df3-4e2d-ad0c-18e3892bfca2</MessageId>
+    <InsertionTime>Fri, 09 Oct 2026 21:04:30 GMT</InsertionTime>
+    <ExpirationTime>Fri, 16 Oct 2026 21:04:30 GMT</ExpirationTime>
+    <DequeueCount>3</DequeueCount>
+    <MessageText>{&quot;orderId&quot;:42}</MessageText>
+  </QueueMessage>
+  <QueueMessage>
+    <MessageId>b1</MessageId>
+    <InsertionTime>Sat, 10 Oct 2026 08:00:00 GMT</InsertionTime>
+    <ExpirationTime>Fri, 31 Dec 9999 23:59:59 GMT</ExpirationTime>
+    <DequeueCount>0</DequeueCount>
+    <MessageText>aGVsbG8=</MessageText>
+  </QueueMessage>
+</QueueMessagesList>"#;
+        let msgs = parse_peek_messages_xml(xml).expect("parse should succeed");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message_id, "5974b586-0df3-4e2d-ad0c-18e3892bfca2");
+        assert_eq!(msgs[0].dequeue_count, 3);
+        assert_eq!(msgs[0].text, r#"{"orderId":42}"#);
+        assert_eq!(
+            msgs[0].insertion_time.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-10-09T21:04:30+00:00")
+        );
+        assert_eq!(msgs[1].dequeue_count, 0);
+        assert_eq!(
+            msgs[1]
+                .expiration_time
+                .map(|t| t.format("%Y").to_string())
+                .as_deref(),
+            Some("9999")
+        );
+        assert_eq!(msgs[1].text, "aGVsbG8=");
+    }
+
+    #[test]
+    fn parses_empty_peek() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?><QueueMessagesList />"#;
+        assert!(parse_peek_messages_xml(xml).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decodes_base64_message_bodies_only_when_printable() {
+        let msg = |text: &str| QueueMessage {
+            message_id: "m".into(),
+            insertion_time: None,
+            expiration_time: None,
+            dequeue_count: 0,
+            text: text.into(),
+        };
+        // `{"orderId":42}` as the Functions binding stores it.
+        assert_eq!(
+            msg("eyJvcmRlcklkIjo0Mn0=").decoded_text().as_deref(),
+            Some(r#"{"orderId":42}"#)
+        );
+        // Plain JSON / text isn't base64 → shown raw.
+        assert_eq!(msg(r#"{"orderId":42}"#).decoded_text(), None);
+        assert_eq!(msg("hello world").decoded_text(), None);
+        // Valid base64 of non-UTF-8 bytes (or control bytes) stays raw.
+        assert_eq!(msg("test").decoded_text(), None);
+        assert_eq!(msg("AAECAw==").decoded_text(), None);
+        assert_eq!(msg("").decoded_text(), None);
+    }
+
+    #[test]
+    fn classifies_queue_403_with_queue_role_hint() {
+        let err = classify_queue_error("acct", anyhow!("azure api error 403: forbidden"));
+        let msg = format!("{err}");
+        assert!(msg.contains("Storage Queue Data Reader"), "got: {msg}");
+        assert!(!msg.contains("Blob"), "got: {msg}");
+        let err = classify_queue_error("ghost", anyhow!("dns error: failed to lookup address"));
+        assert!(format!("{err}").contains("ghost.queue.core.windows.net"));
     }
 
     #[test]

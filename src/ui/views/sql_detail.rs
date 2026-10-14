@@ -212,8 +212,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
     let mut segments =
         super::window_rung_segments(state.sql.metrics_range.label(), super::WINDOW_RUNGS, None);
     segments.push((
-        "l audit log  u sessions ⚠  r refresh  Esc back  o portal  y yank id  ? help  q quit"
-            .to_string(),
+        "l audit log  u sessions ⚠  r refresh  Esc back  o portal  y yank id  ? help".to_string(),
         false,
     ));
     frame.render_widget(Paragraph::new(super::footer_line(theme, &segments)), area);

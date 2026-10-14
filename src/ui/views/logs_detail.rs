@@ -15,7 +15,7 @@ use crate::ui::events::Action;
 use crate::ui::state::AppState;
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "j/k scroll  y yank  o open in portal  Esc back  q quit";
+const FOOTER_HINT: &str = "j/k scroll  y yank  o open in portal  Esc back";
 const HALF_PAGE: u16 = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

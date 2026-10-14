@@ -26,7 +26,7 @@ const NAVIGATION: Section = (
         ("g g", "go to top"),
         ("G", "go to bottom"),
         ("Ctrl-d / Ctrl-u", "half page down / up"),
-        ("Esc", "back"),
+        ("Esc", "clear search, else back"),
     ],
 );
 
@@ -141,7 +141,7 @@ const APP_GATEWAY: Section = (
 );
 
 const STORAGE: Section = (
-    "Storage (blobs)",
+    "Storage (blobs & queues)",
     &[
         ("S", "enter storage mode"),
         (
@@ -149,20 +149,27 @@ const STORAGE: Section = (
             "drill: accounts > overview > containers > blobs > preview",
         ),
         (
+            "q",
+            "queues (from overview): approx. message counts; Enter peeks up to 32 (read-only)",
+        ),
+        (
             "overview",
             "per-account stats (blobs/files/queues/tables, ~24h lag)",
         ),
         (
             "/",
-            "filter accounts / containers / blobs by name (substring)",
+            "filter accounts / containers / queues / blobs by name (substring)",
         ),
         (
             "c / C",
             "calculate container size — selected / all listed (walks every blob)",
         ),
-        ("j/k", "scroll preview (detail)"),
+        ("j/k", "scroll preview / peeked messages"),
         ("g/G", "preview top / bottom"),
-        ("y", "yank account / container / blob / body"),
+        (
+            "y",
+            "yank account / container / queue / blob / body / messages",
+        ),
         ("o", "open account in Azure Portal"),
         ("r", "refresh current panel"),
     ],
@@ -352,7 +359,7 @@ const GLOBAL: Section = (
         ("y", "yank to clipboard"),
         ("o", "open in Azure Portal"),
         ("?", "toggle help"),
-        ("q", "quit"),
+        (":q", "quit"),
     ],
 );
 
@@ -581,7 +588,7 @@ mod tests {
         assert!(s.contains("TRBC"));
         assert!(!s.contains("Cosmos DB"), "cosmos is noise in SQL mode");
         assert!(!s.contains("Service Bus (control plane)"));
-        assert!(!s.contains("Storage (blobs)"));
+        assert!(!s.contains("Storage (blobs & queues)"));
 
         // From cosmos: the reverse.
         let s = render_from(Some(View::CosmosDatabases));
@@ -664,7 +671,7 @@ mod tests {
     fn handle_does_not_bounce_back_into_help() {
         // Simulates: start in List -> ? to Help -> key to dismiss.
         // After dismiss, the stack must not contain Help so a subsequent
-        // Esc/q from List does not warp the user back into Help.
+        // Esc from List does not warp the user back into Help.
         let mut state = AppState::new(Config::default());
         state.view = View::Help;
         state.view_stack.push(View::List);

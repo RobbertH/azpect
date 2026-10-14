@@ -17,7 +17,7 @@ use crate::ui::state::{subscription_display_name, AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter items  l access log  / filter  Esc back  r refresh  y yank id  ? help  q quit";
+    "j/k move  Enter items  l access log  / filter  Esc back  r refresh  y yank id  ? help";
 const HALF_PAGE: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -234,14 +234,21 @@ fn render_footer(frame: &mut Frame, area: Rect, theme: &Theme) {
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let len = state.key_vault.filtered_vaults().len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.key_vault.vaults_filter_active
+            || !state.key_vault.vaults_filter.value().is_empty())
+    {
+        state.key_vault.vaults_filter_active = false;
+        state.key_vault.vaults_filter.reset();
+        state.key_vault.vaults_cursor = 0;
+        return true;
+    }
+
     if state.key_vault.vaults_filter_active {
         match action {
-            Action::Back => {
-                state.key_vault.vaults_filter_active = false;
-                state.key_vault.vaults_filter.reset();
-                state.key_vault.vaults_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.key_vault.vaults_filter_active = false;
                 return true;

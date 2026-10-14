@@ -3,8 +3,9 @@
 //! overview" panel.
 //!
 //! Sits between [`View::StorageAccounts`] and [`View::StorageContainers`] —
-//! Enter from accounts opens this view; Enter here opens the containers list.
-//! Esc walks back to accounts via the semantic-parent chain.
+//! Enter from accounts opens this view; Enter here opens the containers list
+//! and `q` the queues list. Esc walks back to accounts via the
+//! semantic-parent chain.
 //!
 //! Data sources: five concurrent Azure Monitor metrics calls (account scope
 //! plus blob / file / queue / table services). The same data the portal shows,
@@ -26,7 +27,7 @@ use crate::ui::events::Action;
 use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
-const FOOTER_HINT: &str = "Enter containers  Esc back  r refresh  ? help  q quit";
+const FOOTER_HINT: &str = "Enter containers  q queues  Esc back  r refresh  ? help";
 const LAG_NOTE: &str = "Data updated 2-4× daily by Azure Monitor, may lag up to 24h.";
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -334,15 +335,23 @@ pub(crate) fn human_count(n: u64) -> String {
 
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     // Most actions fall through to the global handler (Refresh, Yank, Browser,
-    // Back, Help, etc.). The only thing this view consumes locally is the
-    // forward-drill Enter, which transitions to the containers list while
-    // keeping the pinned account intact.
+    // Back, Help, etc.). The only things this view consumes locally are the
+    // forward drills — Enter to the containers list, `q` to the queues list —
+    // both keeping the pinned account intact.
     match action {
         Action::OpenSelected => {
             if state.storage.selected_account.is_some() {
                 state.storage.containers_cursor = 0;
                 state.storage.containers_filter = tui_input::Input::default();
                 state.view = View::StorageContainers;
+            }
+            true
+        }
+        Action::OpenQueues => {
+            if state.storage.selected_account.is_some() {
+                state.storage.queues_cursor = 0;
+                state.storage.queues_filter = tui_input::Input::default();
+                state.view = View::StorageQueues;
             }
             true
         }
@@ -552,6 +561,17 @@ mod tests {
         );
         // Drilling in must not carry a stale containers filter along.
         assert_eq!(state.storage.containers_filter.value(), "");
+    }
+
+    #[test]
+    fn shift_q_drills_into_queues() {
+        let mut state = fixture();
+        state.storage.queues_filter = tui_input::Input::default().with_value("stale".to_string());
+        state.storage.queues_cursor = 4;
+        assert!(handle(Action::OpenQueues, &mut state));
+        assert_eq!(state.view, View::StorageQueues);
+        assert_eq!(state.storage.queues_filter.value(), "");
+        assert_eq!(state.storage.queues_cursor, 0);
     }
 
     #[test]

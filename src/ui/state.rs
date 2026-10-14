@@ -116,6 +116,8 @@ impl Category {
                     | View::StorageContainers
                     | View::StorageBlobs
                     | View::StorageBlobDetail
+                    | View::StorageQueues
+                    | View::StorageQueueMessages
                     | View::StorageAccessLogs,
             ) | (
                 Category::Registries,
@@ -304,8 +306,9 @@ pub enum View {
     /// account: aggregate container / blob / file-share / queue / table counts
     /// and capacity sourced from Azure Monitor metrics. Sits between
     /// `StorageAccounts` and `StorageContainers` in the drill chain — Enter
-    /// here opens the containers list. Stats are daily-resolution with a
-    /// reporting lag of up to ~24h (same data the portal shows).
+    /// here opens the containers list, `q` the queues list. Stats are
+    /// daily-resolution with a reporting lag of up to ~24h (same data the
+    /// portal shows).
     StorageAccountOverview,
     /// List of blob containers under the selected storage account. Opened with
     /// Enter from `StorageAccountOverview`.
@@ -317,6 +320,13 @@ pub enum View {
     /// Metadata + bounded body preview for the selected blob. Opened with Enter
     /// from `StorageBlobs`.
     StorageBlobDetail,
+    /// Queues under the selected storage account with their approximate
+    /// message counts. Opened with `q` from `StorageAccountOverview`. Names
+    /// are control-plane; counts need `Storage Queue Data Reader`.
+    StorageQueues,
+    /// Read-only peek of up to 32 messages at the front of the selected
+    /// queue. Opened with Enter from `StorageQueues`.
+    StorageQueueMessages,
     /// Access (audit) log for the pinned storage account: who read / wrote
     /// which blob, when, from where — the `StorageBlobLogs` rows the blob
     /// service's diagnostic setting forwards to Log Analytics. Opened with
@@ -946,6 +956,27 @@ pub struct StorageCache {
     pub blob_preview_error: HashMap<String, String>,
     pub blob_preview_scroll: u16,
 
+    /// Queues (with approximate message counts) keyed by storage account
+    /// resource id. A missing-count reason rides inside the listing.
+    pub queues: HashMap<String, crate::azure::storage::QueueListing>,
+    pub queues_pending: HashSet<String>,
+    pub queues_error: HashMap<String, String>,
+    pub queues_cursor: usize,
+    /// Persisted table scroll offset — see `accounts_view_top`.
+    pub queues_view_top: Cell<usize>,
+    /// Client-side case-insensitive substring filter on the queue name —
+    /// same shape as `containers_filter`.
+    pub queues_filter: Input,
+    pub queues_filter_active: bool,
+    /// Pinned queue name the user drilled into.
+    pub selected_queue: Option<String>,
+
+    /// Peeked messages keyed by [`Self::messages_key`].
+    pub messages: HashMap<String, Vec<crate::azure::storage::QueueMessage>>,
+    pub messages_pending: HashSet<String>,
+    pub messages_error: HashMap<String, String>,
+    pub messages_scroll: u16,
+
     // -- access-logs view (`l` on an account or container) -----------------
     // Mirrors `KeyVaultCache` / `RegistryCache`'s access-log block
     // field-for-field; see the doc comments there for the invariants.
@@ -992,6 +1023,11 @@ impl StorageCache {
         format!("{account}/{container}")
     }
 
+    /// Cache key for the peeked-messages map.
+    pub fn messages_key(account: &str, queue: &str) -> String {
+        format!("{account}/{queue}")
+    }
+
     /// Cache key for the blob preview map.
     pub fn blob_preview_key(account: &str, container: &str, blob: &str) -> String {
         format!("{account}/{container}/{blob}")
@@ -1024,6 +1060,20 @@ impl StorageCache {
             Some(rows) => rows
                 .iter()
                 .filter(|c| needle.is_empty() || c.name.to_lowercase().contains(&needle))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Apply `queues_filter` to the queues under `account_id` — the same
+    /// case-insensitive name match as [`Self::filtered_containers`].
+    pub fn filtered_queues(&self, account_id: &str) -> Vec<&crate::azure::storage::StorageQueue> {
+        let needle = self.queues_filter.value().to_lowercase();
+        match self.queues.get(account_id) {
+            Some(listing) => listing
+                .queues
+                .iter()
+                .filter(|q| needle.is_empty() || q.name.to_lowercase().contains(&needle))
                 .collect(),
             None => Vec::new(),
         }

@@ -20,7 +20,7 @@ use crate::ui::state::{AppState, View};
 use crate::ui::theme::Theme;
 
 const FOOTER_HINT: &str =
-    "j/k move  Enter/l sign-in log  / filter  Esc back  r refresh  y yank app id  o portal  ? help  q quit";
+    "j/k move  Enter/l sign-in log  / filter  Esc back  r refresh  y yank app id  o portal  ? help";
 const HALF_PAGE: usize = 10;
 
 /// Days after which a last sign-in stops counting as "recent" and starts
@@ -282,14 +282,20 @@ fn open_sign_ins(state: &mut AppState) {
 pub fn handle(action: Action, state: &mut AppState) -> bool {
     let len = state.app_reg.filtered_apps().len();
 
+    // Esc clears the filter whether the box is still focused or it was
+    // applied then defocused (Enter / Down); only a clear list lets Esc
+    // fall through to navigation. Mirrors the resource list.
+    if matches!(action, Action::Back)
+        && (state.app_reg.apps_filter_active || !state.app_reg.apps_filter.value().is_empty())
+    {
+        state.app_reg.apps_filter_active = false;
+        state.app_reg.apps_filter.reset();
+        state.app_reg.apps_cursor = 0;
+        return true;
+    }
+
     if state.app_reg.apps_filter_active {
         match action {
-            Action::Back => {
-                state.app_reg.apps_filter_active = false;
-                state.app_reg.apps_filter.reset();
-                state.app_reg.apps_cursor = 0;
-                return true;
-            }
             Action::OpenSelected => {
                 state.app_reg.apps_filter_active = false;
                 return true;
