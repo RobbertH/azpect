@@ -1,5 +1,5 @@
-//! Persistent user state: favorites, last subscription, time-window default,
-//! theme. Lives under `${XDG_CONFIG_HOME:-~/.config}/azpect/config.toml`.
+//! Persistent user state: favorites, last subscription, last category,
+//! time-window default, theme. Lives under `${XDG_CONFIG_HOME:-~/.config}/azpect/config.toml`.
 //!
 //! The file is created on first run. Missing or unparseable files yield
 //! [`Config::default`] rather than an error so the TUI always boots — but an
@@ -26,6 +26,14 @@ pub struct Config {
     /// present in the loaded set.
     #[serde(default)]
     pub last_resource_id: Option<String>,
+
+    /// Top-level category the user was inside when they last quit, by its
+    /// canonical palette name (`"apis"`, `"storage"`, `"registries"`, …).
+    /// The TUI lands on that category's root list at launch instead of
+    /// always starting on apis. Unknown / missing values fall back to apis.
+    /// See `ui::state::Category::config_name`.
+    #[serde(default)]
+    pub last_category: Option<String>,
 
     /// Full Azure resource IDs (`/subscriptions/.../resourceGroups/.../providers/...`).
     /// Stored as IDs because they are stable and globally unique.
@@ -78,6 +86,7 @@ impl Default for Config {
         Self {
             last_subscription_id: None,
             last_resource_id: None,
+            last_category: None,
             favorites: Vec::new(),
             default_window: TimeRange::default(),
             theme: default_theme(),
@@ -227,6 +236,7 @@ mod tests {
 
         assert_eq!(parsed.last_subscription_id, cfg.last_subscription_id);
         assert_eq!(parsed.last_resource_id, cfg.last_resource_id);
+        assert_eq!(parsed.last_category, cfg.last_category);
         assert_eq!(parsed.favorites, cfg.favorites);
         assert_eq!(parsed.default_window, cfg.default_window);
         assert_eq!(parsed.theme, cfg.theme);

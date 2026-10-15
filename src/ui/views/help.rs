@@ -164,6 +164,18 @@ const STORAGE: Section = (
             "c / C",
             "calculate container size — selected / all listed (walks every blob)",
         ),
+        (
+            "Enter / h",
+            "blobs: open folder / up one level (Esc also goes up before leaving)",
+        ),
+        (
+            "Tab / S-Tab / i",
+            "blobs: sort by next / previous column, invert direction",
+        ),
+        (
+            "G / scroll",
+            "blobs: reaching the bottom loads the next 1000 rows",
+        ),
         ("j/k", "scroll preview / peeked messages"),
         ("g/G", "preview top / bottom"),
         (

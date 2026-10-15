@@ -203,6 +203,10 @@ pub async fn run(auth: AzureAuth, cfg: Config) -> anyhow::Result<()> {
     // Persist config; non-fatal. Demo sessions never write — favorites or a
     // last-resource id from the mock tenant must not leak into the real config.
     if !auth.is_demo() {
+        // Remember which top-level section the user was in so the next launch
+        // lands there. `last_category` (not `view`) so quitting from the Help
+        // overlay or the subscription picker still records the real section.
+        state.config.last_category = Some(state.last_category.config_name().to_string());
         if let Err(e) = crate::config::save(&state.config) {
             tracing::warn!("failed to save config: {e:#}");
         }
@@ -897,18 +901,12 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::StorageBlobsLoaded { key, result } => {
-                state.storage.blobs_pending.remove(&key);
-                match result {
-                    Ok(blobs) => {
-                        state.storage.blobs_error.remove(&key);
-                        state.storage.blobs.insert(key, blobs);
-                    }
-                    Err(e) => {
-                        state.storage.blobs.remove(&key);
-                        state.storage.blobs_error.insert(key, e);
-                    }
-                }
+            AppEvent::StorageBlobsLoaded {
+                key,
+                from_marker,
+                result,
+            } => {
+                apply_storage_blobs_page(state, key, from_marker, result);
             }
             AppEvent::StorageBlobPreviewLoaded { key, result } => {
                 state.storage.blob_preview_pending.remove(&key);
@@ -4148,6 +4146,15 @@ fn after_action(
         Action::Back if state.view == View::SqlAuditPrincipals => {
             kick_off_loads_for_view(state, auth, tx, /* force */ false);
         }
+        // Folder moves inside the blobs view (`h` / Esc up, `l`-less Right
+        // down) land on a prefix that may not be cached yet — kick its
+        // (debounced) first page. Enter on a folder rides the generic
+        // OpenSelected arm below.
+        Action::MoveLeft | Action::MoveRight | Action::Back
+            if state.view == View::StorageBlobs =>
+        {
+            kick_off_loads_for_view(state, auth, tx, /* force */ false);
+        }
         // Opening logs always starts a fresh newest-end fetch; force past the
         // global `logs.loading` debounce so switching to resource B while
         // resource A's fetch is still in flight doesn't leave B's view empty
@@ -4187,6 +4194,10 @@ fn after_action(
     // Cosmos items: same flag-and-drain for the scroll-near-bottom page.
     if std::mem::take(&mut state.cosmos.items_fetch_more) {
         fetch_more_cosmos_items(state, auth, tx);
+    }
+    // Storage blobs: same flag-and-drain for the next listing page.
+    if std::mem::take(&mut state.storage.blobs_fetch_more) {
+        fetch_more_storage_blobs(state, auth, tx);
     }
 }
 
@@ -4723,16 +4734,31 @@ fn kick_off_loads_for_view(
                 state.storage.selected_account.clone(),
                 state.storage.selected_container.clone(),
             ) {
-                let key = crate::ui::state::StorageCache::blobs_key(&acc.name, &container);
+                let prefix = state.storage.blobs_prefix.clone();
+                let key = crate::ui::state::StorageCache::blob_listing_key(
+                    &acc.name, &container, &prefix,
+                );
                 let cached = state.storage.blobs.contains_key(&key);
                 let in_flight = state.storage.blobs_pending.contains(&key);
                 if force || (!cached && !in_flight) {
                     if force {
+                        // A refresh restarts the folder from its first page;
+                        // a continuation page still in flight is for the
+                        // dropped listing and is discarded on arrival.
                         state.storage.blobs.remove(&key);
                         state.storage.blobs_error.remove(&key);
+                        state.storage.blobs_loading_more.remove(&key);
+                        state.storage.blobs_more_error.remove(&key);
                     }
                     state.storage.blobs_pending.insert(key);
-                    spawn_load_storage_blobs(auth.clone(), acc.name, container, tx.clone());
+                    spawn_load_storage_blobs(
+                        auth.clone(),
+                        acc.name,
+                        container,
+                        prefix,
+                        None,
+                        tx.clone(),
+                    );
                 }
             }
         }
@@ -7226,27 +7252,135 @@ fn spawn_load_storage_overview(
     });
 }
 
+/// Fetch one page of one folder level (`prefix`) of a container. `marker`
+/// `None` is the folder's first page; `Some` continues the cached listing
+/// from where the server left off.
 fn spawn_load_storage_blobs(
     auth: AzureAuth,
     account_name: String,
     container: String,
+    prefix: String,
+    marker: Option<String>,
     tx: UnboundedSender<AppEvent>,
 ) {
+    let key = crate::ui::state::StorageCache::blob_listing_key(&account_name, &container, &prefix);
     if auth.is_demo() {
-        let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
-        let result = Ok(crate::azure::demo::storage_blobs(&account_name, &container));
-        let _ = tx.send(AppEvent::StorageBlobsLoaded { key, result });
+        let result = Ok(crate::azure::demo::storage_blobs(
+            &account_name,
+            &container,
+            &prefix,
+            marker.as_deref(),
+        ));
+        let _ = tx.send(AppEvent::StorageBlobsLoaded {
+            key,
+            from_marker: marker,
+            result,
+        });
         return;
     }
     tokio::spawn(async move {
-        let key = crate::ui::state::StorageCache::blobs_key(&account_name, &container);
-        // Filtering is now client-side, so we always fetch the full container
-        // and pass `None` as the server-side prefix to `list_blobs`.
-        let result = crate::azure::storage::list_blobs(&auth, &account_name, &container, None)
-            .await
-            .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::StorageBlobsLoaded { key, result });
+        let result = crate::azure::storage::list_blobs(
+            &auth,
+            &account_name,
+            &container,
+            &prefix,
+            marker.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::StorageBlobsLoaded {
+            key,
+            from_marker: marker,
+            result,
+        });
     });
+}
+
+/// Land a blobs page. A first page (`from_marker == None`) replaces the
+/// folder's cache entry; a continuation page is appended only when the
+/// cached listing still expects the marker it was fetched from — a refresh
+/// in between replaced the buffer, and splicing the stale page onto it would
+/// duplicate rows. Mirrors `apply_cosmos_items_page`.
+fn apply_storage_blobs_page(
+    state: &mut AppState,
+    key: String,
+    from_marker: Option<String>,
+    result: Result<crate::azure::storage::BlobPage, String>,
+) {
+    let Some(marker) = from_marker else {
+        state.storage.blobs_pending.remove(&key);
+        match result {
+            Ok(page) => {
+                state.storage.blobs_error.remove(&key);
+                state.storage.blobs.insert(key, page);
+            }
+            Err(e) => {
+                state.storage.blobs.remove(&key);
+                state.storage.blobs_error.insert(key, e);
+            }
+        }
+        return;
+    };
+    let Some(listing) = state
+        .storage
+        .blobs
+        .get_mut(&key)
+        .filter(|p| p.next_marker.as_deref() == Some(marker.as_str()))
+    else {
+        return;
+    };
+    state.storage.blobs_loading_more.remove(&key);
+    match result {
+        Ok(page) => {
+            state.storage.blobs_more_error.remove(&key);
+            listing.prefixes.extend(page.prefixes);
+            listing.blobs.extend(page.blobs);
+            listing.next_marker = page.next_marker;
+        }
+        Err(e) => {
+            state.storage.blobs_more_error.insert(key, e);
+        }
+    }
+}
+
+/// Spawn the next page of the folder the blobs view is showing, continuing
+/// from the cached listing's marker. No-op when nothing more exists or a
+/// fetch (first page or next) is already in flight.
+fn fetch_more_storage_blobs(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let (Some(acc), Some(container)) = (
+        state.storage.selected_account.clone(),
+        state.storage.selected_container.clone(),
+    ) else {
+        return;
+    };
+    let prefix = state.storage.blobs_prefix.clone();
+    let key = crate::ui::state::StorageCache::blob_listing_key(&acc.name, &container, &prefix);
+    if state.storage.blobs_pending.contains(&key) || state.storage.blobs_loading_more.contains(&key)
+    {
+        return;
+    }
+    let Some(marker) = state
+        .storage
+        .blobs
+        .get(&key)
+        .and_then(|p| p.next_marker.clone())
+    else {
+        return;
+    };
+    state.storage.blobs_more_error.remove(&key);
+    state.storage.blobs_loading_more.insert(key);
+    spawn_load_storage_blobs(
+        auth.clone(),
+        acc.name,
+        container,
+        prefix,
+        Some(marker),
+        tx.clone(),
+    );
 }
 
 fn spawn_load_storage_queues(
@@ -8498,6 +8632,139 @@ mod tests {
             40,
             "stale page ignored"
         );
+    }
+
+    fn storage_blobs_demo_state() -> AppState {
+        let mut state = fresh_state();
+        let account = crate::azure::demo::storage_accounts(&[]).remove(0);
+        state.storage.selected_account = Some(account);
+        state.storage.selected_container = Some("raw-events".into());
+        state.view = View::StorageBlobs;
+        state
+    }
+
+    fn recv_blobs_page(state: &mut AppState, rx: &mut mpsc::UnboundedReceiver<AppEvent>) {
+        loop {
+            if let AppEvent::StorageBlobsLoaded {
+                key,
+                from_marker,
+                result,
+            } = rx.try_recv().expect("blobs event")
+            {
+                return apply_storage_blobs_page(state, key, from_marker, result);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_blobs_folder_walk_and_page_through_until_exhausted() {
+        // Root → events/ → 2026/ → 06/ → 09/: each level is its own cached
+        // listing, the deepest one is wider than a page and streams in.
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = storage_blobs_demo_state();
+        let acc = state.storage.selected_account.clone().unwrap().name;
+        let key = |prefix: &str| {
+            crate::ui::state::StorageCache::blob_listing_key(&acc, "raw-events", prefix)
+        };
+
+        kick_off_loads_for_view(&mut state, &auth, &tx, false);
+        recv_blobs_page(&mut state, &mut rx);
+        let root = &state.storage.blobs[&key("")];
+        assert_eq!(root.prefixes, vec!["events/", "schema/"]);
+        assert_eq!(root.blobs.len(), 1, "README.md");
+        assert!(root.next_marker.is_none());
+
+        // Enter on `events/` (cursor 0) descends; after_action kicks the
+        // folder's first page.
+        apply_action(Action::OpenSelected, &mut state, &auth, &tx);
+        assert_eq!(state.storage.blobs_prefix, "events/");
+        recv_blobs_page(&mut state, &mut rx);
+        for _ in 0..2 {
+            apply_action(Action::OpenSelected, &mut state, &auth, &tx);
+            recv_blobs_page(&mut state, &mut rx);
+        }
+        assert_eq!(state.storage.blobs_prefix, "events/2026/06/");
+        let june = &state.storage.blobs[&key("events/2026/06/")];
+        assert_eq!(
+            june.prefixes,
+            vec![
+                "events/2026/06/07/",
+                "events/2026/06/08/",
+                "events/2026/06/09/"
+            ]
+        );
+
+        // Into the wide day folder: 1200 blobs, first page is 1000.
+        state.storage.blobs_cursor = 2;
+        apply_action(Action::OpenSelected, &mut state, &auth, &tx);
+        recv_blobs_page(&mut state, &mut rx);
+        let day = key("events/2026/06/09/");
+        assert_eq!(state.storage.blobs[&day].blobs.len(), 1000);
+        assert!(state.storage.blobs[&day].next_marker.is_some());
+
+        // `G` near the end raises the flag, after_action drains it.
+        apply_action(Action::GotoBottom, &mut state, &auth, &tx);
+        assert!(state.storage.blobs_loading_more.contains(&day));
+        recv_blobs_page(&mut state, &mut rx);
+        assert_eq!(state.storage.blobs[&day].blobs.len(), 1200);
+        assert!(state.storage.blobs[&day].next_marker.is_none());
+        assert!(state.storage.blobs_loading_more.is_empty());
+
+        // Exhausted: another `G` fetches nothing.
+        apply_action(Action::GotoBottom, &mut state, &auth, &tx);
+        assert!(rx.try_recv().is_err());
+
+        // `h` climbs back out onto the folder we came from, served from cache.
+        apply_action(Action::MoveLeft, &mut state, &auth, &tx);
+        assert_eq!(state.storage.blobs_prefix, "events/2026/06/");
+        assert_eq!(state.storage.blobs_cursor, 2);
+        assert!(rx.try_recv().is_err(), "parent listing is cached");
+    }
+
+    #[test]
+    fn storage_blobs_stale_next_page_is_dropped_after_refresh() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = storage_blobs_demo_state();
+        state.storage.blobs_prefix = "events/2026/06/09/".into();
+        let acc = state.storage.selected_account.clone().unwrap().name;
+        let key = crate::ui::state::StorageCache::blob_listing_key(
+            &acc,
+            "raw-events",
+            "events/2026/06/09/",
+        );
+
+        kick_off_loads_for_view(&mut state, &auth, &tx, false);
+        recv_blobs_page(&mut state, &mut rx);
+        fetch_more_storage_blobs(&mut state, &auth, &tx);
+        recv_blobs_page(&mut state, &mut rx);
+        assert_eq!(state.storage.blobs[&key].blobs.len(), 1200);
+
+        // A page continuing from a marker the listing no longer ends at.
+        apply_storage_blobs_page(
+            &mut state,
+            key.clone(),
+            Some("1000".into()),
+            Ok(crate::azure::demo::storage_blobs(
+                &acc,
+                "raw-events",
+                "events/2026/06/09/",
+                Some("1000"),
+            )),
+        );
+        assert_eq!(
+            state.storage.blobs[&key].blobs.len(),
+            1200,
+            "stale page ignored"
+        );
+
+        // `r` restarts the folder from page one and drops the more-state.
+        state.storage.blobs_loading_more.insert(key.clone());
+        kick_off_loads_for_view(&mut state, &auth, &tx, true);
+        assert!(!state.storage.blobs_loading_more.contains(&key));
+        recv_blobs_page(&mut state, &mut rx);
+        assert_eq!(state.storage.blobs[&key].blobs.len(), 1000);
     }
 
     #[test]

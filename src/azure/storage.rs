@@ -8,8 +8,10 @@
 //!   across the supplied subscriptions.
 //! - [`list_containers`] — ARM control-plane GET that lists blob containers
 //!   for one account (no data-plane permissions required).
-//! - [`list_blobs`] — Data-plane XML enumeration of blobs in a container
-//!   (requires `Storage Blob Data Reader` on the account).
+//! - [`list_blobs`] — Data-plane XML enumeration of one "folder" level of a
+//!   container (delimiter listing: virtual directories + the blobs directly
+//!   under the prefix), one page at a time (requires `Storage Blob Data
+//!   Reader` on the account).
 //! - [`preview_blob`] — Data-plane HEAD + optional ranged GET that yields
 //!   metadata plus a UTF-8 text preview (or a textual marker for binary
 //!   content) for one blob.
@@ -94,6 +96,20 @@ pub struct Blob {
     pub last_modified: Option<DateTime<Utc>>,
     /// `"BlockBlob"`, `"PageBlob"`, or `"AppendBlob"`.
     pub blob_type: String,
+}
+
+/// One page of a delimiter listing — what [`list_blobs`] returns.
+///
+/// `prefixes` are the virtual directories directly under the requested
+/// prefix (full prefix including the trailing `/`, e.g. `events/2026/`);
+/// `blobs` are the blobs directly under it (full names, as always). A
+/// `Some(next_marker)` means the server has more rows for the same prefix —
+/// pass it back to [`list_blobs`] to continue.
+#[derive(Clone, Debug, Default)]
+pub struct BlobPage {
+    pub prefixes: Vec<String>,
+    pub blobs: Vec<Blob>,
+    pub next_marker: Option<String>,
 }
 
 /// Metadata returned by HEAD on a single blob.
@@ -259,9 +275,10 @@ Resources
 /// API version used for the ARM control-plane container listing call.
 const STORAGE_CONTROL_API_VERSION: &str = "2023-05-01";
 
-/// Soft cap for `maxresults` on the list-blobs XML call — matches the warn
-/// threshold in `resources.rs`.
-const LIST_BLOBS_MAX_RESULTS: u32 = 1000;
+/// `maxresults` per list-blobs page for the blobs view. The view follows the
+/// continuation marker on demand (scroll to the bottom) rather than walking
+/// the whole prefix up front, so a page is a UI unit, not a cap.
+pub const LIST_BLOBS_PAGE_SIZE: u32 = 1000;
 
 /// The service maximum for `numofmessages` on a peek.
 pub const PEEK_MAX_MESSAGES: u32 = 32;
@@ -583,25 +600,33 @@ pub(crate) fn parse_overview_metrics_response(
     out
 }
 
-/// Enumerate blobs in `container` for `account_name` via the data plane.
+/// List one folder level of `container` for `account_name` via the data
+/// plane: a `delimiter=/` listing under `prefix` (`""` for the container
+/// root), which yields the virtual directories directly below it plus the
+/// blobs directly below it.
 ///
-/// Pagination: we cap `maxresults` at [`LIST_BLOBS_MAX_RESULTS`] and warn (but
-/// do **not** error) if the server signals a `NextMarker` — matching the
-/// `resources.rs` truncation behaviour.
+/// Pagination: one page of [`LIST_BLOBS_PAGE_SIZE`] rows per call. When the
+/// result carries a `next_marker`, call again with it as `marker` to fetch
+/// the following page for the same prefix. Azure counts prefixes and blobs
+/// together towards `maxresults`.
 pub async fn list_blobs(
     auth: &AzureAuth,
     account_name: &str,
     container: &str,
-    prefix: Option<&str>,
-) -> anyhow::Result<Vec<Blob>> {
+    prefix: &str,
+    marker: Option<&str>,
+) -> anyhow::Result<BlobPage> {
     let client = StorageClient::new(auth.clone())?;
     let mut url = format!(
-        "https://{account_name}.blob.core.windows.net/{container}?restype=container&comp=list&maxresults={}",
-        LIST_BLOBS_MAX_RESULTS
+        "https://{account_name}.blob.core.windows.net/{container}?restype=container&comp=list&delimiter=%2F&maxresults={LIST_BLOBS_PAGE_SIZE}"
     );
-    if let Some(p) = prefix.filter(|s| !s.is_empty()) {
+    if !prefix.is_empty() {
         url.push_str("&prefix=");
-        url.push_str(&urlencode(p));
+        url.push_str(&urlencode(prefix));
+    }
+    if let Some(m) = marker.filter(|m| !m.is_empty()) {
+        url.push_str("&marker=");
+        url.push_str(&urlencode(m));
     }
 
     let body = client
@@ -610,10 +635,10 @@ pub async fn list_blobs(
         .map_err(|e| classify_data_plane_error(account_name, e))?;
 
     if body.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(BlobPage::default());
     }
 
-    parse_list_blobs_xml(&body)
+    parse_list_blobs_page(&body)
 }
 
 /// Walk the *entire* blob listing of `container` page by page and sum it —
@@ -651,10 +676,10 @@ pub async fn measure_container(
         if body.trim().is_empty() {
             break;
         }
-        let (page, next) = parse_list_blobs_page(&body)?;
-        total.absorb(&page);
+        let page = parse_list_blobs_page(&body)?;
+        total.absorb(&page.blobs);
         on_page(total);
-        match next {
+        match page.next_marker {
             Some(m) => marker = Some(m),
             None => break,
         }
@@ -1004,6 +1029,15 @@ struct XmlEnumerationResults {
 struct XmlBlobs {
     #[serde(rename = "Blob", default)]
     blob: Vec<XmlBlob>,
+    /// Virtual directories — only present on `delimiter` listings.
+    #[serde(rename = "BlobPrefix", default)]
+    blob_prefix: Vec<XmlBlobPrefix>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XmlBlobPrefix {
+    #[serde(rename = "Name")]
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1026,27 +1060,20 @@ struct XmlBlobProperties {
     blob_type: Option<String>,
 }
 
-/// Single-page listing for the blobs view: parses the page and warns (but
-/// does not follow) when the server signals more. Public for tests.
-pub(crate) fn parse_list_blobs_xml(body: &str) -> anyhow::Result<Vec<Blob>> {
-    let (blobs, next_marker) = parse_list_blobs_page(body)?;
-    if next_marker.is_some() {
-        tracing::warn!(
-            "list-blobs returned NextMarker (more than {} blobs); pagination not implemented in v1",
-            LIST_BLOBS_MAX_RESULTS
-        );
-    }
-    Ok(blobs)
-}
-
-/// Parse one list-blobs page into its rows plus the continuation marker
-/// (`None` when this was the last page). The size walk follows the marker;
-/// the blobs view ignores it.
-pub(crate) fn parse_list_blobs_page(body: &str) -> anyhow::Result<(Vec<Blob>, Option<String>)> {
+/// Parse one list-blobs page into its virtual directories, its rows and the
+/// continuation marker (`None` when this was the last page). Public for
+/// tests.
+pub(crate) fn parse_list_blobs_page(body: &str) -> anyhow::Result<BlobPage> {
     let parsed: XmlEnumerationResults =
         quick_xml::de::from_str(body).map_err(|e| anyhow!("parse list-blobs xml: {e}"))?;
 
     let next_marker = Some(parsed.next_marker).filter(|m| !m.is_empty());
+    let prefixes = parsed
+        .blobs
+        .blob_prefix
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
     let blobs = parsed
         .blobs
         .blob
@@ -1066,7 +1093,11 @@ pub(crate) fn parse_list_blobs_page(body: &str) -> anyhow::Result<(Vec<Blob>, Op
             }
         })
         .collect();
-    Ok((blobs, next_marker))
+    Ok(BlobPage {
+        prefixes,
+        blobs,
+        next_marker,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,7 +1509,10 @@ mod tests {
   </Blobs>
   <NextMarker />
 </EnumerationResults>"#;
-        let blobs = parse_list_blobs_xml(xml).expect("parse should succeed");
+        let page = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert!(page.prefixes.is_empty());
+        assert!(page.next_marker.is_none());
+        let blobs = page.blobs;
         assert_eq!(blobs.len(), 2);
 
         assert_eq!(blobs[0].name, "app/2026/05/18.log");
@@ -1499,15 +1533,42 @@ mod tests {
   <Blobs />
   <NextMarker />
 </EnumerationResults>"#;
-        let blobs = parse_list_blobs_xml(xml).expect("parse should succeed");
-        assert!(blobs.is_empty());
+        let page = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert!(page.blobs.is_empty());
+        assert!(page.prefixes.is_empty());
+    }
+
+    #[test]
+    fn parses_delimiter_listing_prefixes_and_blobs() {
+        // A `delimiter=/` listing under `app/` yields the sub-directories as
+        // `BlobPrefix` entries (full prefix, trailing slash) next to the
+        // blobs directly under the prefix. The element order on the wire is
+        // interleaved by name; the parser keeps the two kinds apart.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="logs">
+  <Prefix>app/</Prefix>
+  <Delimiter>/</Delimiter>
+  <Blobs>
+    <BlobPrefix><Name>app/2025/</Name></BlobPrefix>
+    <BlobPrefix><Name>app/2026/</Name></BlobPrefix>
+    <Blob>
+      <Name>app/readme.txt</Name>
+      <Properties><Content-Length>12</Content-Length><BlobType>BlockBlob</BlobType></Properties>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+        let page = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert_eq!(page.prefixes, vec!["app/2025/", "app/2026/"]);
+        assert_eq!(page.blobs.len(), 1);
+        assert_eq!(page.blobs[0].name, "app/readme.txt");
+        assert!(page.next_marker.is_none());
     }
 
     #[test]
     fn list_blobs_page_surfaces_continuation_marker() {
-        // A non-empty NextMarker means the walk must fetch again; the
-        // single-page parser drops it (with a warning), the page parser
-        // hands it back for the size walk to follow.
+        // A non-empty NextMarker means there is another page: the size walk
+        // follows it immediately, the blobs view on demand.
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="big">
   <Blobs>
@@ -1516,10 +1577,9 @@ mod tests {
   </Blobs>
   <NextMarker>2!72!MDAwMDE0IWE=</NextMarker>
 </EnumerationResults>"#;
-        let (blobs, marker) = parse_list_blobs_page(xml).expect("parse should succeed");
-        assert_eq!(blobs.len(), 2);
-        assert_eq!(marker.as_deref(), Some("2!72!MDAwMDE0IWE="));
-        assert_eq!(parse_list_blobs_xml(xml).unwrap().len(), 2);
+        let page = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert_eq!(page.blobs.len(), 2);
+        assert_eq!(page.next_marker.as_deref(), Some("2!72!MDAwMDE0IWE="));
     }
 
     #[test]
@@ -1529,8 +1589,8 @@ mod tests {
   <Blobs><Blob><Name>a</Name><Properties><Content-Length>10</Content-Length></Properties></Blob></Blobs>
   <NextMarker />
 </EnumerationResults>"#;
-        let (_, marker) = parse_list_blobs_page(xml).expect("parse should succeed");
-        assert_eq!(marker, None);
+        let page = parse_list_blobs_page(xml).expect("parse should succeed");
+        assert_eq!(page.next_marker, None);
     }
 
     #[test]

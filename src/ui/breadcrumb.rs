@@ -166,6 +166,17 @@ pub(crate) fn segments(state: &AppState) -> Vec<String> {
             if let Some(container) = state.storage.selected_container.as_deref() {
                 s.push(container.to_string());
             }
+            // One segment per virtual folder level (`events/2026/` →
+            // `events > 2026`) so the trail says where in the container
+            // the view is.
+            s.extend(
+                state
+                    .storage
+                    .blobs_prefix
+                    .split('/')
+                    .filter(|seg| !seg.is_empty())
+                    .map(str::to_string),
+            );
             s
         }
 
@@ -851,6 +862,21 @@ mod tests {
         assert_eq!(
             breadcrumb(&state),
             "sub:my-sub > storage > my-account > orders-poison"
+        );
+    }
+
+    #[test]
+    fn storage_blobs_breadcrumb_includes_folder_segments() {
+        let mut state = fresh_state();
+        state.subscriptions = vec![sub_fixture()];
+        state.selected_subscription = Some(sub_fixture().id);
+        state.storage.selected_account = Some(storage_account_fixture());
+        state.storage.selected_container = Some("my-container".into());
+        state.storage.blobs_prefix = "events/2026/".into();
+        state.view = View::StorageBlobs;
+        assert_eq!(
+            breadcrumb(&state),
+            "sub:my-sub > storage > my-account > my-container > events > 2026"
         );
     }
 

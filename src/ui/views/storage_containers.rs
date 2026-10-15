@@ -400,6 +400,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
                 .map(|c| c.name.clone());
             if let Some(name) = container_name {
                 state.storage.selected_container = Some(name);
+                state.storage.blobs_prefix.clear();
                 state.storage.blobs_cursor = 0;
                 state.storage.blobs_filter = tui_input::Input::default();
                 state.view = View::StorageBlobs;

@@ -192,7 +192,11 @@ pub enum AppEvent {
     /// [`crate::ui::state::StorageCache::blobs_key`].
     StorageBlobsLoaded {
         key: String,
-        result: Result<Vec<crate::azure::storage::Blob>, String>,
+        /// `None` for the first page of a folder (replaces the cache entry);
+        /// `Some(marker)` for a continuation page, which is appended only if
+        /// the cached listing still expects that marker.
+        from_marker: Option<String>,
+        result: Result<crate::azure::storage::BlobPage, String>,
     },
     /// Background progress: the container size walk finished another listing
     /// page. `partial` is the running total so far; the row shows it with a
@@ -571,6 +575,13 @@ pub enum Action {
     /// Storage containers view: [`Self::CalculateSize`] for every container
     /// currently listed (after the filter). Bound to `C` there only.
     CalculateAllSizes,
+    /// Storage blobs view: sort by the next / previous column (NAME → SIZE →
+    /// CONTENT-TYPE → LAST MODIFIED → TYPE), ascending. Bound to `Tab` /
+    /// `Shift+Tab` there only.
+    CycleSort,
+    CycleSortBack,
+    /// Storage blobs view: flip the sort direction. Bound to `i` there only.
+    InvertSort,
     /// Open the top-level Container Registries mode. Bound to `R` (capital so
     /// it doesn't collide with `r` = refresh).
     OpenRegistries,
@@ -707,6 +718,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::StorageAccessLogs
             | View::AppRegistrationSignIns
             | View::SqlAuditEvents => Action::CycleSourceFilter,
+            View::StorageBlobs => Action::CycleSort,
             _ => Action::NextPanel,
         },
         KeyCode::BackTab => match view {
@@ -716,6 +728,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::StorageAccessLogs
             | View::AppRegistrationSignIns
             | View::SqlAuditEvents => Action::CycleSourceFilterBack,
+            View::StorageBlobs => Action::CycleSortBack,
             _ => Action::PrevPanel,
         },
 
@@ -791,6 +804,10 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
         },
         KeyCode::Char('C') => match view {
             View::StorageContainers => Action::CalculateAllSizes,
+            _ => Action::Noop,
+        },
+        KeyCode::Char('i') => match view {
+            View::StorageBlobs => Action::InvertSort,
             _ => Action::Noop,
         },
         KeyCode::Char('x') => Action::DecodeSecret,

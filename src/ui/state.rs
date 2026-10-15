@@ -256,6 +256,24 @@ impl Category {
             Category::AppRegistrations => &["appregistrations", "appreg", "apps", "entra"],
         }
     }
+
+    /// Stable name this category is persisted under in `config.toml`
+    /// (`last_category`). The canonical palette alias, so the on-disk value
+    /// doubles as something the user can type at the `:` prompt.
+    pub fn config_name(self) -> &'static str {
+        self.palette_aliases()[0]
+    }
+
+    /// Inverse of [`Category::config_name`]. Accepts any palette alias so a
+    /// hand-edited `last_category = "kv"` still resolves; `None` for unknown
+    /// names (callers fall back to [`Category::Apis`]).
+    pub fn from_config_name(name: &str) -> Option<Category> {
+        let name = name.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| c.palette_aliases().contains(&name))
+    }
 }
 
 /// Mark `category` as the user's active top-level section, route them to its
@@ -813,7 +831,7 @@ pub struct ApimCache {
 impl ApimCache {
     /// Apply `apis_filter` to the APIs under `service_id`. Case-insensitive
     /// substring match over display name, gateway path, and slug; empty filter
-    /// returns everything. Mirrors `StorageCache::filtered_blobs`.
+    /// returns everything. Mirrors `StorageCache::filtered_accounts`.
     pub fn filtered_apis(&self, service_id: &str) -> Vec<&crate::azure::apim::Api> {
         let needle = self.apis_filter.value().to_lowercase();
         match self.apis.get(service_id) {
@@ -932,21 +950,39 @@ pub struct StorageCache {
     pub container_sizes_pending: HashSet<String>,
     pub container_sizes_error: HashMap<String, String>,
 
-    /// Keyed by `"{account_name}/{container_name}"`. The full set of blobs in
-    /// the container is fetched once and filtered client-side, so the prefix
-    /// is no longer a cache-key dimension.
-    pub blobs: HashMap<String, Vec<crate::azure::storage::Blob>>,
+    /// The virtual folder the blobs view is showing inside the pinned
+    /// container: `""` for the root, otherwise a `/`-terminated prefix like
+    /// `events/2026/`. Enter on a folder row descends, `h` / Esc go up.
+    pub blobs_prefix: String,
+    /// One folder level per entry, keyed by [`Self::blob_listing_key`]. The
+    /// value grows as the view follows the continuation marker (scroll to
+    /// the bottom); `next_marker` is `Some` while the server has more rows
+    /// for that prefix.
+    pub blobs: HashMap<String, crate::azure::storage::BlobPage>,
+    /// First page in flight for a listing key.
     pub blobs_pending: HashSet<String>,
     pub blobs_error: HashMap<String, String>,
+    /// Continuation page in flight for a listing key (the first page is
+    /// already on screen).
+    pub blobs_loading_more: HashSet<String>,
+    /// A continuation page failed; the rows loaded so far stay visible.
+    pub blobs_more_error: HashMap<String, String>,
+    /// Raised by the blobs view handler when the cursor nears the end of a
+    /// listing that has a continuation marker; `after_action` drains it and
+    /// spawns the next page (view handlers can't spawn tasks).
+    pub blobs_fetch_more: bool,
     pub blobs_cursor: usize,
     /// Persisted table scroll offset — see `accounts_view_top`.
     pub blobs_view_top: Cell<usize>,
-    /// Client-side case-insensitive substring filter applied to the blobs list
-    /// by name. Mirrors `accounts_filter` + `accounts_filter_active` so the
-    /// input forwarding code in `app.rs` can route keystrokes to the right
-    /// buffer. Empty value → all blobs pass.
+    /// Client-side case-insensitive substring filter applied to the rows of
+    /// the current folder by display name. Mirrors `accounts_filter` +
+    /// `accounts_filter_active` so the input forwarding code in `app.rs` can
+    /// route keystrokes to the right buffer. Empty value → all rows pass.
     pub blobs_filter: Input,
     pub blobs_filter_active: bool,
+    /// Column + direction the blobs table is sorted by. Folders always sort
+    /// above blobs; the direction applies to them only on the NAME column.
+    pub blobs_sort: BlobSort,
     /// Pinned blob name the user drilled into.
     pub selected_blob: Option<String>,
 
@@ -1015,12 +1051,142 @@ pub struct StorageCache {
     pub access_window_input_active: bool,
 }
 
+/// Sortable columns of the blobs table, in the order `Tab` cycles them
+/// (left to right as rendered).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlobSortColumn {
+    #[default]
+    Name,
+    Size,
+    ContentType,
+    LastModified,
+    BlobType,
+}
+
+impl BlobSortColumn {
+    const ALL: [BlobSortColumn; 5] = [
+        BlobSortColumn::Name,
+        BlobSortColumn::Size,
+        BlobSortColumn::ContentType,
+        BlobSortColumn::LastModified,
+        BlobSortColumn::BlobType,
+    ];
+
+    pub fn next(self) -> Self {
+        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let i = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Lower-case label for the footer / status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            BlobSortColumn::Name => "name",
+            BlobSortColumn::Size => "size",
+            BlobSortColumn::ContentType => "content-type",
+            BlobSortColumn::LastModified => "last modified",
+            BlobSortColumn::BlobType => "type",
+        }
+    }
+}
+
+/// Sort order of the blobs table. Default: NAME ascending — the order the
+/// service returns rows in, so an unsorted listing and a fresh view agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlobSort {
+    pub column: BlobSortColumn,
+    pub descending: bool,
+}
+
+impl BlobSort {
+    /// `Tab`: next column, ascending.
+    pub fn cycle_next(&mut self) {
+        self.column = self.column.next();
+        self.descending = false;
+    }
+
+    /// `Shift+Tab`: previous column, ascending.
+    pub fn cycle_prev(&mut self) {
+        self.column = self.column.prev();
+        self.descending = false;
+    }
+
+    /// `i`: flip the direction on the current column.
+    pub fn invert(&mut self) {
+        self.descending = !self.descending;
+    }
+}
+
+/// One row of the blobs table: a virtual directory under the current prefix
+/// or a blob directly under it. Both carry their *full* name (`events/2026/`,
+/// `events/readme.txt`); [`Self::display_name`] strips the prefix for
+/// rendering.
+#[derive(Clone, Copy, Debug)]
+pub enum BlobRow<'a> {
+    Folder(&'a str),
+    Blob(&'a crate::azure::storage::Blob),
+}
+
+impl<'a> BlobRow<'a> {
+    pub fn full_name(&self) -> &'a str {
+        match self {
+            BlobRow::Folder(p) => p,
+            BlobRow::Blob(b) => b.name.as_str(),
+        }
+    }
+
+    /// Name relative to `prefix` — what the table shows. Falls back to the
+    /// full name if the row somehow isn't under the prefix.
+    pub fn display_name(&self, prefix: &str) -> &'a str {
+        let full = self.full_name();
+        full.strip_prefix(prefix).unwrap_or(full)
+    }
+
+    pub fn as_blob(&self) -> Option<&'a crate::azure::storage::Blob> {
+        match self {
+            BlobRow::Blob(b) => Some(b),
+            BlobRow::Folder(_) => None,
+        }
+    }
+}
+
 impl StorageCache {
-    /// Cache key for the blobs map. The full container is fetched once and
-    /// filtered client-side, so the key is just `{account}/{container}` — no
-    /// prefix dimension.
+    /// Cache key for the container size map: `{account}/{container}`.
     pub fn blobs_key(account: &str, container: &str) -> String {
         format!("{account}/{container}")
+    }
+
+    /// Cache key for one folder level of the blobs map:
+    /// `{account}/{container}/{prefix}` (prefix `""` for the root).
+    pub fn blob_listing_key(account: &str, container: &str, prefix: &str) -> String {
+        format!("{account}/{container}/{prefix}")
+    }
+
+    /// The listing of the folder the blobs view is currently showing.
+    pub fn current_blob_listing(
+        &self,
+        account: &str,
+        container: &str,
+    ) -> Option<&crate::azure::storage::BlobPage> {
+        self.blobs.get(&Self::blob_listing_key(
+            account,
+            container,
+            &self.blobs_prefix,
+        ))
+    }
+
+    /// Parent prefix of the current folder (`events/2026/` → `events/`,
+    /// `events/` → `""`), or `None` at the container root.
+    pub fn parent_blob_prefix(&self) -> Option<String> {
+        let p = self.blobs_prefix.strip_suffix('/')?;
+        Some(match p.rfind('/') {
+            Some(i) => p[..=i].to_string(),
+            None => String::new(),
+        })
     }
 
     /// Cache key for the peeked-messages map.
@@ -1079,24 +1245,69 @@ impl StorageCache {
         }
     }
 
-    /// Apply `blobs_filter` to the blobs under `(account, container)` as a
-    /// case-insensitive substring match on the blob name. Returns an empty
-    /// vector when blobs haven't been fetched yet. An empty filter passes
-    /// everything through.
-    pub fn filtered_blobs(
-        &self,
-        account: &str,
-        container: &str,
-    ) -> Vec<&crate::azure::storage::Blob> {
+    /// The rows of the current folder as the table shows them: `blobs_filter`
+    /// applied as a case-insensitive substring match on the display name,
+    /// folders first (by name), then blobs ordered by `blobs_sort` with the
+    /// name as tie-break. Returns an empty vector when the folder hasn't
+    /// been fetched yet. An empty filter passes everything through.
+    pub fn visible_blob_rows(&self, account: &str, container: &str) -> Vec<BlobRow<'_>> {
+        let Some(page) = self.current_blob_listing(account, container) else {
+            return Vec::new();
+        };
+        let prefix = self.blobs_prefix.as_str();
         let needle = self.blobs_filter.value().to_lowercase();
-        let key = Self::blobs_key(account, container);
-        match self.blobs.get(&key) {
-            Some(rows) => rows
-                .iter()
-                .filter(|b| needle.is_empty() || b.name.to_lowercase().contains(&needle))
-                .collect(),
-            None => Vec::new(),
+        let passes = |row: &BlobRow<'_>| {
+            needle.is_empty() || row.display_name(prefix).to_lowercase().contains(&needle)
+        };
+        let sort = self.blobs_sort;
+
+        let mut folders: Vec<BlobRow<'_>> = page
+            .prefixes
+            .iter()
+            .map(|p| BlobRow::Folder(p.as_str()))
+            .filter(passes)
+            .collect();
+        folders.sort_by(|a, b| a.full_name().cmp(b.full_name()));
+        if sort.column == BlobSortColumn::Name && sort.descending {
+            folders.reverse();
         }
+
+        let mut blobs: Vec<&crate::azure::storage::Blob> = page
+            .blobs
+            .iter()
+            .filter(|b| passes(&BlobRow::Blob(b)))
+            .collect();
+        blobs.sort_by(|a, b| {
+            let primary = match sort.column {
+                BlobSortColumn::Name => std::cmp::Ordering::Equal,
+                BlobSortColumn::Size => a.size.cmp(&b.size),
+                BlobSortColumn::ContentType => a
+                    .content_type
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .cmp(&b.content_type.as_deref().map(str::to_lowercase)),
+                BlobSortColumn::LastModified => a.last_modified.cmp(&b.last_modified),
+                BlobSortColumn::BlobType => a.blob_type.cmp(&b.blob_type),
+            };
+            let primary = if sort.descending {
+                primary.reverse()
+            } else {
+                primary
+            };
+            // Name is the tie-break and the primary key for NAME; it follows
+            // the direction too so "name ↓" is a true reversal.
+            let by_name = a.name.cmp(&b.name);
+            primary.then(if sort.descending {
+                by_name.reverse()
+            } else {
+                by_name
+            })
+        });
+
+        folders
+            .into_iter()
+            .chain(blobs.into_iter().map(BlobRow::Blob))
+            .collect()
     }
 
     /// Access events with the client-side `access_operation` filter applied —
@@ -2826,13 +3037,22 @@ pub struct AppState {
 impl AppState {
     pub fn new(config: Config) -> Self {
         let range = config.default_window;
+        // Land straight on the root list of whichever category the user was
+        // inside when they last quit (all subscriptions, or a previously-
+        // pinned one restored below), defaulting to apis on a fresh config or
+        // an unrecognised name. The Subscriptions view is an optional filter
+        // reached with `s`, not a startup gate. Only the category is restored,
+        // not the drill-in position: deeper views depend on pinned ids and
+        // caches that don't survive a restart.
+        let last_category = config
+            .last_category
+            .as_deref()
+            .and_then(Category::from_config_name)
+            .unwrap_or(Category::Apis);
         Self {
-            // Land straight on the API resources list (all subscriptions, or a
-            // previously-pinned one restored below). The Subscriptions view is
-            // now an optional filter reached with `s`, not a startup gate.
-            view: View::List,
+            view: last_category.root_view(),
             view_stack: Vec::new(),
-            last_category: Category::Apis,
+            last_category,
             scope_generation: 0,
             subscriptions: Vec::new(),
             selected_subscription: config.last_subscription_id.clone(),
@@ -3232,6 +3452,52 @@ mod tests {
                 "{category:?}.root_view() must belong to {category:?}",
             );
         }
+    }
+
+    #[test]
+    fn config_name_round_trips_for_every_category() {
+        for category in Category::ALL {
+            assert_eq!(
+                Category::from_config_name(category.config_name()),
+                Some(*category),
+                "{category:?} must survive a config round-trip",
+            );
+        }
+        // Aliases resolve too (hand-edited config), unknown names don't.
+        assert_eq!(Category::from_config_name("kv"), Some(Category::KeyVaults));
+        assert_eq!(
+            Category::from_config_name(" storage "),
+            Some(Category::Storage)
+        );
+        assert_eq!(Category::from_config_name("nope"), None);
+        assert_eq!(Category::from_config_name(""), None);
+    }
+
+    #[test]
+    fn new_lands_on_last_category_root_view() {
+        let cfg = Config {
+            last_category: Some("storage".into()),
+            ..Config::default()
+        };
+        let state = AppState::new(cfg);
+        assert_eq!(state.view, View::StorageAccounts);
+        assert_eq!(state.last_category, Category::Storage);
+        assert!(state.view_stack.is_empty());
+    }
+
+    #[test]
+    fn new_falls_back_to_apis_without_or_with_bad_last_category() {
+        let state = AppState::new(Config::default());
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.last_category, Category::Apis);
+
+        let cfg = Config {
+            last_category: Some("not-a-category".into()),
+            ..Config::default()
+        };
+        let state = AppState::new(cfg);
+        assert_eq!(state.view, View::List);
+        assert_eq!(state.last_category, Category::Apis);
     }
 
     #[test]

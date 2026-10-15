@@ -44,8 +44,9 @@ use crate::azure::service_bus::{
 };
 use crate::azure::sql::{SqlKind, SqlResource};
 use crate::azure::storage::{
-    Blob, BlobContainer, BlobMetadata, BlobPreview, BlobPreviewBody, ContainerSize, QueueListing,
-    QueueMessage, StorageAccount, StorageAccountStats, StorageQueue,
+    Blob, BlobContainer, BlobMetadata, BlobPage, BlobPreview, BlobPreviewBody, ContainerSize,
+    QueueListing, QueueMessage, StorageAccount, StorageAccountStats, StorageQueue,
+    LIST_BLOBS_PAGE_SIZE,
 };
 use crate::azure::subscriptions::Subscription;
 
@@ -927,7 +928,11 @@ pub fn storage_overview(_account: &StorageAccount) -> StorageAccountStats {
     }
 }
 
-pub fn storage_blobs(_account_name: &str, container: &str) -> Vec<Blob> {
+/// Every blob of a demo container, in name order (the order the service
+/// lists in). `raw-events` is deliberately deep and wide — three day folders,
+/// one of them past the 1000-row page size — so folder navigation and the
+/// scroll-to-load-more path can be exercised without a tenant.
+fn storage_blob_names(container: &str) -> Vec<Blob> {
     let now = Utc::now();
     let blob = |name: &str, size: u64, ct: &str, hours: i64| Blob {
         name: name.to_string(),
@@ -936,7 +941,7 @@ pub fn storage_blobs(_account_name: &str, container: &str) -> Vec<Blob> {
         last_modified: Some(now - Duration::hours(hours)),
         blob_type: "BlockBlob".to_string(),
     };
-    match container {
+    let mut all = match container {
         "invoices" => vec![
             blob("2026/06/INV-100482.pdf", 184_320, "application/pdf", 2),
             blob("2026/06/INV-100481.pdf", 162_004, "application/pdf", 5),
@@ -947,27 +952,76 @@ pub fn storage_blobs(_account_name: &str, container: &str) -> Vec<Blob> {
             blob("orders-2026-06-09.csv", 2_493_001, "text/csv", 14),
             blob("orders-2026-06-08.csv", 2_311_876, "text/csv", 38),
         ],
-        _ => vec![
-            blob(
-                "events/2026/06/09/batch-0042.json",
-                912_330,
-                "application/json",
-                1,
-            ),
-            blob(
-                "events/2026/06/09/batch-0041.json",
-                877_104,
-                "application/json",
-                2,
-            ),
-            blob(
-                "events/2026/06/08/batch-0040.json",
-                901_274,
-                "application/json",
-                26,
-            ),
-        ],
+        _ => {
+            let mut v = vec![
+                blob("README.md", 1_204, "text/markdown", 900),
+                blob("schema/events.schema.json", 8_410, "application/json", 700),
+            ];
+            // (day, batches that day, hours ago the day's first batch landed)
+            for (day, batches, age) in [("07", 150u64, 60i64), ("08", 150, 36), ("09", 1_200, 12)] {
+                for n in 0..batches {
+                    v.push(blob(
+                        &format!("events/2026/06/{day}/batch-{n:04}.json"),
+                        850_000 + (n * 7_919) % 120_000,
+                        "application/json",
+                        age - (n as i64 * 12) / batches as i64,
+                    ));
+                }
+            }
+            v
+        }
+    };
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    all
+}
+
+/// One page of a `delimiter=/` listing under `prefix`, the way the service
+/// answers it: the virtual directories and blobs directly under the prefix,
+/// interleaved by name, `LIST_BLOBS_PAGE_SIZE` rows at a time. The
+/// continuation marker is simply the next row offset.
+pub fn storage_blobs(
+    _account_name: &str,
+    container: &str,
+    prefix: &str,
+    marker: Option<&str>,
+) -> BlobPage {
+    enum Entry {
+        Folder(String),
+        Blob(Blob),
     }
+    let mut entries: Vec<Entry> = Vec::new();
+    for b in storage_blob_names(container) {
+        let Some(rest) = b.name.strip_prefix(prefix) else {
+            continue;
+        };
+        match rest.find('/') {
+            Some(i) => {
+                let folder = format!("{prefix}{}", &rest[..=i]);
+                // Names are sorted, so every blob of a folder is adjacent.
+                if !matches!(entries.last(), Some(Entry::Folder(f)) if *f == folder) {
+                    entries.push(Entry::Folder(folder));
+                }
+            }
+            None => entries.push(Entry::Blob(b)),
+        }
+    }
+    let start: usize = marker.and_then(|m| m.parse().ok()).unwrap_or(0);
+    let end = (start + LIST_BLOBS_PAGE_SIZE as usize).min(entries.len());
+    let mut page = BlobPage {
+        next_marker: (end < entries.len()).then(|| end.to_string()),
+        ..BlobPage::default()
+    };
+    for e in entries
+        .drain(..)
+        .skip(start)
+        .take(end.saturating_sub(start))
+    {
+        match e {
+            Entry::Folder(f) => page.prefixes.push(f),
+            Entry::Blob(b) => page.blobs.push(b),
+        }
+    }
+    page
 }
 
 /// Two queues of an order pipeline plus the poison queue its Function
@@ -1030,9 +1084,9 @@ pub fn storage_queue_messages(_account_name: &str, queue: &str) -> Vec<QueueMess
 
 /// Size walk result for the demo containers — just the sum of the canned
 /// blob list, so the SIZE column agrees with what Enter shows.
-pub fn storage_container_size(account_name: &str, container: &str) -> ContainerSize {
+pub fn storage_container_size(_account_name: &str, container: &str) -> ContainerSize {
     let mut size = ContainerSize::default();
-    size.absorb(&storage_blobs(account_name, container));
+    size.absorb(&storage_blob_names(container));
     size
 }
 
