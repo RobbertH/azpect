@@ -1543,12 +1543,20 @@ mod tests {
         // A `delimiter=/` listing under `app/` yields the sub-directories as
         // `BlobPrefix` entries (full prefix, trailing slash) next to the
         // blobs directly under the prefix. The element order on the wire is
-        // interleaved by name; the parser keeps the two kinds apart.
+        // interleaved by name (`.keep` sorts before `2025/`, `readme.txt`
+        // after `2026/`), so `<Blob>` appears in two separate runs. The
+        // parser keeps the two kinds apart; without quick-xml's
+        // `overlapped-lists` feature the second run fails as
+        // "duplicate field `Blob`".
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <EnumerationResults ServiceEndpoint="https://acct.blob.core.windows.net/" ContainerName="logs">
   <Prefix>app/</Prefix>
   <Delimiter>/</Delimiter>
   <Blobs>
+    <Blob>
+      <Name>app/.keep</Name>
+      <Properties><Content-Length>0</Content-Length><BlobType>BlockBlob</BlobType></Properties>
+    </Blob>
     <BlobPrefix><Name>app/2025/</Name></BlobPrefix>
     <BlobPrefix><Name>app/2026/</Name></BlobPrefix>
     <Blob>
@@ -1560,8 +1568,9 @@ mod tests {
 </EnumerationResults>"#;
         let page = parse_list_blobs_page(xml).expect("parse should succeed");
         assert_eq!(page.prefixes, vec!["app/2025/", "app/2026/"]);
-        assert_eq!(page.blobs.len(), 1);
-        assert_eq!(page.blobs[0].name, "app/readme.txt");
+        assert_eq!(page.blobs.len(), 2);
+        assert_eq!(page.blobs[0].name, "app/.keep");
+        assert_eq!(page.blobs[1].name, "app/readme.txt");
         assert!(page.next_marker.is_none());
     }
 

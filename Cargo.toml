@@ -37,7 +37,7 @@ tui-input = "0.14"
 nucleo-matcher = "0.3"
 futures = "0.3"
 open = "5"
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.36", features = ["serialize", "overlapped-lists"] }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
 tokio-util = { version = "0.7.19", features = ["compat"] }
 
