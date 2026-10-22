@@ -208,6 +208,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         let cursor = state.list_cursor.min(filtered.len() - 1);
         let visible = body_area.height as usize;
         let scroll = edge_scroll(&state.list_view_top, cursor, filtered.len(), visible);
+        // Published for the post-draw decoration sweep (`app::sweep_visible_list_decorations`).
+        state.list_visible_rows.set(visible);
 
         // Sampled once per frame so every CREATED / MODIFIED cell tints against
         // the same "now" (see `date_cell`).

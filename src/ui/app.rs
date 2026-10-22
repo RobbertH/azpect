@@ -60,6 +60,9 @@ const CHORD_TIMEOUT: Duration = Duration::from_millis(1000);
 /// The same gate covers the other per-resource list decorations (Container App
 /// overview + replicas, Function App `config/web`) — they ride the same list
 /// load / auto-refresh fan-out and were the remaining source of 429 bursts.
+/// The fan-out itself is scoped to the rows on screen
+/// (`sweep_visible_list_decorations`), so the gate now mostly smooths a
+/// window's worth of rows rather than a whole subscription's.
 const HEALTH_FETCH_CONCURRENCY: usize = 8;
 
 /// Process-wide gate limiting concurrent health fetches to [`HEALTH_FETCH_CONCURRENCY`].
@@ -69,6 +72,31 @@ fn health_fetch_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
         std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(HEALTH_FETCH_CONCURRENCY)))
         .clone()
+}
+
+/// Wait for a slot in [`health_fetch_gate`] on behalf of a per-row list
+/// decoration fetch. `None` means the fetch was cancelled while it was queued
+/// (see [`AppState::cancel_queued_list_decorations`]) and the caller must
+/// return without touching Azure — its pending marker is already gone.
+///
+/// `priority` fetches are the ones for the resource the user drilled into:
+/// they skip the gate entirely (it's one resource, a handful of calls) so they
+/// aren't stuck behind whatever the list sweep still holds permits for, and
+/// they are never cancelled. `Some(None)` is the "no permit held" case.
+async fn acquire_list_decoration_permit(
+    priority: bool,
+) -> Option<Option<tokio::sync::OwnedSemaphorePermit>> {
+    if priority {
+        return Some(None);
+    }
+    let generation = crate::ui::state::list_decoration_generation();
+    // A closed gate (never happens — we never close it) yields no permit but
+    // still proceeds, matching the previous behavior.
+    let permit = health_fetch_gate().acquire_owned().await.ok();
+    if crate::ui::state::list_decoration_generation() != generation {
+        return None;
+    }
+    Some(permit)
 }
 
 /// Restores the terminal on drop. Owned by `run`; if a panic blows past it
@@ -244,6 +272,9 @@ async fn event_loop(
             Ok(ev) => ev,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 terminal.draw(|f| dispatch_view(f, f.area(), state, theme))?;
+                // The draw just reconciled the list viewport, so this is the
+                // one place that knows exactly which rows are on screen.
+                sweep_visible_list_decorations(state, auth, tx);
                 match rx.recv().await {
                     Some(ev) => ev,
                     None => break,
@@ -498,13 +529,12 @@ async fn event_loop(
                         // below the last visible row.
                         state.restore_list_cursor(anchor_id.as_deref());
                         // Per-row badges derive from the health fetch (availability
-                        // + a fixed-24h Errors+Traffic window). Chart metrics are
-                        // fetched lazily on detail entry, not eagerly per row.
-                        spawn_missing_list_health(state, auth, tx, /* force */ false);
-                        spawn_missing_container_app_overview(
-                            state, auth, tx, /* force */ false,
-                        );
-                        spawn_missing_function_app_image(state, auth, tx, /* force */ false);
+                        // + a fixed-24h Errors+Traffic window). Those go out for
+                        // the rows on screen from the post-draw sweep
+                        // (`sweep_visible_list_decorations`) — the viewport isn't
+                        // reconciled until the next draw, so firing here would
+                        // target the pre-reload window. Chart metrics are fetched
+                        // lazily on detail entry, not eagerly per row.
                     }
                     Err(e) => state.set_status(format!("resources: {e}")),
                 }
@@ -3416,9 +3446,10 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .as_deref()
             .and_then(service_id_from_api_id)
             .map(|svc_id| format!("{PORTAL_BASE}{svc_id}/apim-apis")),
+        // The backends view mirrors the gateway's "Backend pools" blade.
         View::AppGatewayBackends => state
             .selected_resource()
-            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+            .map(|r| format!("{PORTAL_BASE}{}/backendPools", r.id)),
         // Cursor 0 is the synthetic "All subscriptions" row (no single sub to
         // open); rows below index the *filtered* list at `cursor - 1`.
         View::Subscriptions => state
@@ -3426,20 +3457,17 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .checked_sub(1)
             .and_then(|i| state.filtered_subscription_list().into_iter().nth(i))
             .map(|s| format!("{PORTAL_BASE}/subscriptions/{}/overview", s.id)),
-        // Storage views land on the account's overview blade; the portal
-        // exposes the container/blob drill-down off of there. The cursor
-        // indexes into the *filtered* view so `o` follows what's on screen.
+        // Storage: each drill level opens the matching portal blade — the
+        // account overview, the Containers / Queues list, or (once a row is
+        // pinned or highlighted) that container's / queue's / blob's own
+        // blade. The cursor indexes into the *filtered* view so `o` follows
+        // what's on screen.
         View::StorageAccounts => state
             .storage
             .filtered_accounts()
             .get(state.storage.accounts_cursor)
             .map(|a| format!("{PORTAL_BASE}{}", a.id)),
         View::StorageAccountOverview
-        | View::StorageContainers
-        | View::StorageBlobs
-        | View::StorageBlobDetail
-        | View::StorageQueues
-        | View::StorageQueueMessages
         // The access log's portal counterpart is the account's diagnostics /
         // logs side nav; the overview blade is the stable entry point.
         | View::StorageAccessLogs => state
@@ -3447,6 +3475,43 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .selected_account
             .as_ref()
             .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+        View::StorageContainers => state.storage.selected_account.as_ref().map(|a| {
+            match state
+                .storage
+                .filtered_containers(&a.id)
+                .get(state.storage.containers_cursor)
+            {
+                Some(c) => storage_container_blade_url(&a.id, &c.name),
+                None => format!("{PORTAL_BASE}{}/containersList", a.id),
+            }
+        }),
+        // The container blade has no folder-prefix parameter, so the blobs
+        // view lands on the container root regardless of how deep the TUI is.
+        View::StorageBlobs => state.storage.selected_account.as_ref().and_then(|a| {
+            let container = state.storage.selected_container.as_deref()?;
+            Some(storage_container_blade_url(&a.id, container))
+        }),
+        View::StorageBlobDetail => state.storage.selected_account.as_ref().and_then(|a| {
+            let container = state.storage.selected_container.as_deref()?;
+            match state.storage.selected_blob.as_deref() {
+                Some(blob) => Some(storage_blob_blade_url(&a.id, container, blob)),
+                None => Some(storage_container_blade_url(&a.id, container)),
+            }
+        }),
+        // The queue list opens the account's Queues blade (the list itself,
+        // not the highlighted row); only drilling into a queue opens that
+        // queue's blade.
+        View::StorageQueues => state
+            .storage
+            .selected_account
+            .as_ref()
+            .map(|a| format!("{PORTAL_BASE}{}/queueList", a.id)),
+        View::StorageQueueMessages => state.storage.selected_account.as_ref().map(|a| {
+            match state.storage.selected_queue.as_deref() {
+                Some(q) => storage_queue_blade_url(&a.id, q),
+                None => format!("{PORTAL_BASE}{}/queueList", a.id),
+            }
+        }),
         // Registry views land on the registry's **repository** blade — the
         // overview page is just a metadata panel, whereas the repository
         // blade is where users actually browse images and is what the
@@ -3457,11 +3522,24 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .filtered_registries()
             .get(state.registry.registries_cursor)
             .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
-        View::RegistryRepositories | View::RegistryTags => state
-            .registry
-            .selected_registry
-            .as_ref()
-            .map(|r| format!("{PORTAL_BASE}{}/repository", r.id)),
+        // With a repository highlighted / pinned, open *that* repository's
+        // blade (tag list) rather than the registry-wide repository list.
+        View::RegistryRepositories => state.registry.selected_registry.as_ref().map(|r| {
+            match state
+                .registry
+                .filtered_repositories(&r.id)
+                .get(state.registry.repositories_cursor)
+            {
+                Some(repo) => registry_repository_blade_url(&r.id, &repo.name),
+                None => format!("{PORTAL_BASE}{}/repository", r.id),
+            }
+        }),
+        View::RegistryTags => state.registry.selected_registry.as_ref().map(|r| {
+            match state.registry.selected_repository.as_deref() {
+                Some(repo) => registry_repository_blade_url(&r.id, repo),
+                None => format!("{PORTAL_BASE}{}/repository", r.id),
+            }
+        }),
         // The access log's portal counterpart is the registry's diagnostics /
         // logs side nav; the overview blade is the stable entry point.
         View::RegistryAccessLogs => state
@@ -3476,10 +3554,15 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .filtered_workflows()
             .get(state.logic_apps.workflows_cursor)
             .map(|w| format!("{PORTAL_BASE}{}", w.id)),
-        View::LogicAppRuns
-        | View::LogicAppTriggerHistory
-        | View::LogicAppRunDetail
-        | View::LogicAppContent => state
+        // Run-centric views open the workflow's "Runs history" blade — the
+        // portal's counterpart of what the TUI is paging through. (A single
+        // run has no stable deep link; the history blade is one click away.)
+        View::LogicAppRuns | View::LogicAppRunDetail | View::LogicAppContent => state
+            .logic_apps
+            .selected_workflow
+            .as_ref()
+            .map(|w| format!("{PORTAL_BASE}{}/runs", w.id)),
+        View::LogicAppTriggerHistory => state
             .logic_apps
             .selected_workflow
             .as_ref()
@@ -3495,7 +3578,7 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .cosmos
             .selected_account
             .as_ref()
-            .map(|a| format!("{PORTAL_BASE}{}", a.id)),
+            .map(|a| format!("{PORTAL_BASE}{}/dataExplorer", a.id)),
         // Key Vault views land on the vault's overview blade; the Azure
         // portal's secrets/certs panes are reachable via the side nav from
         // there. The cursor indexes into the *filtered* view so `o` follows
@@ -3505,11 +3588,16 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .filtered_vaults()
             .get(state.key_vault.vaults_cursor)
             .map(|v| format!("{PORTAL_BASE}{}", v.id)),
-        View::KeyVaultItems => state
-            .key_vault
-            .selected_vault
-            .as_ref()
-            .map(|v| format!("{PORTAL_BASE}{}", v.id)),
+        // The items view opens the pane it is showing — Secrets or
+        // Certificates — not the vault overview.
+        View::KeyVaultItems => state.key_vault.selected_vault.as_ref().map(|v| {
+            use crate::azure::key_vault::ItemKind;
+            let blade = match state.key_vault.items_kind {
+                ItemKind::Secret => "secrets",
+                ItemKind::Certificate => "certificates",
+            };
+            format!("{PORTAL_BASE}{}/{blade}", v.id)
+        }),
         // The access log's portal counterpart is the vault's diagnostics /
         // logs side nav; the overview blade is the stable entry point.
         View::KeyVaultAccessLogs => state
@@ -3525,11 +3613,48 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .filtered_namespaces()
             .get(state.service_bus.namespaces_cursor)
             .map(|n| format!("{PORTAL_BASE}{}", n.id)),
-        View::ServiceBusEntities | View::ServiceBusSubscriptions => state
-            .service_bus
-            .selected_namespace
-            .as_ref()
-            .map(|n| format!("{PORTAL_BASE}{}", n.id)),
+        // Queues / topics / subscriptions are ARM resources with their own
+        // portal blades, so the highlighted row opens directly; with nothing
+        // highlighted, fall back to the namespace's Queues / Topics list.
+        View::ServiceBusEntities => state.service_bus.selected_namespace.as_ref().map(|n| {
+            use crate::azure::service_bus::EntityKind;
+            let cursor = state.service_bus.entities_cursor;
+            let row_id = match state.service_bus.entity_kind {
+                EntityKind::Queue => state
+                    .service_bus
+                    .filtered_queues(&n.id)
+                    .get(cursor)
+                    .map(|q| q.id.clone()),
+                EntityKind::Topic => state
+                    .service_bus
+                    .filtered_topics(&n.id)
+                    .get(cursor)
+                    .map(|t| t.id.clone()),
+            };
+            match row_id {
+                Some(id) => format!("{PORTAL_BASE}{id}"),
+                None => {
+                    let blade = match state.service_bus.entity_kind {
+                        EntityKind::Queue => "queues",
+                        EntityKind::Topic => "topics",
+                    };
+                    format!("{PORTAL_BASE}{}/{blade}", n.id)
+                }
+            }
+        }),
+        View::ServiceBusSubscriptions => state.service_bus.selected_namespace.as_ref().map(|n| {
+            let Some(topic) = state.service_bus.selected_topic.as_deref() else {
+                return format!("{PORTAL_BASE}{}/topics", n.id);
+            };
+            match state
+                .service_bus
+                .filtered_subscriptions(&n.id, topic)
+                .get(state.service_bus.subscriptions_cursor)
+            {
+                Some(sub) => format!("{PORTAL_BASE}{}", sub.id),
+                None => format!("{PORTAL_BASE}{}/topics/{topic}", n.id),
+            }
+        }),
         // Azure SQL: the flat list opens the highlighted pool/database blade;
         // the detail view opens the pinned resource. Both land on the resource
         // overview, where the portal's Metrics blade is one click away.
@@ -3538,17 +3663,33 @@ fn portal_url_for(state: &AppState) -> Option<String> {
             .filtered_resources()
             .get(state.sql.cursor)
             .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+        // The detail view is a metrics panel, so open the Metrics blade.
         View::SqlDetail => state
             .sql
             .selected
             .as_ref()
-            .map(|r| format!("{PORTAL_BASE}{}", r.id)),
-        // The audit views' portal counterpart is the server's Auditing blade;
-        // the pinned resource's overview is the stable entry point.
-        View::SqlAuditPrincipals
-        | View::SqlAuditEvents
-        | View::SqlAuditEventDetail
-        | View::SqlSessions => state
+            .map(|r| format!("{PORTAL_BASE}{}/metrics", r.id)),
+        // Audit views open the Auditing blade of what they're scoped to: the
+        // database when one is pinned, else the logical server (derived from
+        // its `master` database id, which is where server-level auditing
+        // lands). Falls back to the pinned resource if no target is set yet.
+        View::SqlAuditPrincipals | View::SqlAuditEvents | View::SqlAuditEventDetail => {
+            match state.sql.audit.target.as_ref() {
+                Some(t) => {
+                    let scope = t
+                        .database_id
+                        .as_deref()
+                        .unwrap_or_else(|| sql_server_id_from_master(&t.master_id));
+                    Some(format!("{PORTAL_BASE}{scope}/auditing"))
+                }
+                None => state
+                    .sql
+                    .selected
+                    .as_ref()
+                    .map(|r| format!("{PORTAL_BASE}{}", r.id)),
+            }
+        }
+        View::SqlSessions => state
             .sql
             .selected
             .as_ref()
@@ -3574,6 +3715,56 @@ fn portal_url_for(state: &AppState) -> Option<String> {
 /// Portal deep link to an app registration's overview blade. App
 /// registrations live outside ARM, so the `#@/resource/{id}` form the other
 /// views use doesn't exist for them.
+/// Deep link to one blob container's blade (the account's "Containers" list
+/// is `{id}/containersList`; a specific container has no resource-menu
+/// suffix, only this extension blade keyed on account id + container path).
+fn storage_container_blade_url(account_id: &str, container: &str) -> String {
+    format!(
+        "https://portal.azure.com/#view/Microsoft_Azure_Storage/ContainerMenuBlade/~/overview/storageAccountId/{}/path/{}",
+        percent_encode(account_id),
+        percent_encode(container),
+    )
+}
+
+/// Deep link to one blob's properties blade. `blob` is the full blob name
+/// (including any virtual-folder prefix) — the path is `{container}/{blob}`.
+fn storage_blob_blade_url(account_id: &str, container: &str, blob: &str) -> String {
+    format!(
+        "https://portal.azure.com/#view/Microsoft_Azure_Storage/BlobPropertiesBladeV2/storageAccountId/{}/path/{}/isDeleted~/false/tabToload~/0",
+        percent_encode(account_id),
+        percent_encode(&format!("{container}/{blob}")),
+    )
+}
+
+/// Deep link to one storage queue's blade (the account's "Queues" list is
+/// `{id}/queueList`).
+fn storage_queue_blade_url(account_id: &str, queue: &str) -> String {
+    format!(
+        "https://portal.azure.com/#view/Microsoft_Azure_Storage/QueueMenuBlade/~/overview/storageAccountId/{}/queueName/{}",
+        percent_encode(account_id),
+        percent_encode(queue),
+    )
+}
+
+/// Deep link to one ACR repository's blade (its tag list). The registry-wide
+/// list is `{id}/repository`.
+fn registry_repository_blade_url(registry_id: &str, repository: &str) -> String {
+    format!(
+        "https://portal.azure.com/#view/Microsoft_Azure_ContainerRegistries/RepositoryBlade/id/{}/repository/{}",
+        percent_encode(registry_id),
+        percent_encode(repository),
+    )
+}
+
+/// `.../servers/{s}/databases/master` → `.../servers/{s}`. Returns the input
+/// unchanged when it doesn't end in a `/databases/<x>` segment.
+fn sql_server_id_from_master(master_id: &str) -> &str {
+    match master_id.rfind("/databases/") {
+        Some(i) => &master_id[..i],
+        None => master_id,
+    }
+}
+
 fn app_registration_blade_url(app_id: &str) -> String {
     format!(
         "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Overview/appId/{app_id}"
@@ -4432,12 +4623,12 @@ fn kick_off_loads_for_view(
                 state.loading_resources = true;
                 spawn_load_resources(auth.clone(), state.scope_generation, sub_ids, tx.clone());
                 if force {
-                    // Refresh per-row badges + Container App overview *in place*:
-                    // re-fetch without dropping the current values, so rows
-                    // update silently instead of flickering to LOADING. (The
-                    // resource list itself reloads above; new rows get filled by
-                    // the non-force `spawn_missing_*` in the ResourcesLoaded
-                    // handler.)
+                    // Refresh per-row badges + Container App overview *in place*
+                    // for the rows on screen: re-fetch without dropping the
+                    // current values, so rows update silently instead of
+                    // flickering to LOADING. (The resource list itself reloads
+                    // above; rows scrolled into view later get filled by the
+                    // post-draw `sweep_visible_list_decorations`.)
                     spawn_missing_list_health(state, auth, tx, /* force */ true);
                     spawn_missing_container_app_overview(state, auth, tx, /* force */ true);
                     spawn_missing_function_app_image(state, auth, tx, /* force */ true);
@@ -4478,24 +4669,58 @@ fn kick_off_loads_for_view(
                     state.metrics.pending.insert(resource.id.clone());
                     spawn_load_metrics(auth.clone(), resource, state.metrics.range, tx.clone());
                 }
+                // The user is now looking at exactly one resource: anything
+                // still queued for the list's other rows is noise, so empty
+                // the gate's backlog and send this resource's fetches around
+                // the gate (`priority`) so they aren't stuck behind it.
+                state.cancel_queued_list_decorations();
                 // Health — and, for Container Apps, the active-revision metadata
-                // + overview that ride alongside it — is otherwise fetched once
-                // eagerly and never refreshed, so `r` after a deploy would keep
-                // showing the old active revision. Re-fetch on explicit refresh,
-                // but WITHOUT dropping the cached values: the old rows stay shown
-                // (and the header's "· refreshing…" signals the reload) until
-                // the fresh data arrives and overwrites them — no flicker.
-                if force {
-                    if !state.health.pending.contains(&id) {
-                        state.health.pending.insert(id.clone());
-                        spawn_load_health(auth.clone(), id.clone(), kind, tx.clone());
-                    }
-                    if kind == crate::azure::resources::ResourceKind::ContainerApp
-                        && !state.container_app_overview.pending.contains(&id)
-                    {
-                        state.container_app_overview.pending.insert(id.clone());
-                        spawn_load_container_app_overview(auth.clone(), id.clone(), tx.clone());
-                    }
+                // + overview that ride alongside it — is otherwise fetched for
+                // the list window and never refreshed, so `r` after a deploy
+                // would keep showing the old active revision. Re-fetch on
+                // explicit refresh, but WITHOUT dropping the cached values: the
+                // old rows stay shown (and the header's "· refreshing…" signals
+                // the reload) until the fresh data arrives and overwrites them
+                // — no flicker. Without force, fetch only what the list sweep
+                // hadn't landed yet (its queued copy was just cancelled).
+                let health_cached = state.health.by_resource.contains_key(&id)
+                    || state.health.failures.contains_key(&id);
+                if (force || !health_cached) && !state.health.pending.contains(&id) {
+                    state.health.pending.insert(id.clone());
+                    spawn_load_health(
+                        auth.clone(),
+                        id.clone(),
+                        kind,
+                        tx.clone(),
+                        /* priority */ true,
+                    );
+                }
+                if kind == crate::azure::resources::ResourceKind::ContainerApp
+                    && (force || !state.container_app_overview.by_resource.contains_key(&id))
+                    && !state.container_app_overview.pending.contains(&id)
+                {
+                    state.container_app_overview.pending.insert(id.clone());
+                    spawn_load_container_app_overview(
+                        auth.clone(),
+                        id.clone(),
+                        tx.clone(),
+                        /* priority */ true,
+                    );
+                }
+                if matches!(
+                    kind,
+                    crate::azure::resources::ResourceKind::FunctionApp
+                        | crate::azure::resources::ResourceKind::WebApp
+                ) && !state.func_image.by_resource.contains_key(&id)
+                    && !state.func_image.pending.contains(&id)
+                {
+                    state.func_image.pending.insert(id.clone());
+                    spawn_load_function_app_image(
+                        auth.clone(),
+                        id.clone(),
+                        tx.clone(),
+                        /* priority */ true,
+                    );
                 }
                 // App settings (Function Apps + Web Apps) + per-function triggers
                 // (Function Apps only — Web Apps have no functions list) are
@@ -4572,7 +4797,12 @@ fn kick_off_loads_for_view(
                     crate::azure::resources::ResourceKind::ContainerApp if force => {
                         state.container_app_overview.by_resource.remove(&id);
                         state.container_app_overview.pending.insert(id.clone());
-                        spawn_load_container_app_overview(auth.clone(), id, tx.clone());
+                        spawn_load_container_app_overview(
+                            auth.clone(),
+                            id,
+                            tx.clone(),
+                            /* priority */ true,
+                        );
                     }
                     _ => {}
                 }
@@ -6342,6 +6572,7 @@ fn refetch_env_after_write(
                 auth.clone(),
                 applied.resource_id.clone(),
                 tx.clone(),
+                /* priority */ true,
             );
         }
         _ => {}
@@ -6681,6 +6912,7 @@ fn spawn_load_health(
     resource_id: String,
     kind: crate::azure::resources::ResourceKind,
     tx: UnboundedSender<AppEvent>,
+    priority: bool,
 ) {
     use crate::azure::resources::ResourceKind;
     if auth.is_demo() {
@@ -6711,9 +6943,11 @@ fn spawn_load_health(
     tokio::spawn(async move {
         // Hold a permit for the duration of the fan-out so no more than
         // HEALTH_FETCH_CONCURRENCY resources hit ARM/Monitor at once. The task is
-        // already spawned; it just parks here until a slot frees. A closed gate
-        // (never happens — we never close it) would drop the permit and proceed.
-        let _permit = health_fetch_gate().acquire_owned().await;
+        // already spawned; it just parks here until a slot frees — unless the
+        // queue was cancelled meanwhile, in which case it quietly goes away.
+        let Some(_permit) = acquire_list_decoration_permit(priority).await else {
+            return;
+        };
         // Two independent signals feed the health badge, fetched concurrently:
         //   1. availability — the platform's up/degraded/down state
         //   2. health metrics — a fixed-24h Errors+Traffic window (range-agnostic)
@@ -6782,6 +7016,7 @@ fn spawn_load_container_app_overview(
     auth: AzureAuth,
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
+    priority: bool,
 ) {
     if auth.is_demo() {
         let result = Ok(crate::azure::demo::container_app_overview(&resource_id));
@@ -6796,7 +7031,9 @@ fn spawn_load_container_app_overview(
         // resource (and auto-refresh re-fires it every interval), so ungated
         // it recreates exactly the ARM 429 burst the semaphore exists to
         // smooth.
-        let _permit = health_fetch_gate().acquire_owned().await;
+        let Some(_permit) = acquire_list_decoration_permit(priority).await else {
+            return;
+        };
         let result = crate::azure::container_app_overview::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
@@ -6825,7 +7062,9 @@ fn spawn_load_container_app_replicas(
         // Gated like the overview fetch: every health fan-out re-emits
         // `ContainerAppRevisionMetaLoaded`, whose handler re-spawns this per
         // app — on the auto-refresh timer that's another per-resource burst.
-        let _permit = health_fetch_gate().acquire_owned().await;
+        let Some(_permit) = acquire_list_decoration_permit(/* priority */ false).await else {
+            return;
+        };
         let result =
             crate::azure::container_app_replicas::fetch(&auth, &resource_id, &revision_name)
                 .await
@@ -6841,6 +7080,7 @@ fn spawn_load_function_app_image(
     auth: AzureAuth,
     resource_id: String,
     tx: UnboundedSender<AppEvent>,
+    priority: bool,
 ) {
     if auth.is_demo() {
         let result = Ok(crate::azure::demo::web_config(&resource_id));
@@ -6853,7 +7093,9 @@ fn spawn_load_function_app_image(
     tokio::spawn(async move {
         // Gated like the overview fetch: one `config/web` GET per Function App
         // on every list load *and* every auto-refresh tick.
-        let _permit = health_fetch_gate().acquire_owned().await;
+        let Some(_permit) = acquire_list_decoration_permit(priority).await else {
+            return;
+        };
         let result = crate::azure::function_app_config::fetch(&auth, &resource_id)
             .await
             .map_err(|e| format!("{e:#}"));
@@ -6949,6 +7191,28 @@ fn looks_like_guid(s: &str) -> bool {
 /// Kick off a Container App template fetch for every Container App that
 /// doesn't already have cached limits. Same eager-on-load pattern as
 /// `spawn_missing_list_health`.
+/// Issue the per-row list decorations (health badge, Container App overview,
+/// Function App image) for every row currently on screen that has neither a
+/// cached value nor a fetch in flight. Runs after every draw while the list
+/// is up, so scrolling or filtering pulls in exactly the newly exposed rows —
+/// on a large subscription that is a window of ~40 rows instead of a fan-out
+/// over every resource the scope contains. Idempotent and cheap when the
+/// window is settled.
+fn sweep_visible_list_decorations(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    if state.view != View::List {
+        return;
+    }
+    spawn_missing_list_health(state, auth, tx, /* force */ false);
+    spawn_missing_container_app_overview(state, auth, tx, /* force */ false);
+    spawn_missing_function_app_image(state, auth, tx, /* force */ false);
+}
+
+/// Kick off an overview fetch for every *visible* Container App row without a
+/// cached overview. `force` re-fetches cached rows too (auto-refresh).
 fn spawn_missing_container_app_overview(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -6957,8 +7221,8 @@ fn spawn_missing_container_app_overview(
 ) {
     use crate::azure::resources::ResourceKind;
     let to_fetch: Vec<String> = state
-        .resources
-        .iter()
+        .visible_list_resources()
+        .into_iter()
         .filter(|r| r.kind == ResourceKind::ContainerApp)
         .filter(|r| {
             (force || !state.container_app_overview.by_resource.contains_key(&r.id))
@@ -6971,14 +7235,20 @@ fn spawn_missing_container_app_overview(
             .container_app_overview
             .pending
             .insert(resource_id.clone());
-        spawn_load_container_app_overview(auth.clone(), resource_id, tx.clone());
+        spawn_load_container_app_overview(
+            auth.clone(),
+            resource_id,
+            tx.clone(),
+            /* priority */ false,
+        );
     }
 }
 
-/// Kick off a `config/web` fetch for every Function App / Web App that doesn't
-/// already have a cached deployed image. Feeds the list's VERSION column; same
-/// eager-on-load pattern as `spawn_missing_container_app_overview` (Container
-/// Apps get their image for free off the health fetch, so they're skipped here).
+/// Kick off a `config/web` fetch for every *visible* Function App / Web App
+/// row that doesn't already have a cached deployed image. Feeds the list's
+/// VERSION column; same window-scoped pattern as
+/// `spawn_missing_container_app_overview` (Container Apps get their image for
+/// free off the health fetch, so they're skipped here).
 fn spawn_missing_function_app_image(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -6987,8 +7257,8 @@ fn spawn_missing_function_app_image(
 ) {
     use crate::azure::resources::ResourceKind;
     let to_fetch: Vec<String> = state
-        .resources
-        .iter()
+        .visible_list_resources()
+        .into_iter()
         .filter(|r| matches!(r.kind, ResourceKind::FunctionApp | ResourceKind::WebApp))
         .filter(|r| {
             (force || !state.func_image.by_resource.contains_key(&r.id))
@@ -6998,12 +7268,17 @@ fn spawn_missing_function_app_image(
         .collect();
     for resource_id in to_fetch {
         state.func_image.pending.insert(resource_id.clone());
-        spawn_load_function_app_image(auth.clone(), resource_id, tx.clone());
+        spawn_load_function_app_image(
+            auth.clone(),
+            resource_id,
+            tx.clone(),
+            /* priority */ false,
+        );
     }
 }
 
-/// Kick off a Resource Health fetch for every loaded resource that doesn't
-/// already have one cached or in flight. Mirrors `spawn_missing_list_metrics`.
+/// Kick off a Resource Health fetch for every *visible* resource row that
+/// doesn't already have one cached or in flight.
 fn spawn_missing_list_health(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -7011,8 +7286,8 @@ fn spawn_missing_list_health(
     force: bool,
 ) {
     let to_fetch: Vec<(String, crate::azure::resources::ResourceKind)> = state
-        .resources
-        .iter()
+        .visible_list_resources()
+        .into_iter()
         .filter(|r| {
             (force || !state.health.by_resource.contains_key(&r.id))
                 && !state.health.pending.contains(&r.id)
@@ -7021,7 +7296,13 @@ fn spawn_missing_list_health(
         .collect();
     for (resource_id, kind) in to_fetch {
         state.health.pending.insert(resource_id.clone());
-        spawn_load_health(auth.clone(), resource_id, kind, tx.clone());
+        spawn_load_health(
+            auth.clone(),
+            resource_id,
+            kind,
+            tx.clone(),
+            /* priority */ false,
+        );
     }
 }
 
@@ -10312,5 +10593,451 @@ mod tests {
             url.ends_with("/containerApps/beta/containers"),
             "container app env vars should open the Containers blade, got {url}"
         );
+    }
+
+    fn list_resource(i: usize, kind: crate::azure::resources::ResourceKind) -> Resource {
+        Resource {
+            id: format!("/r/{i:03}"),
+            name: format!("res-{i:03}"),
+            kind,
+            location: "westeurope".into(),
+            resource_group: "rg-demo".into(),
+            subscription_id: "sub".into(),
+            state: Some("Running".into()),
+            created_at: None,
+            modified_at: None,
+            meta: Default::default(),
+        }
+    }
+
+    /// A list of 30 resources with a 5-row viewport scrolled to rows 10..15.
+    fn windowed_list_state() -> AppState {
+        use crate::azure::resources::ResourceKind;
+        let mut state = fresh_state();
+        state.resources = (0..30)
+            .map(|i| {
+                let kind = match i % 3 {
+                    0 => ResourceKind::FunctionApp,
+                    1 => ResourceKind::ContainerApp,
+                    _ => ResourceKind::Apim,
+                };
+                list_resource(i, kind)
+            })
+            .collect();
+        state.view = View::List;
+        state.list_cursor = 12;
+        state.list_view_top.set(10);
+        state.list_visible_rows.set(5);
+        state
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> Vec<AppEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn visible_list_resources_is_the_rendered_window() {
+        let state = windowed_list_state();
+        let ids: Vec<&str> = state
+            .visible_list_resources()
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(ids, ["/r/010", "/r/011", "/r/012", "/r/013", "/r/014"]);
+
+        // Window past the end clamps instead of panicking.
+        state.list_view_top.set(28);
+        assert_eq!(state.visible_list_resources().len(), 2);
+        // Nothing rendered yet → nothing visible → nothing fetched.
+        state.list_visible_rows.set(0);
+        assert!(state.visible_list_resources().is_empty());
+    }
+
+    #[test]
+    fn sweep_only_decorates_rows_on_screen() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = windowed_list_state();
+
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+
+        // Demo auth answers synchronously, so every spawned fetch shows up as
+        // a HealthLoaded on the channel — exactly one per visible row.
+        let mut health_ids: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                AppEvent::HealthLoaded { resource_id, .. } => Some(resource_id),
+                _ => None,
+            })
+            .collect();
+        health_ids.sort();
+        assert_eq!(
+            health_ids,
+            ["/r/010", "/r/011", "/r/012", "/r/013", "/r/014"],
+            "health fetched for the 5 visible rows only"
+        );
+        // Pending markers were set for the visible rows (demo results are
+        // still sitting unapplied on the channel) and nothing off-screen.
+        assert_eq!(state.health.pending.len(), 5);
+        assert!(!state.health.pending.contains("/r/000"));
+        assert!(!state.health.pending.contains("/r/029"));
+        // Overview only for the visible Container Apps (010, 013), image only
+        // for the visible Function Apps (012).
+        let mut overview: Vec<&String> = state.container_app_overview.pending.iter().collect();
+        overview.sort();
+        assert_eq!(overview, ["/r/010", "/r/013"]);
+        let image: Vec<&String> = state.func_image.pending.iter().collect();
+        assert_eq!(image, ["/r/012"]);
+    }
+
+    #[test]
+    fn sweep_is_idempotent_and_follows_the_window() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = windowed_list_state();
+
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+        let first = drain(&mut rx).len();
+        assert!(first > 0);
+        // Same window, everything pending → nothing new goes out.
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "settled window must not re-spawn"
+        );
+
+        // Scroll one row: exactly the newly exposed row is fetched.
+        state.list_view_top.set(11);
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+        let ids: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                AppEvent::HealthLoaded { resource_id, .. } => Some(resource_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["/r/015"]);
+    }
+
+    #[test]
+    fn sweep_is_a_noop_outside_the_list_view() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = windowed_list_state();
+        state.view = View::Detail;
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+        assert!(drain(&mut rx).is_empty());
+        assert!(state.health.pending.is_empty());
+    }
+
+    #[test]
+    fn detail_entry_cancels_the_queue_and_fetches_the_selected_row_first() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = windowed_list_state();
+        // Simulate a backlog: every visible row has a queued fetch.
+        sweep_visible_list_decorations(&mut state, &auth, &tx);
+        drain(&mut rx);
+        assert_eq!(state.health.pending.len(), 5);
+        let before = crate::ui::state::list_decoration_generation();
+
+        // Enter on row 12 (a Function App) → Detail.
+        assert!(crate::ui::views::list::handle(
+            Action::OpenSelected,
+            &mut state
+        ));
+        assert_eq!(state.view, View::Detail);
+        kick_off_loads_for_view(&mut state, &auth, &tx, /* force */ true);
+
+        assert!(
+            crate::ui::state::list_decoration_generation() > before,
+            "queued list fetches are cancelled on drill-in"
+        );
+        // Only the selected resource's health / image are in flight now.
+        let pending: Vec<&String> = state.health.pending.iter().collect();
+        assert_eq!(pending, ["/r/012"]);
+        let image: Vec<&String> = state.func_image.pending.iter().collect();
+        assert_eq!(image, ["/r/012"]);
+        assert!(state.container_app_overview.pending.is_empty());
+        let health_ids: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                AppEvent::HealthLoaded { resource_id, .. } => Some(resource_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(health_ids, ["/r/012"]);
+    }
+
+    #[test]
+    fn detail_entry_without_force_fetches_only_what_is_missing() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = windowed_list_state();
+        state.view = View::Detail;
+        // Health already landed for the selected row; image did not.
+        state
+            .health
+            .by_resource
+            .insert("/r/012".into(), crate::azure::demo::availability("/r/012"));
+
+        kick_off_loads_for_view(&mut state, &auth, &tx, /* force */ false);
+
+        assert!(
+            state.health.pending.is_empty(),
+            "cached health is not re-fetched"
+        );
+        let image: Vec<&String> = state.func_image.pending.iter().collect();
+        assert_eq!(image, ["/r/012"]);
+        let kinds: Vec<&str> = drain(&mut rx)
+            .iter()
+            .map(|ev| match ev {
+                AppEvent::HealthLoaded { .. } => "health",
+                AppEvent::FunctionAppImageLoaded { .. } => "image",
+                _ => "other",
+            })
+            .collect();
+        assert!(!kinds.contains(&"health"));
+        assert!(kinds.contains(&"image"));
+    }
+
+    #[tokio::test]
+    async fn queued_permit_is_dropped_when_the_generation_moves() {
+        // Fill the gate so a queued acquire has to wait.
+        let gate = health_fetch_gate();
+        let held = gate
+            .clone()
+            .acquire_many_owned(HEALTH_FETCH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let queued = tokio::spawn(acquire_list_decoration_permit(/* priority */ false));
+        // Give the task a chance to park on the semaphore.
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished(), "must wait for a permit");
+
+        // Cancel while queued, then free the gate.
+        crate::ui::state::LIST_DECORATION_GENERATION
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        assert!(
+            queued.await.unwrap().is_none(),
+            "a cancelled fetch must bail out instead of calling Azure"
+        );
+
+        // Priority fetches never touch the gate, even when it is full.
+        let _held = gate
+            .acquire_many_owned(HEALTH_FETCH_CONCURRENCY as u32)
+            .await
+            .unwrap();
+        let permit = acquire_list_decoration_permit(/* priority */ true).await;
+        assert!(matches!(permit, Some(None)));
+    }
+
+    #[test]
+    fn portal_url_storage_views_target_the_container_queue_and_blob_blades() {
+        use crate::azure::storage::{BlobContainer, QueueListing, StorageQueue};
+        let mut account = crate::azure::demo::storage_accounts(&[]).remove(0);
+        account.id =
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/acct"
+                .into();
+        let mut state = fresh_state();
+        state.storage.selected_account = Some(account.clone());
+
+        // Containers list with nothing loaded → the account's Containers blade.
+        state.view = View::StorageContainers;
+        let url = portal_url_for(&state).unwrap();
+        assert!(
+            url.ends_with("/storageAccounts/acct/containersList"),
+            "{url}"
+        );
+
+        // A highlighted container → that container's own blade.
+        state.storage.containers.insert(
+            account.id.clone(),
+            vec![BlobContainer {
+                name: "events".into(),
+                public_access: None,
+                last_modified: None,
+                has_immutability_policy: None,
+            }],
+        );
+        state.storage.containers_cursor = 0;
+        let url = portal_url_for(&state).unwrap();
+        assert!(
+            url.contains("Microsoft_Azure_Storage/ContainerMenuBlade"),
+            "{url}"
+        );
+        assert!(
+            url.ends_with("storageAccountId/%2Fsubscriptions%2FX%2FresourceGroups%2Frg%2Fproviders%2FMicrosoft.Storage%2FstorageAccounts%2Facct/path/events"),
+            "{url}"
+        );
+
+        // Inside the container (any folder depth) → the container blade.
+        state.view = View::StorageBlobs;
+        state.storage.selected_container = Some("events".into());
+        state.storage.blobs_prefix = "2026/".into();
+        let url = portal_url_for(&state).unwrap();
+        assert!(url.ends_with("/path/events"), "{url}");
+
+        // A pinned blob → its properties blade with the full path.
+        state.view = View::StorageBlobDetail;
+        state.storage.selected_blob = Some("2026/a b.json".into());
+        let url = portal_url_for(&state).unwrap();
+        assert!(url.contains("BlobPropertiesBladeV2"), "{url}");
+        assert!(url.contains("/path/events%2F2026%2Fa%20b.json/"), "{url}");
+
+        // Queues: the list always opens the account's Queues blade, even
+        // with a row highlighted; drilling into a queue opens that queue.
+        state.view = View::StorageQueues;
+        state.storage.queues.insert(
+            account.id.clone(),
+            QueueListing {
+                queues: vec![StorageQueue {
+                    name: "orders".into(),
+                    approximate_message_count: None,
+                }],
+                count_error: None,
+            },
+        );
+        let url = portal_url_for(&state).unwrap();
+        assert!(url.ends_with("/storageAccounts/acct/queueList"), "{url}");
+        state.view = View::StorageQueueMessages;
+        state.storage.selected_queue = Some("orders".into());
+        let url = portal_url_for(&state).unwrap();
+        assert!(url.contains("QueueMenuBlade"), "{url}");
+        assert!(url.ends_with("/queueName/orders"), "{url}");
+
+        // The account overview stays on the account.
+        state.view = View::StorageAccountOverview;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/storageAccounts/acct"));
+    }
+
+    #[test]
+    fn portal_url_registry_repository_views_target_the_repository_blade() {
+        use crate::azure::registries::Repository;
+        let mut registry = crate::azure::demo::registries(&[]).remove(0);
+        registry.id = "/subscriptions/X/resourceGroups/rg/providers/Microsoft.ContainerRegistry/registries/reg".into();
+        let mut state = fresh_state();
+        state.registry.selected_registry = Some(registry.clone());
+        state.view = View::RegistryRepositories;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/registries/reg/repository"));
+
+        state.registry.repositories.insert(
+            registry.id.clone(),
+            vec![Repository {
+                name: "team/api".into(),
+            }],
+        );
+        let url = portal_url_for(&state).unwrap();
+        assert!(
+            url.contains("Microsoft_Azure_ContainerRegistries/RepositoryBlade/id/"),
+            "{url}"
+        );
+        assert!(url.ends_with("/repository/team%2Fapi"), "{url}");
+
+        state.view = View::RegistryTags;
+        state.registry.selected_repository = Some("team/api".into());
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/repository/team%2Fapi"));
+    }
+
+    #[test]
+    fn portal_url_service_bus_rows_open_the_entity_itself() {
+        use crate::azure::service_bus::EntityKind;
+        let mut ns = crate::azure::demo::sb_namespaces(&[]).remove(0);
+        ns.id = "/subscriptions/X/resourceGroups/rg/providers/Microsoft.ServiceBus/namespaces/ns"
+            .into();
+        let mut state = fresh_state();
+        state.service_bus.selected_namespace = Some(ns.clone());
+        state.service_bus.entity_kind = EntityKind::Queue;
+        state.view = View::ServiceBusEntities;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/namespaces/ns/queues"));
+
+        let mut queue = crate::azure::demo::sb_queues(&ns).remove(0);
+        queue.id = format!("{}/queues/orders", ns.id);
+        queue.name = "orders".into();
+        state.service_bus.queues.insert(ns.id.clone(), vec![queue]);
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/namespaces/ns/queues/orders"));
+
+        state.service_bus.entity_kind = EntityKind::Topic;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/namespaces/ns/topics"));
+
+        state.view = View::ServiceBusSubscriptions;
+        state.service_bus.selected_topic = Some("events".into());
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/namespaces/ns/topics/events"));
+        let mut sub = crate::azure::demo::sb_subscriptions(&ns, "events").remove(0);
+        sub.id = format!("{}/topics/events/subscriptions/billing", ns.id);
+        sub.name = "billing".into();
+        state.service_bus.subscriptions.insert(
+            crate::ui::state::ServiceBusCache::subscriptions_key(&ns.id, "events"),
+            vec![sub],
+        );
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/topics/events/subscriptions/billing"));
+    }
+
+    #[test]
+    fn portal_url_sql_audit_targets_the_auditing_blade_of_its_scope() {
+        use crate::azure::sql_audit::AuditTarget;
+        let mut state = fresh_state();
+        state.view = View::SqlAuditEvents;
+        // Server-wide audit (opened on a pool): scope is the logical server.
+        state.sql.audit.target = Some(AuditTarget {
+            master_id: "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Sql/servers/srv/databases/master".into(),
+            database_id: None,
+            server: "srv".into(),
+            database: None,
+        });
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/servers/srv/auditing"));
+        // Database-scoped audit.
+        state.sql.audit.target = Some(AuditTarget {
+            master_id: "/subscriptions/X/resourceGroups/rg/providers/Microsoft.Sql/servers/srv/databases/master".into(),
+            database_id: Some("/subscriptions/X/resourceGroups/rg/providers/Microsoft.Sql/servers/srv/databases/app".into()),
+            server: "srv".into(),
+            database: Some("app".into()),
+        });
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/servers/srv/databases/app/auditing"));
+        assert_eq!(sql_server_id_from_master("/x/servers/s"), "/x/servers/s");
+    }
+
+    #[test]
+    fn portal_url_key_vault_items_follow_the_item_kind() {
+        use crate::azure::key_vault::ItemKind;
+        let mut vault = crate::azure::demo::key_vaults(&[]).remove(0);
+        vault.id =
+            "/subscriptions/X/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/kv".into();
+        let mut state = fresh_state();
+        state.key_vault.selected_vault = Some(vault);
+        state.view = View::KeyVaultItems;
+        state.key_vault.items_kind = ItemKind::Secret;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/vaults/kv/secrets"));
+        state.key_vault.items_kind = ItemKind::Certificate;
+        assert!(portal_url_for(&state)
+            .unwrap()
+            .ends_with("/vaults/kv/certificates"));
     }
 }

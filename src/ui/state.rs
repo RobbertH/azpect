@@ -188,6 +188,9 @@ impl Category {
                 // longer owns this flag. Left `true`, the flag would debounce
                 // away the re-fetch for the *new* scope.
                 state.loading_resources = false;
+                // Per-row decoration fetches still queued for the old scope
+                // would burn ARM calls on rows nobody is looking at anymore.
+                state.cancel_queued_list_decorations();
             }
             Category::Storage => {
                 state.storage = StorageCache::default();
@@ -760,6 +763,19 @@ pub struct DetailModal {
     pub lines: Vec<String>,
     /// Vertical scroll offset (in rendered rows) inside the modal body.
     pub scroll: u16,
+}
+
+/// Bumped by [`AppState::cancel_queued_list_decorations`]. Every gated
+/// list-decoration fetch captures the value when it is spawned and, once it
+/// finally gets a permit, bails out without calling Azure if the value moved
+/// in the meantime — so a drill-in or scope switch empties the queue instead
+/// of letting hundreds of stale per-row requests drain through the gate.
+pub static LIST_DECORATION_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Current value of [`LIST_DECORATION_GENERATION`].
+pub fn list_decoration_generation() -> u64 {
+    LIST_DECORATION_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Per-resource cached Azure Resource Health availability. Populated by a
@@ -2913,6 +2929,11 @@ pub struct AppState {
     /// [`crate::ui::views::edge_scroll`] so the window only moves when the
     /// cursor pushes against an edge. `Cell` because render takes `&AppState`.
     pub list_view_top: Cell<usize>,
+    /// How many resource rows the list body showed on the last render. Set by
+    /// the list view (hence `Cell`) and read by the post-draw decoration sweep
+    /// so per-row health / overview / image fetches go out only for rows the
+    /// user can actually see — see [`AppState::visible_list_resources`].
+    pub list_visible_rows: Cell<usize>,
     pub list_filter: Input,
     pub list_filter_active: bool,
     pub favorites_only: bool,
@@ -3063,6 +3084,7 @@ impl AppState {
             resources: Vec::new(),
             list_cursor: 0,
             list_view_top: Cell::new(0),
+            list_visible_rows: Cell::new(0),
             list_filter: Input::default(),
             list_filter_active: false,
             favorites_only: false,
@@ -3157,10 +3179,11 @@ impl AppState {
     }
 
     /// Progress of the per-row decoration fetches for the *current* resource
-    /// list — health badge for every row, overview for Container Apps, image
-    /// for Function Apps — as `(back, launched)`. These fetches are throttled
-    /// through a shared semaphore to avoid ARM 429s, so on a large
-    /// subscription the list takes a while to settle; the header uses this to
+    /// list — health badge, overview for Container Apps, image for Function
+    /// Apps — as `(back, launched)`. Fetches are issued for the rows on screen
+    /// only ([`AppState::visible_list_resources`]) and throttled through a
+    /// shared semaphore to avoid ARM 429s, so `launched` grows as the user
+    /// scrolls rather than covering the whole scope up front; the header uses this to
     /// show that progress instead of leaving the user staring at LOADING
     /// badges with no sense of how far along the sweep is. `None` once
     /// nothing is in flight (the indicator should disappear, not stick at
@@ -3277,6 +3300,34 @@ impl AppState {
             .filter(|r| !self.favorites_only || self.config.is_favorite(&r.id))
             .filter(|r| needle.is_empty() || is_subsequence(&needle, &r.name.to_lowercase()))
             .collect()
+    }
+
+    /// The slice of [`AppState::filtered_resources`] the list body currently
+    /// shows: `list_view_top .. list_view_top + list_visible_rows`, both as
+    /// reconciled by the last render. Empty before the first render with rows
+    /// (the sweep runs again after every draw, so nothing is lost).
+    pub fn visible_list_resources(&self) -> Vec<&Resource> {
+        let filtered = self.filtered_resources();
+        let top = self.list_view_top.get().min(filtered.len());
+        let end = top
+            .saturating_add(self.list_visible_rows.get())
+            .min(filtered.len());
+        filtered[top..end].to_vec()
+    }
+
+    /// Drop every per-row list decoration fetch (health, Container App
+    /// overview + replicas, Function App image) that is still *queued* behind
+    /// the concurrency gate, and forget their pending markers so the next
+    /// visible-window sweep (or a priority fetch) can re-issue them. Fetches
+    /// already holding a permit run to completion and land normally. Called
+    /// when the user drills into one resource — its own fetches then go out
+    /// ahead of the gate — and when the list's scope changes.
+    pub fn cancel_queued_list_decorations(&mut self) {
+        LIST_DECORATION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.health.pending.clear();
+        self.container_app_overview.pending.clear();
+        self.replica_instances.pending.clear();
+        self.func_image.pending.clear();
     }
 
     /// Re-anchor `list_cursor` after `resources` is replaced (e.g. by the 60s
