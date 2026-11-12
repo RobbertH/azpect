@@ -52,9 +52,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         format!("· {} ", state.key_vault.access_window.label()),
         Style::default().fg(theme.fg),
     ));
-    if state.key_vault.access_truncated {
+    if state.key_vault.access_loading_more {
         title_spans.push(Span::styled(
-            "· newest rows only (window has more) ",
+            "· loading older… ",
+            Style::default().fg(theme.muted),
+        ));
+    } else if state.key_vault.access_truncated {
+        title_spans.push(Span::styled(
+            "· scroll past bottom for older rows ",
             Style::default().fg(theme.degraded),
         ));
     }
@@ -282,10 +287,25 @@ fn invalidate_fetch(state: &mut AppState) {
     state.key_vault.access_error = None;
     state.key_vault.access_hidden = None;
     state.key_vault.access_truncated = false;
+    state.key_vault.access_loading_more = false;
+    state.key_vault.access_fetch_older = false;
     state.key_vault.access_cursor = 0;
     state.key_vault.access_view_top.set(0);
     state.key_vault.access_operation = None;
     state.key_vault.access_generation = state.key_vault.access_generation.wrapping_add(1);
+}
+
+/// Ask for the page older than the loaded buffer, if the window has more and
+/// no fetch is already running.
+fn request_older_page(state: &mut AppState) {
+    let kv = &mut state.key_vault;
+    if kv.access_truncated
+        && !kv.access_loading_more
+        && !kv.access_pending
+        && kv.access_events.is_some()
+    {
+        kv.access_fetch_older = true;
+    }
 }
 
 fn set_window(state: &mut AppState, window: AccessWindow) -> bool {
@@ -383,6 +403,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     match action {
         Action::MoveDown => {
             if len > 0 {
+                // Already on the last row: ask for the older-than page
+                // (drained by `after_action` — handlers can't spawn).
+                if state.key_vault.access_cursor + 1 >= len {
+                    request_older_page(state);
+                }
                 state.key_vault.access_cursor = (state.key_vault.access_cursor + 1).min(len - 1);
             }
             true
@@ -393,6 +418,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::HalfPageDown => {
             if len > 0 {
+                if state.key_vault.access_cursor + HALF_PAGE >= len {
+                    request_older_page(state);
+                }
                 state.key_vault.access_cursor =
                     (state.key_vault.access_cursor + HALF_PAGE).min(len - 1);
             }
@@ -408,6 +436,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::GotoBottom => {
             state.key_vault.access_cursor = len.saturating_sub(1);
+            request_older_page(state);
             true
         }
         Action::SetWindowHour => set_window(state, AccessWindow::Hour),
@@ -653,5 +682,83 @@ mod tests {
         term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("diagnostic settings"));
+    }
+
+    #[test]
+    fn pushing_past_the_last_row_requests_an_older_page() {
+        let mut state = fixture();
+        state.key_vault.access_truncated = true;
+
+        // Not at the bottom yet: plain movement.
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.key_vault.access_fetch_older);
+        handle(Action::MoveDown, &mut state);
+        assert_eq!(state.key_vault.access_cursor, 2);
+        assert!(!state.key_vault.access_fetch_older);
+
+        // On the last row: the next `j` asks for more.
+        handle(Action::MoveDown, &mut state);
+        assert!(state.key_vault.access_fetch_older);
+        assert_eq!(state.key_vault.access_cursor, 2);
+
+        // `G` and a half-page that reaches the end do too.
+        state.key_vault.access_fetch_older = false;
+        state.key_vault.access_cursor = 0;
+        handle(Action::GotoBottom, &mut state);
+        assert!(state.key_vault.access_fetch_older);
+        state.key_vault.access_fetch_older = false;
+        state.key_vault.access_cursor = 0;
+        handle(Action::HalfPageDown, &mut state);
+        assert!(state.key_vault.access_fetch_older);
+    }
+
+    #[test]
+    fn no_older_page_when_window_is_exhausted_or_a_fetch_is_running() {
+        let mut state = fixture();
+        state.key_vault.access_cursor = 2;
+
+        state.key_vault.access_truncated = false;
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.key_vault.access_fetch_older, "nothing older to get");
+
+        state.key_vault.access_truncated = true;
+        state.key_vault.access_loading_more = true;
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.key_vault.access_fetch_older, "already loading");
+
+        state.key_vault.access_loading_more = false;
+        state.key_vault.access_pending = true;
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.key_vault.access_fetch_older, "refresh in flight");
+    }
+
+    #[test]
+    fn scope_change_cancels_older_paging() {
+        let mut state = fixture();
+        state.key_vault.access_truncated = true;
+        state.key_vault.access_loading_more = true;
+        state.key_vault.access_fetch_older = true;
+        handle(Action::SetWindowWeek, &mut state);
+        assert!(!state.key_vault.access_truncated);
+        assert!(!state.key_vault.access_loading_more);
+        assert!(!state.key_vault.access_fetch_older);
+    }
+
+    #[test]
+    fn header_says_how_to_get_older_rows() {
+        let theme = crate::ui::theme::Theme::catppuccin_mocha();
+        let backend = TestBackend::new(160, 14);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        state.key_vault.access_truncated = true;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("scroll past bottom for older rows"));
+
+        state.key_vault.access_loading_more = true;
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let s = format!("{:?}", term.backend().buffer());
+        assert!(s.contains("loading older"));
+        assert!(!s.contains("scroll past bottom"));
     }
 }

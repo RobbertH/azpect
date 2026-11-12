@@ -18,9 +18,9 @@ use crate::azure::auth::{AzureAuth, SCOPE_LOGS};
 use crate::azure::client::LogsClient;
 use crate::azure::key_vault::KeyVault;
 
-/// Rows per query. Key Vault audit volumes are usually modest; one page keeps
-/// the fetch simple. A full page sets [`AccessPage::truncated`] so the UI can
-/// say "newest 500" instead of implying completeness.
+/// Rows per query. A full page sets [`AccessPage::truncated`]; scrolling past
+/// the bottom then fetches the next page *older than* the oldest row held
+/// (`before` on [`fetch`]), same as the logs view.
 pub const ACCESS_PAGE_SIZE: u32 = 500;
 
 /// Time window for the access-logs query. Unlike
@@ -232,6 +232,7 @@ pub async fn fetch(
     window: &AccessWindow,
     scope: Option<&ItemScope>,
     exclude_self: bool,
+    before: Option<DateTime<Utc>>,
 ) -> anyhow::Result<AccessPage> {
     // Resolve "me" from the same token the query will use — no extra call.
     let hidden = if exclude_self {
@@ -248,11 +249,16 @@ pub async fn fetch(
         None
     };
 
-    let kql = build_access_kql(scope, hidden.as_ref());
+    let kql = build_access_kql(scope, hidden.as_ref(), before);
     let client = LogsClient::new(auth.clone())?;
     let resp = client.query(&vault.id, &kql, &window.timespan()).await?;
-    let events = parse_access_response(&resp)?;
+    let mut events = parse_access_response(&resp)?;
     let truncated = events.len() as u32 >= ACCESS_PAGE_SIZE;
+    // Keep the page boundary between distinct timestamps so the next
+    // older-than page neither skips nor repeats a tied group.
+    if truncated {
+        crate::azure::logs::trim_boundary_ties(&mut events, |e| e.ts);
+    }
     Ok(AccessPage {
         events,
         truncated,
@@ -268,7 +274,11 @@ fn escape_kql(value: &str) -> String {
 /// Build the `AzureDiagnostics` audit query. Identity columns are dynamic
 /// per-row in that table, so every reference goes through `column_ifexists` —
 /// a vault whose rows never carried a claim must not fail the whole query.
-fn build_access_kql(scope: Option<&ItemScope>, exclude: Option<&SelfIdentity>) -> String {
+fn build_access_kql(
+    scope: Option<&ItemScope>,
+    exclude: Option<&SelfIdentity>,
+    before: Option<DateTime<Utc>>,
+) -> String {
     let mut kql = String::from(
         r#"AzureDiagnostics
 | where Category == "AuditEvent"
@@ -305,6 +315,12 @@ fn build_access_kql(scope: Option<&ItemScope>, exclude: Option<&SelfIdentity>) -
         if !clauses.is_empty() {
             kql.push_str(&format!("| where not({})\n", clauses.join(" or ")));
         }
+    }
+    if let Some(before) = before {
+        kql.push_str(&crate::azure::logs::older_than_clause(
+            "TimeGenerated",
+            before,
+        ));
     }
     kql.push_str(&format!(
         "| order by TimeGenerated desc\n| take {ACCESS_PAGE_SIZE}\n| project TimeGenerated, OperationName, upn_, mirid_, appid_, ip_, obj_, result_, status_\n"
@@ -473,7 +489,7 @@ mod tests {
             ip: Some("203.0.113.7".into()),
             oid: None,
         };
-        let kql = build_access_kql(Some(&scope), Some(&me));
+        let kql = build_access_kql(Some(&scope), Some(&me), None);
         assert!(kql.contains(r#"obj_ contains "/secrets/orders-db-connection""#));
         assert!(kql.contains(r#"not(upn_ == "robbert@contoso.com" or ip_ == "203.0.113.7")"#));
         assert!(kql.contains("take 500"));
@@ -484,8 +500,22 @@ mod tests {
 
     #[test]
     fn kql_without_filters_has_no_where_beyond_category() {
-        let kql = build_access_kql(None, None);
+        let kql = build_access_kql(None, None, None);
         assert_eq!(kql.matches("| where").count(), 1, "{kql}");
+    }
+
+    #[test]
+    fn kql_older_than_cursor_filters_before_order_and_take() {
+        // 100ns-precision stamp: the cursor must round-trip at full precision
+        // or the strict `<` would skip same-microsecond siblings.
+        let before = DateTime::parse_from_rfc3339("2026-08-01T10:00:00.1234567Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_access_kql(None, None, Some(before));
+        let cursor = r#"| where TimeGenerated < datetime("2026-08-01T10:00:00.123456700Z")"#;
+        let cursor_idx = kql.find(cursor).unwrap_or_else(|| panic!("{kql}"));
+        assert!(cursor_idx < kql.find("| order by").unwrap(), "{kql}");
+        assert!(cursor_idx < kql.find("| take").unwrap(), "{kql}");
     }
 
     #[test]

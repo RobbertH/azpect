@@ -382,7 +382,7 @@ pub async fn fetch(
     // Context windows (`around`) are never paginated, so trimming there would
     // lose rows for no benefit.
     if has_more && around.is_none() {
-        trim_boundary_ties(&mut lines);
+        trim_boundary_ties(&mut lines, |l| l.ts);
     }
     Ok(LogsPage {
         lines,
@@ -396,14 +396,31 @@ pub async fn fetch(
 /// timestamp — trimming would then make no progress at all, so we keep the
 /// page and accept that pagination may skip unseen siblings of that single
 /// timestamp (500+ rows on one 100ns tick; not a realistic workload).
-fn trim_boundary_ties(lines: &mut Vec<LogLine>) {
-    let Some(oldest) = lines.last().map(|l| l.ts) else {
+///
+/// Shared by every newest-first KQL view that pages with
+/// [`older_than_clause`]; `ts` reads a row's `TimeGenerated`.
+pub(crate) fn trim_boundary_ties<T>(rows: &mut Vec<T>, ts: impl Fn(&T) -> DateTime<Utc>) {
+    let Some(oldest) = rows.last().map(&ts) else {
         return;
     };
-    let tied = lines.iter().rev().take_while(|l| l.ts == oldest).count();
-    if tied < lines.len() {
-        lines.truncate(lines.len() - tied);
+    let tied = rows.iter().rev().take_while(|r| ts(r) == oldest).count();
+    if tied < rows.len() {
+        rows.truncate(rows.len() - tied);
     }
+}
+
+/// The `| where <column> < …` line that asks for the page *older than* the
+/// oldest row already loaded. `column` is `TimeGenerated`, or whatever the
+/// query projected it as (SQL audit's `ts`). Full nanosecond precision — KQL
+/// `datetime()` accepts RFC3339 with nanos, and TimeGenerated carries 100ns
+/// precision, so anything coarser (e.g. micros) rounds the cursor *below* the
+/// oldest received row and the strict `<` then skips its same-microsecond
+/// older siblings. Strict `<` itself is safe against rows that share the
+/// cursor timestamp exactly because callers [`trim_boundary_ties`] off every
+/// full page, so the oldest row held is always the last of its group.
+pub(crate) fn older_than_clause(column: &str, ts: DateTime<Utc>) -> String {
+    let stamp = ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    format!("| where {column} < datetime(\"{stamp}\")\n")
 }
 
 /// Half-width of the "context around an error" window. A failed request and the
@@ -476,17 +493,7 @@ fn build_kql(
         filter_block.push('\n');
     }
     if let Some(ts) = older_than {
-        // Full nanosecond precision — KQL `datetime()` accepts RFC3339 with
-        // nanos, and TimeGenerated carries 100ns precision, so anything
-        // coarser (e.g. micros) rounds the cursor *below* the oldest received
-        // row and the strict `<` then skips its same-microsecond older
-        // siblings. Strict `<` itself is safe against rows that share the
-        // cursor timestamp exactly because [`fetch`] trims boundary-tied rows
-        // off every full page (see [`trim_boundary_ties`]), so the caller's
-        // oldest row is always the last of its timestamp group.
-        let stamp = ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        filter_block.push_str(&format!(r#"| where TimeGenerated < datetime("{stamp}")"#));
-        filter_block.push('\n');
+        filter_block.push_str(&older_than_clause("TimeGenerated", ts));
     }
 
     if filter_block.is_empty() {
@@ -1627,7 +1634,7 @@ mod tests {
             line_at("2026-01-01T00:00:01.5000000Z"),
             line_at("2026-01-01T00:00:01.5000000Z"),
         ];
-        trim_boundary_ties(&mut lines);
+        trim_boundary_ties(&mut lines, |l| l.ts);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].ts, line_at("2026-01-01T00:00:02Z").ts);
     }
@@ -1640,7 +1647,7 @@ mod tests {
             line_at("2026-01-01T00:00:02Z"),
             line_at("2026-01-01T00:00:01Z"),
         ];
-        trim_boundary_ties(&mut lines);
+        trim_boundary_ties(&mut lines, |l| l.ts);
         assert_eq!(lines.len(), 1);
 
         // Pathological all-one-timestamp page: trimming would empty it and
@@ -1649,11 +1656,11 @@ mod tests {
             line_at("2026-01-01T00:00:01Z"),
             line_at("2026-01-01T00:00:01Z"),
         ];
-        trim_boundary_ties(&mut lines);
+        trim_boundary_ties(&mut lines, |l| l.ts);
         assert_eq!(lines.len(), 2);
 
         let mut empty: Vec<LogLine> = vec![];
-        trim_boundary_ties(&mut empty);
+        trim_boundary_ties(&mut empty, |l| l.ts);
         assert!(empty.is_empty());
     }
 

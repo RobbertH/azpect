@@ -27,10 +27,10 @@ use crate::azure::client::LogsClient;
 use crate::azure::key_vault_logs::{AccessWindow, SelfIdentity};
 use crate::azure::registries::Registry;
 
-/// Rows per query — same single-page discipline as
+/// Rows per query — same paging as
 /// [`crate::azure::key_vault_logs::ACCESS_PAGE_SIZE`]: a full page sets
-/// [`AccessPage::truncated`] so the UI can say "newest 500" instead of
-/// implying completeness.
+/// [`AccessPage::truncated`] and scrolling past the bottom fetches the page
+/// older than the oldest row held (`before` on [`fetch`]).
 pub const ACCESS_PAGE_SIZE: u32 = 500;
 
 /// What the `Identity` column resolved to — drives the column styling and
@@ -105,6 +105,7 @@ pub async fn fetch(
     window: &AccessWindow,
     repository: Option<&str>,
     exclude_self: bool,
+    before: Option<DateTime<Utc>>,
 ) -> anyhow::Result<AccessPage> {
     // Resolve "me" from the same token the query will use — no extra call.
     let hidden = if exclude_self {
@@ -119,11 +120,16 @@ pub async fn fetch(
         None
     };
 
-    let kql = build_access_kql(repository, hidden.as_ref());
+    let kql = build_access_kql(repository, hidden.as_ref(), before);
     let client = LogsClient::new(auth.clone())?;
     let resp = client.query(&registry.id, &kql, &window.timespan()).await?;
-    let events = parse_access_response(&resp, &registry.name)?;
+    let mut events = parse_access_response(&resp, &registry.name)?;
     let truncated = events.len() as u32 >= ACCESS_PAGE_SIZE;
+    // Keep the page boundary between distinct timestamps so the next
+    // older-than page neither skips nor repeats a tied group.
+    if truncated {
+        crate::azure::logs::trim_boundary_ties(&mut events, |e| e.ts);
+    }
     Ok(AccessPage {
         events,
         truncated,
@@ -228,7 +234,11 @@ fn escape_kql(value: &str) -> String {
 /// a resource-specific table with a fixed schema, but every optional column
 /// still goes through `column_ifexists` — matching the Key Vault module's
 /// defensive posture against schema drift across clouds / API versions.
-fn build_access_kql(repository: Option<&str>, exclude: Option<&SelfIdentity>) -> String {
+fn build_access_kql(
+    repository: Option<&str>,
+    exclude: Option<&SelfIdentity>,
+    before: Option<DateTime<Utc>>,
+) -> String {
     let mut kql = String::from(
         r#"ContainerRegistryRepositoryEvents
 | extend identity_ = tostring(column_ifexists("Identity", ""))
@@ -258,6 +268,12 @@ fn build_access_kql(repository: Option<&str>, exclude: Option<&SelfIdentity>) ->
         if !clauses.is_empty() {
             kql.push_str(&format!("| where not({})\n", clauses.join(" or ")));
         }
+    }
+    if let Some(before) = before {
+        kql.push_str(&crate::azure::logs::older_than_clause(
+            "TimeGenerated",
+            before,
+        ));
     }
     kql.push_str(&format!(
         "| order by TimeGenerated desc\n| take {ACCESS_PAGE_SIZE}\n| project TimeGenerated, OperationName, identity_, ip_, repo_, tag_, digest_, result_\n"
@@ -373,7 +389,7 @@ mod tests {
             ip: Some("203.0.113.7".into()),
             oid: Some("9e8d7c6b-5a49-4038-b2c1-d0e9f8a7b6c5".into()),
         };
-        let kql = build_access_kql(Some("team/svc"), Some(&me));
+        let kql = build_access_kql(Some("team/svc"), Some(&me), None);
         assert!(kql.contains(r#"repo_ =~ "team/svc""#));
         assert!(kql.contains(r#"tolower(identity_) == "robbert@contoso.com""#));
         assert!(kql.contains(r#"tolower(identity_) == "9e8d7c6b-5a49-4038-b2c1-d0e9f8a7b6c5""#));
@@ -422,7 +438,7 @@ mod tests {
 
     #[test]
     fn kql_without_filters_has_no_where() {
-        let kql = build_access_kql(None, None);
+        let kql = build_access_kql(None, None, None);
         assert_eq!(kql.matches("| where").count(), 0, "{kql}");
     }
 
@@ -491,5 +507,16 @@ mod tests {
         assert_eq!(events[1].tag, None);
         assert_eq!(events[1].image(), "base/dotnet-runtime");
         assert_eq!(events[1].result, "denied: pushes disabled");
+    }
+
+    #[test]
+    fn kql_older_than_cursor_filters_before_order_and_take() {
+        let before = DateTime::parse_from_rfc3339("2026-08-01T10:00:00.1234567Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_access_kql(None, None, Some(before));
+        let cursor = r#"| where TimeGenerated < datetime("2026-08-01T10:00:00.123456700Z")"#;
+        let cursor_idx = kql.find(cursor).unwrap_or_else(|| panic!("{kql}"));
+        assert!(cursor_idx < kql.find("| order by").unwrap(), "{kql}");
     }
 }

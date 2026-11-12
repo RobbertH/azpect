@@ -1059,6 +1059,14 @@ pub struct StorageCache {
     pub access_operation: Option<String>,
     /// The page came back at the row cap — older rows in the window exist.
     pub access_truncated: bool,
+    /// An *older-than* page is in flight (scroll-past-bottom fetch). Distinct
+    /// from `access_pending` so the body doesn't wipe back to "loading" while
+    /// appending — mirrors `LogsCache::loading_more`.
+    pub access_loading_more: bool,
+    /// Set by the view when the cursor pushes past the last row and the
+    /// window has more; drained by `after_action`, which spawns the
+    /// older-than fetch (view handlers can't spawn tasks).
+    pub access_fetch_older: bool,
     /// Where Esc should land: `StorageContainers` when opened from a
     /// container row, `StorageAccounts` when opened from the accounts list.
     pub access_return_view: Option<View>,
@@ -1369,6 +1377,8 @@ impl StorageCache {
         self.access_scope = scope;
         self.access_operation = None;
         self.access_truncated = false;
+        self.access_loading_more = false;
+        self.access_fetch_older = false;
         self.access_return_view = Some(return_view);
         self.access_window_input.reset();
         self.access_window_input_active = false;
@@ -1450,6 +1460,14 @@ pub struct RegistryCache {
     pub access_operation: Option<String>,
     /// The page came back at the row cap — older rows in the window exist.
     pub access_truncated: bool,
+    /// An *older-than* page is in flight (scroll-past-bottom fetch). Distinct
+    /// from `access_pending` so the body doesn't wipe back to "loading" while
+    /// appending — mirrors `LogsCache::loading_more`.
+    pub access_loading_more: bool,
+    /// Set by the view when the cursor pushes past the last row and the
+    /// window has more; drained by `after_action`, which spawns the
+    /// older-than fetch (view handlers can't spawn tasks).
+    pub access_fetch_older: bool,
     /// Where Esc should land: `RegistryRepositories` when opened from a repo
     /// row, `Registries` when opened from the registries list.
     pub access_return_view: Option<View>,
@@ -1616,6 +1634,8 @@ impl RegistryCache {
         self.access_scope = scope;
         self.access_operation = None;
         self.access_truncated = false;
+        self.access_loading_more = false;
+        self.access_fetch_older = false;
         self.access_return_view = Some(return_view);
         self.access_window_input.reset();
         self.access_window_input_active = false;
@@ -1947,6 +1967,14 @@ pub struct KeyVaultCache {
     pub access_operation: Option<String>,
     /// The page came back at the row cap — older rows in the window exist.
     pub access_truncated: bool,
+    /// An *older-than* page is in flight (scroll-past-bottom fetch). Distinct
+    /// from `access_pending` so the body doesn't wipe back to "loading" while
+    /// appending — mirrors `LogsCache::loading_more`.
+    pub access_loading_more: bool,
+    /// Set by the view when the cursor pushes past the last row and the
+    /// window has more; drained by `after_action`, which spawns the
+    /// older-than fetch (view handlers can't spawn tasks).
+    pub access_fetch_older: bool,
     /// Where Esc should land: `KeyVaultItems` when opened from an item row,
     /// `KeyVaults` when opened from the vaults list.
     pub access_return_view: Option<View>,
@@ -2064,6 +2092,8 @@ impl KeyVaultCache {
         self.access_scope = scope;
         self.access_operation = None;
         self.access_truncated = false;
+        self.access_loading_more = false;
+        self.access_fetch_older = false;
         self.access_return_view = Some(return_view);
         self.access_window_input.reset();
         self.access_window_input_active = false;

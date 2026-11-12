@@ -1183,6 +1183,9 @@ fn handle_events(action: Action, state: &mut AppState) -> bool {
         }
         Action::HalfPageDown => {
             if len > 0 {
+                if audit.events_cursor + HALF_PAGE >= len {
+                    request_older_page(audit);
+                }
                 audit.events_cursor = (audit.events_cursor + HALF_PAGE).min(len - 1);
             }
             true
@@ -1769,6 +1772,11 @@ mod tests {
         assert!(!state.sql.audit.events_fetch_older);
         // At the last row: the next MoveDown asks for the older page.
         assert!(handle(Action::MoveDown, &mut state));
+        assert!(state.sql.audit.events_fetch_older);
+        // A half-page that reaches the end asks too.
+        state.sql.audit.events_fetch_older = false;
+        state.sql.audit.events_cursor = 0;
+        assert!(handle(Action::HalfPageDown, &mut state));
         assert!(state.sql.audit.events_fetch_older);
         // G asks too; but a page that isn't truncated never does.
         state.sql.audit.events_fetch_older = false;

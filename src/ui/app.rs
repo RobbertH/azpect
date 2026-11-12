@@ -977,40 +977,12 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::StorageAccessLoaded { generation, result } => {
-                // Same stale-scope rule as `KeyVaultAccessLoaded`.
-                if generation == state.storage.access_generation {
-                    state.storage.access_pending = false;
-                    match result {
-                        Ok(page) => {
-                            // OAuth object ids resolve to directory names via
-                            // Graph — best-effort, cached, deduped like the
-                            // SQL audit roll-up's resolution.
-                            for e in &page.events {
-                                let Some(id) =
-                                    crate::azure::sql_audit::graph_candidate(&e.identity)
-                                else {
-                                    continue;
-                                };
-                                if state.principals.by_id.contains_key(&id)
-                                    || state.principals.failed.contains(&id)
-                                    || state.principals.pending.contains(&id)
-                                {
-                                    continue;
-                                }
-                                state.principals.pending.insert(id.clone());
-                                spawn_resolve_principal(auth.clone(), id, tx.clone());
-                            }
-                            state.storage.access_error = None;
-                            state.storage.access_truncated = page.truncated;
-                            state.storage.access_hidden = page.hidden;
-                            state.storage.access_events = Some(page.events);
-                            state.storage.access_cursor = 0;
-                            state.storage.access_view_top.set(0);
-                        }
-                        Err(e) => state.storage.access_error = Some(e),
-                    }
-                }
+            AppEvent::StorageAccessLoaded {
+                generation,
+                append,
+                result,
+            } => {
+                apply_storage_access_page(state, auth, tx, generation, append, result);
             }
             AppEvent::RegistriesLoaded { scope, result } => {
                 // Stale scope — see the `ResourcesLoaded` arm.
@@ -1106,41 +1078,12 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::RegistryAccessLoaded { generation, result } => {
-                // Same stale-scope rule as `KeyVaultAccessLoaded`.
-                if generation == state.registry.access_generation {
-                    state.registry.access_pending = false;
-                    match result {
-                        Ok(page) => {
-                            // GUID-shaped identities (service principals,
-                            // managed identities) resolve to directory names
-                            // via Graph — best-effort, cached, deduped like
-                            // the SQL audit roll-up's resolution.
-                            for e in &page.events {
-                                let Some(id) =
-                                    crate::azure::sql_audit::graph_candidate(&e.identity)
-                                else {
-                                    continue;
-                                };
-                                if state.principals.by_id.contains_key(&id)
-                                    || state.principals.failed.contains(&id)
-                                    || state.principals.pending.contains(&id)
-                                {
-                                    continue;
-                                }
-                                state.principals.pending.insert(id.clone());
-                                spawn_resolve_principal(auth.clone(), id, tx.clone());
-                            }
-                            state.registry.access_error = None;
-                            state.registry.access_truncated = page.truncated;
-                            state.registry.access_hidden = page.hidden;
-                            state.registry.access_events = Some(page.events);
-                            state.registry.access_cursor = 0;
-                            state.registry.access_view_top.set(0);
-                        }
-                        Err(e) => state.registry.access_error = Some(e),
-                    }
-                }
+            AppEvent::RegistryAccessLoaded {
+                generation,
+                append,
+                result,
+            } => {
+                apply_registry_access_page(state, auth, tx, generation, append, result);
             }
             AppEvent::RegistryAccessMetricsLoaded { generation, result } => {
                 // Same stale-scope rule as `RegistryAccessLoaded`: the chart's
@@ -1382,45 +1325,12 @@ async fn event_loop(
                     }
                 }
             }
-            AppEvent::KeyVaultAccessLoaded { generation, result } => {
-                // A page fetched under an older query scope (window / item /
-                // exclude-me changed while it was in flight) no longer
-                // describes what the header claims — drop it; the fetch for
-                // the current generation owns the pending flag.
-                if generation == state.key_vault.access_generation {
-                    state.key_vault.access_pending = false;
-                    match result {
-                        Ok(page) => {
-                            // App callers carry only the appId GUID claim —
-                            // resolve to directory names via Graph, best-effort,
-                            // cached and deduped like the storage access log.
-                            for e in &page.events {
-                                if e.caller_kind != crate::azure::key_vault_logs::CallerKind::App {
-                                    continue;
-                                }
-                                let Some(id) = crate::azure::sql_audit::graph_candidate(&e.caller)
-                                else {
-                                    continue;
-                                };
-                                if state.principals.by_id.contains_key(&id)
-                                    || state.principals.failed.contains(&id)
-                                    || state.principals.pending.contains(&id)
-                                {
-                                    continue;
-                                }
-                                state.principals.pending.insert(id.clone());
-                                spawn_resolve_principal(auth.clone(), id, tx.clone());
-                            }
-                            state.key_vault.access_error = None;
-                            state.key_vault.access_truncated = page.truncated;
-                            state.key_vault.access_hidden = page.hidden;
-                            state.key_vault.access_events = Some(page.events);
-                            state.key_vault.access_cursor = 0;
-                            state.key_vault.access_view_top.set(0);
-                        }
-                        Err(e) => state.key_vault.access_error = Some(e),
-                    }
-                }
+            AppEvent::KeyVaultAccessLoaded {
+                generation,
+                append,
+                result,
+            } => {
+                apply_key_vault_access_page(state, auth, tx, generation, append, result);
             }
             AppEvent::AppRegistrationsLoaded { scope, result } => {
                 // Stale scope (a re-login may have changed tenants) — see the
@@ -1523,6 +1433,12 @@ async fn event_loop(
                                 state.sql.audit.events_cursor = 0;
                                 state.sql.audit.events_view_top.set(0);
                             }
+                        }
+                        // Keep the rows on screen — the body renders
+                        // `events_error` instead of the table. See
+                        // `KeyVaultAccessLoaded`.
+                        Err(e) if append => {
+                            state.set_status(format!("couldn't load older rows: {e}"));
                         }
                         Err(e) => state.sql.audit.events_error = Some(e),
                     }
@@ -4382,6 +4298,17 @@ fn after_action(
         state.sql.audit.events_fetch_older = false;
         fetch_older_sql_audit_events(state, auth, tx);
     }
+    // Access logs (Key Vault / Storage / Registry): same flag-and-drain for
+    // the older-than page.
+    if std::mem::take(&mut state.key_vault.access_fetch_older) {
+        fetch_older_key_vault_access(state, auth, tx);
+    }
+    if std::mem::take(&mut state.storage.access_fetch_older) {
+        fetch_older_storage_access(state, auth, tx);
+    }
+    if std::mem::take(&mut state.registry.access_fetch_older) {
+        fetch_older_registry_access(state, auth, tx);
+    }
     // Cosmos items: same flag-and-drain for the scroll-near-bottom page.
     if std::mem::take(&mut state.cosmos.items_fetch_more) {
         fetch_more_cosmos_items(state, auth, tx);
@@ -5066,12 +4993,15 @@ fn kick_off_loads_for_view(
                     state.storage.access_generation =
                         state.storage.access_generation.wrapping_add(1);
                     state.storage.access_pending = true;
+                    state.storage.access_loading_more = false;
                     spawn_load_storage_access(
                         auth.clone(),
                         account,
                         state.storage.access_window.clone(),
                         state.storage.access_scope.clone(),
                         state.storage.access_exclude_self,
+                        None,
+                        /* append */ false,
                         state.storage.access_generation,
                         tx.clone(),
                     );
@@ -5176,12 +5106,15 @@ fn kick_off_loads_for_view(
                     state.registry.access_generation =
                         state.registry.access_generation.wrapping_add(1);
                     state.registry.access_pending = true;
+                    state.registry.access_loading_more = false;
                     spawn_load_registry_access(
                         auth.clone(),
                         registry.clone(),
                         state.registry.access_window.clone(),
                         state.registry.access_scope.clone(),
                         state.registry.access_exclude_self,
+                        None,
+                        /* append */ false,
                         state.registry.access_generation,
                         tx.clone(),
                     );
@@ -5566,12 +5499,15 @@ fn kick_off_loads_for_view(
                     state.key_vault.access_generation =
                         state.key_vault.access_generation.wrapping_add(1);
                     state.key_vault.access_pending = true;
+                    state.key_vault.access_loading_more = false;
                     spawn_load_key_vault_access(
                         auth.clone(),
                         vault,
                         state.key_vault.access_window.clone(),
                         state.key_vault.access_scope.clone(),
                         state.key_vault.access_exclude_self,
+                        None,
+                        /* append */ false,
                         state.key_vault.access_generation,
                         tx.clone(),
                     );
@@ -7749,23 +7685,28 @@ fn spawn_load_storage_blob_preview(
 /// Fetch one page of `StorageBlobLogs` rows for the storage access-logs view.
 /// `generation` is the query-scope token the result is validated against on
 /// landing (see `AppEvent::StorageAccessLoaded`).
+#[allow(clippy::too_many_arguments)]
 fn spawn_load_storage_access(
     auth: AzureAuth,
     account: crate::azure::storage::StorageAccount,
     window: crate::azure::key_vault_logs::AccessWindow,
     container: Option<String>,
     exclude_self: bool,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    append: bool,
     generation: u64,
     tx: UnboundedSender<AppEvent>,
 ) {
     if auth.is_demo() {
+        let mut page =
+            crate::azure::demo::storage_access(&window, container.as_deref(), exclude_self);
+        if let Some(before) = before {
+            page.events.retain(|e| e.ts < before);
+        }
         let _ = tx.send(AppEvent::StorageAccessLoaded {
             generation,
-            result: Ok(crate::azure::demo::storage_access(
-                &window,
-                container.as_deref(),
-                exclude_self,
-            )),
+            append,
+            result: Ok(page),
         });
         return;
     }
@@ -7776,11 +7717,109 @@ fn spawn_load_storage_access(
             &window,
             container.as_deref(),
             exclude_self,
+            before,
         )
         .await
         .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::StorageAccessLoaded { generation, result });
+        let _ = tx.send(AppEvent::StorageAccessLoaded {
+            generation,
+            append,
+            result,
+        });
     });
+}
+
+/// Land one storage access-log page (see `AppEvent::StorageAccessLoaded`).
+fn apply_storage_access_page(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    generation: u64,
+    append: bool,
+    result: Result<crate::azure::storage_logs::AccessPage, String>,
+) {
+    // Same stale-scope rule as `KeyVaultAccessLoaded`.
+    if generation == state.storage.access_generation {
+        state.storage.access_pending = false;
+        state.storage.access_loading_more = false;
+        match result {
+            Ok(page) => {
+                // OAuth object ids resolve to directory names via
+                // Graph — best-effort, cached, deduped like the
+                // SQL audit roll-up's resolution.
+                for e in &page.events {
+                    let Some(id) = crate::azure::sql_audit::graph_candidate(&e.identity) else {
+                        continue;
+                    };
+                    if state.principals.by_id.contains_key(&id)
+                        || state.principals.failed.contains(&id)
+                        || state.principals.pending.contains(&id)
+                    {
+                        continue;
+                    }
+                    state.principals.pending.insert(id.clone());
+                    spawn_resolve_principal(auth.clone(), id, tx.clone());
+                }
+                state.storage.access_error = None;
+                state.storage.access_truncated = page.truncated;
+                if append {
+                    // Older-than page: extend, keep the cursor
+                    // where the user was scrolling.
+                    state
+                        .storage
+                        .access_events
+                        .get_or_insert_with(Vec::new)
+                        .extend(page.events);
+                } else {
+                    state.storage.access_hidden = page.hidden;
+                    state.storage.access_events = Some(page.events);
+                    state.storage.access_cursor = 0;
+                    state.storage.access_view_top.set(0);
+                }
+            }
+            // Keep the rows on screen — see `KeyVaultAccessLoaded`.
+            Err(e) if append => {
+                state.set_status(format!("couldn't load older rows: {e}"));
+            }
+            Err(e) => state.storage.access_error = Some(e),
+        }
+    }
+}
+
+/// Spawn the *older-than* storage access page for the scroll-past-bottom fetch —
+/// see [`fetch_older_key_vault_access`].
+fn fetch_older_storage_access(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let c = &state.storage;
+    if c.access_pending || c.access_loading_more || !c.access_truncated {
+        return;
+    }
+    let Some(account) = c.selected_account.clone() else {
+        return;
+    };
+    let Some(oldest) = c
+        .access_events
+        .as_ref()
+        .and_then(|e| e.last())
+        .map(|e| e.ts)
+    else {
+        return;
+    };
+    state.storage.access_loading_more = true;
+    spawn_load_storage_access(
+        auth.clone(),
+        account,
+        state.storage.access_window.clone(),
+        state.storage.access_scope.clone(),
+        state.storage.access_exclude_self,
+        Some(oldest),
+        /* append */ true,
+        state.storage.access_generation,
+        tx.clone(),
+    );
 }
 
 fn spawn_load_registries(
@@ -7852,23 +7891,28 @@ fn spawn_load_tags(
 /// Fetch one page of `ContainerRegistryRepositoryEvents` rows for the
 /// registry access-logs view. `generation` is the query-scope token the
 /// result is validated against on landing (see `AppEvent::RegistryAccessLoaded`).
+#[allow(clippy::too_many_arguments)]
 fn spawn_load_registry_access(
     auth: AzureAuth,
     registry: crate::azure::registries::Registry,
     window: crate::azure::key_vault_logs::AccessWindow,
     repository: Option<String>,
     exclude_self: bool,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    append: bool,
     generation: u64,
     tx: UnboundedSender<AppEvent>,
 ) {
     if auth.is_demo() {
+        let mut page =
+            crate::azure::demo::registry_access(&window, repository.as_deref(), exclude_self);
+        if let Some(before) = before {
+            page.events.retain(|e| e.ts < before);
+        }
         let _ = tx.send(AppEvent::RegistryAccessLoaded {
             generation,
-            result: Ok(crate::azure::demo::registry_access(
-                &window,
-                repository.as_deref(),
-                exclude_self,
-            )),
+            append,
+            result: Ok(page),
         });
         return;
     }
@@ -7879,11 +7923,110 @@ fn spawn_load_registry_access(
             &window,
             repository.as_deref(),
             exclude_self,
+            before,
         )
         .await
         .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::RegistryAccessLoaded { generation, result });
+        let _ = tx.send(AppEvent::RegistryAccessLoaded {
+            generation,
+            append,
+            result,
+        });
     });
+}
+
+/// Land one registry access-log page (see `AppEvent::RegistryAccessLoaded`).
+fn apply_registry_access_page(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    generation: u64,
+    append: bool,
+    result: Result<crate::azure::registry_logs::AccessPage, String>,
+) {
+    // Same stale-scope rule as `KeyVaultAccessLoaded`.
+    if generation == state.registry.access_generation {
+        state.registry.access_pending = false;
+        state.registry.access_loading_more = false;
+        match result {
+            Ok(page) => {
+                // GUID-shaped identities (service principals,
+                // managed identities) resolve to directory names
+                // via Graph — best-effort, cached, deduped like
+                // the SQL audit roll-up's resolution.
+                for e in &page.events {
+                    let Some(id) = crate::azure::sql_audit::graph_candidate(&e.identity) else {
+                        continue;
+                    };
+                    if state.principals.by_id.contains_key(&id)
+                        || state.principals.failed.contains(&id)
+                        || state.principals.pending.contains(&id)
+                    {
+                        continue;
+                    }
+                    state.principals.pending.insert(id.clone());
+                    spawn_resolve_principal(auth.clone(), id, tx.clone());
+                }
+                state.registry.access_error = None;
+                state.registry.access_truncated = page.truncated;
+                if append {
+                    // Older-than page: extend, keep the cursor
+                    // where the user was scrolling.
+                    state
+                        .registry
+                        .access_events
+                        .get_or_insert_with(Vec::new)
+                        .extend(page.events);
+                } else {
+                    state.registry.access_hidden = page.hidden;
+                    state.registry.access_events = Some(page.events);
+                    state.registry.access_cursor = 0;
+                    state.registry.access_view_top.set(0);
+                }
+            }
+            // Keep the rows on screen — see `KeyVaultAccessLoaded`.
+            Err(e) if append => {
+                state.set_status(format!("couldn't load older rows: {e}"));
+            }
+            Err(e) => state.registry.access_error = Some(e),
+        }
+    }
+}
+
+/// Spawn the *older-than* registry access page for the scroll-past-bottom fetch —
+/// see [`fetch_older_key_vault_access`].
+fn fetch_older_registry_access(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let c = &state.registry;
+    if c.access_pending || c.access_loading_more || !c.access_truncated {
+        return;
+    }
+    let Some(registry) = c.selected_registry.clone() else {
+        return;
+    };
+    let Some(oldest) = c
+        .access_events
+        .as_ref()
+        .and_then(|e| e.last())
+        .map(|e| e.ts)
+    else {
+        return;
+    };
+    state.registry.access_loading_more = true;
+    spawn_load_registry_access(
+        auth.clone(),
+        registry,
+        state.registry.access_window.clone(),
+        state.registry.access_scope.clone(),
+        state.registry.access_exclude_self,
+        Some(oldest),
+        /* append */ true,
+        state.registry.access_generation,
+        tx.clone(),
+    );
 }
 
 /// Fetch registry-wide pull/push counts from Monitor platform metrics for the
@@ -8336,24 +8479,29 @@ fn spawn_load_key_vault_items(
 
 /// Fetch one page of Key Vault `AuditEvent` rows for the access-logs view.
 /// `generation` is the query-scope token the result is validated against on
-/// landing (see `AppEvent::KeyVaultAccessLoaded`).
+/// landing (see `AppEvent::KeyVaultAccessLoaded`). `before` + `append` fetch
+/// the page older than the loaded buffer (scroll past bottom).
+#[allow(clippy::too_many_arguments)]
 fn spawn_load_key_vault_access(
     auth: AzureAuth,
     vault: crate::azure::key_vault::KeyVault,
     window: crate::azure::key_vault_logs::AccessWindow,
     scope: Option<crate::azure::key_vault_logs::ItemScope>,
     exclude_self: bool,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    append: bool,
     generation: u64,
     tx: UnboundedSender<AppEvent>,
 ) {
     if auth.is_demo() {
+        let mut page = crate::azure::demo::key_vault_access(&window, scope.as_ref(), exclude_self);
+        if let Some(before) = before {
+            page.events.retain(|e| e.ts < before);
+        }
         let _ = tx.send(AppEvent::KeyVaultAccessLoaded {
             generation,
-            result: Ok(crate::azure::demo::key_vault_access(
-                &window,
-                scope.as_ref(),
-                exclude_self,
-            )),
+            append,
+            result: Ok(page),
         });
         return;
     }
@@ -8364,11 +8512,120 @@ fn spawn_load_key_vault_access(
             &window,
             scope.as_ref(),
             exclude_self,
+            before,
         )
         .await
         .map_err(|e| format!("{e:#}"));
-        let _ = tx.send(AppEvent::KeyVaultAccessLoaded { generation, result });
+        let _ = tx.send(AppEvent::KeyVaultAccessLoaded {
+            generation,
+            append,
+            result,
+        });
     });
+}
+
+/// Land one Key Vault access-log page (see `AppEvent::KeyVaultAccessLoaded`).
+fn apply_key_vault_access_page(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+    generation: u64,
+    append: bool,
+    result: Result<crate::azure::key_vault_logs::AccessPage, String>,
+) {
+    // A page fetched under an older query scope (window / item /
+    // exclude-me changed while it was in flight) no longer
+    // describes what the header claims — drop it; the fetch for
+    // the current generation owns the pending flag.
+    if generation == state.key_vault.access_generation {
+        state.key_vault.access_pending = false;
+        state.key_vault.access_loading_more = false;
+        match result {
+            Ok(page) => {
+                // App callers carry only the appId GUID claim —
+                // resolve to directory names via Graph, best-effort,
+                // cached and deduped like the storage access log.
+                for e in &page.events {
+                    if e.caller_kind != crate::azure::key_vault_logs::CallerKind::App {
+                        continue;
+                    }
+                    let Some(id) = crate::azure::sql_audit::graph_candidate(&e.caller) else {
+                        continue;
+                    };
+                    if state.principals.by_id.contains_key(&id)
+                        || state.principals.failed.contains(&id)
+                        || state.principals.pending.contains(&id)
+                    {
+                        continue;
+                    }
+                    state.principals.pending.insert(id.clone());
+                    spawn_resolve_principal(auth.clone(), id, tx.clone());
+                }
+                state.key_vault.access_error = None;
+                state.key_vault.access_truncated = page.truncated;
+                if append {
+                    // Older-than page: extend, keep the cursor
+                    // where the user was scrolling.
+                    state
+                        .key_vault
+                        .access_events
+                        .get_or_insert_with(Vec::new)
+                        .extend(page.events);
+                } else {
+                    state.key_vault.access_hidden = page.hidden;
+                    state.key_vault.access_events = Some(page.events);
+                    state.key_vault.access_cursor = 0;
+                    state.key_vault.access_view_top.set(0);
+                }
+            }
+            // A failed older page must not blank the rows already
+            // on screen (the body renders `access_error` instead
+            // of the table) — surface it as a status hint; the
+            // next push past the bottom retries.
+            Err(e) if append => {
+                state.set_status(format!("couldn't load older rows: {e}"));
+            }
+            Err(e) => state.key_vault.access_error = Some(e),
+        }
+    }
+}
+
+/// Spawn the *older-than* KV access page for the scroll-past-bottom fetch:
+/// same query scope as the loaded buffer, `before` pinned to its oldest row.
+/// Runs under the current generation (no bump — it extends, not replaces, the
+/// buffer; any scope change bumps and orphans it).
+fn fetch_older_key_vault_access(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    let kv = &state.key_vault;
+    if kv.access_pending || kv.access_loading_more || !kv.access_truncated {
+        return;
+    }
+    let Some(vault) = kv.selected_vault.clone() else {
+        return;
+    };
+    let Some(oldest) = kv
+        .access_events
+        .as_ref()
+        .and_then(|e| e.last())
+        .map(|e| e.ts)
+    else {
+        return;
+    };
+    state.key_vault.access_loading_more = true;
+    spawn_load_key_vault_access(
+        auth.clone(),
+        vault,
+        state.key_vault.access_window.clone(),
+        state.key_vault.access_scope.clone(),
+        state.key_vault.access_exclude_self,
+        Some(oldest),
+        /* append */ true,
+        state.key_vault.access_generation,
+        tx.clone(),
+    );
 }
 
 fn spawn_load_app_registrations(auth: AzureAuth, scope: u64, tx: UnboundedSender<AppEvent>) {
@@ -11039,5 +11296,225 @@ mod tests {
         assert!(portal_url_for(&state)
             .unwrap()
             .ends_with("/vaults/kv/certificates"));
+    }
+
+    // -- Key Vault access log: scroll-past-bottom older-than paging ----------
+
+    fn kv_access_state() -> AppState {
+        use crate::azure::key_vault_logs::{AccessEvent, CallerKind};
+        let mut state = fresh_state();
+        state.view = View::KeyVaultAccessLogs;
+        state.key_vault.selected_vault = Some(crate::azure::demo::key_vaults(&[]).remove(0));
+        let now = chrono::Utc::now();
+        let row = |secs: i64| AccessEvent {
+            ts: now - chrono::Duration::seconds(secs),
+            operation: "SecretGet".into(),
+            caller: "dana@contoso.com".into(),
+            caller_kind: CallerKind::User,
+            ip: "198.51.100.23".into(),
+            object: None,
+            result: "OK".into(),
+            mirid: None,
+        };
+        state.key_vault.access_events = Some(vec![row(1), row(2)]);
+        state.key_vault.access_truncated = true;
+        state.key_vault.access_cursor = 1;
+        state
+    }
+
+    fn recv_kv_access_page(
+        state: &mut AppState,
+        auth: &AzureAuth,
+        tx: &UnboundedSender<AppEvent>,
+        rx: &mut UnboundedReceiver<AppEvent>,
+    ) {
+        loop {
+            if let AppEvent::KeyVaultAccessLoaded {
+                generation,
+                append,
+                result,
+            } = rx.try_recv().expect("access event")
+            {
+                return apply_key_vault_access_page(state, auth, tx, generation, append, result);
+            }
+        }
+    }
+
+    #[test]
+    fn kv_access_older_page_appends_below_the_cursor_and_keeps_it() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = kv_access_state();
+        let oldest = state.key_vault.access_events.as_ref().unwrap()[1].ts;
+
+        fetch_older_key_vault_access(&mut state, &auth, &tx);
+        assert!(state.key_vault.access_loading_more);
+        recv_kv_access_page(&mut state, &auth, &tx, &mut rx);
+
+        let rows = state.key_vault.access_events.as_ref().unwrap();
+        assert!(rows.len() > 2, "older page appended");
+        assert!(
+            rows[2..].iter().all(|e| e.ts < oldest),
+            "only rows older than the cursor are appended"
+        );
+        assert_eq!(state.key_vault.access_cursor, 1, "cursor stays put");
+        assert!(!state.key_vault.access_loading_more);
+        assert!(state.key_vault.access_error.is_none());
+    }
+
+    #[test]
+    fn kv_access_older_page_only_when_truncated_and_idle() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = kv_access_state();
+
+        state.key_vault.access_truncated = false;
+        fetch_older_key_vault_access(&mut state, &auth, &tx);
+        assert!(rx.try_recv().is_err(), "window exhausted: nothing to fetch");
+
+        state.key_vault.access_truncated = true;
+        state.key_vault.access_pending = true;
+        fetch_older_key_vault_access(&mut state, &auth, &tx);
+        assert!(rx.try_recv().is_err(), "a full refresh is in flight");
+
+        state.key_vault.access_pending = false;
+        state.key_vault.access_loading_more = true;
+        fetch_older_key_vault_access(&mut state, &auth, &tx);
+        assert!(rx.try_recv().is_err(), "an older page is already in flight");
+    }
+
+    #[test]
+    fn kv_access_stale_older_page_is_dropped() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = kv_access_state();
+
+        fetch_older_key_vault_access(&mut state, &auth, &tx);
+        // The query scope changed (window / exclude-me) while it was in flight.
+        state.key_vault.access_generation = state.key_vault.access_generation.wrapping_add(1);
+        recv_kv_access_page(&mut state, &auth, &tx, &mut rx);
+        assert_eq!(state.key_vault.access_events.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn kv_access_failed_older_page_keeps_rows_on_screen() {
+        let auth = AzureAuth::demo();
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = kv_access_state();
+        state.key_vault.access_loading_more = true;
+        let generation = state.key_vault.access_generation;
+
+        apply_key_vault_access_page(
+            &mut state,
+            &auth,
+            &tx,
+            generation,
+            /* append */ true,
+            Err("throttled".into()),
+        );
+        assert_eq!(state.key_vault.access_events.as_ref().unwrap().len(), 2);
+        assert!(
+            state.key_vault.access_error.is_none(),
+            "an error would replace the table"
+        );
+        assert!(state
+            .status_message
+            .as_deref()
+            .unwrap()
+            .contains("throttled"));
+        assert!(
+            state.key_vault.access_truncated,
+            "next push past the bottom retries"
+        );
+        assert!(!state.key_vault.access_loading_more);
+    }
+
+    #[test]
+    fn storage_access_older_page_appends_below_the_cursor_and_keeps_it() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = fresh_state();
+        state.storage.selected_account = Some(crate::azure::demo::storage_accounts(&[]).remove(0));
+        // Seed the buffer with the demo page's newest two rows, as if the
+        // first page had come back full.
+        let mut first = crate::azure::demo::storage_access(&Default::default(), None, false).events;
+        first.truncate(2);
+        let oldest = first[1].ts;
+        state.storage.access_events = Some(first);
+        state.storage.access_truncated = true;
+        state.storage.access_cursor = 1;
+
+        fetch_older_storage_access(&mut state, &auth, &tx);
+        assert!(state.storage.access_loading_more);
+        let (generation, append, result) = loop {
+            if let AppEvent::StorageAccessLoaded {
+                generation,
+                append,
+                result,
+            } = rx.try_recv().expect("access event")
+            {
+                break (generation, append, result);
+            }
+        };
+        assert!(append);
+        apply_storage_access_page(&mut state, &auth, &tx, generation, append, result);
+
+        let rows = state.storage.access_events.as_ref().unwrap();
+        assert!(rows.len() > 2, "older page appended");
+        assert!(rows[2..].iter().all(|e| e.ts < oldest));
+        assert_eq!(state.storage.access_cursor, 1, "cursor stays put");
+        assert!(!state.storage.access_loading_more);
+
+        // A failed older page keeps the rows and says so in the status line.
+        let len = rows.len();
+        let generation = state.storage.access_generation;
+        apply_storage_access_page(&mut state, &auth, &tx, generation, true, Err("boom".into()));
+        assert_eq!(state.storage.access_events.as_ref().unwrap().len(), len);
+        assert!(state.storage.access_error.is_none());
+    }
+
+    #[test]
+    fn registry_access_older_page_appends_below_the_cursor_and_keeps_it() {
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = fresh_state();
+        state.registry.selected_registry = Some(crate::azure::demo::registries(&[]).remove(0));
+        // Seed the buffer with the demo page's newest two rows, as if the
+        // first page had come back full.
+        let mut first =
+            crate::azure::demo::registry_access(&Default::default(), None, false).events;
+        first.truncate(2);
+        let oldest = first[1].ts;
+        state.registry.access_events = Some(first);
+        state.registry.access_truncated = true;
+        state.registry.access_cursor = 1;
+
+        fetch_older_registry_access(&mut state, &auth, &tx);
+        assert!(state.registry.access_loading_more);
+        let (generation, append, result) = loop {
+            if let AppEvent::RegistryAccessLoaded {
+                generation,
+                append,
+                result,
+            } = rx.try_recv().expect("access event")
+            {
+                break (generation, append, result);
+            }
+        };
+        assert!(append);
+        apply_registry_access_page(&mut state, &auth, &tx, generation, append, result);
+
+        let rows = state.registry.access_events.as_ref().unwrap();
+        assert!(rows.len() > 2, "older page appended");
+        assert!(rows[2..].iter().all(|e| e.ts < oldest));
+        assert_eq!(state.registry.access_cursor, 1, "cursor stays put");
+        assert!(!state.registry.access_loading_more);
+
+        // A failed older page keeps the rows and says so in the status line.
+        let len = rows.len();
+        let generation = state.registry.access_generation;
+        apply_registry_access_page(&mut state, &auth, &tx, generation, true, Err("boom".into()));
+        assert_eq!(state.registry.access_events.as_ref().unwrap().len(), len);
+        assert!(state.registry.access_error.is_none());
     }
 }

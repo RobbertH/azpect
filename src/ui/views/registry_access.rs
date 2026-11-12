@@ -56,9 +56,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         format!("· {} ", state.registry.access_window.label()),
         Style::default().fg(theme.fg),
     ));
-    if state.registry.access_truncated {
+    if state.registry.access_loading_more {
         title_spans.push(Span::styled(
-            "· newest rows only (window has more) ",
+            "· loading older… ",
+            Style::default().fg(theme.muted),
+        ));
+    } else if state.registry.access_truncated {
+        title_spans.push(Span::styled(
+            "· scroll past bottom for older rows ",
             Style::default().fg(theme.degraded),
         ));
     }
@@ -456,10 +461,25 @@ fn invalidate_fetch(state: &mut AppState) {
     state.registry.access_error = None;
     state.registry.access_hidden = None;
     state.registry.access_truncated = false;
+    state.registry.access_loading_more = false;
+    state.registry.access_fetch_older = false;
     state.registry.access_cursor = 0;
     state.registry.access_view_top.set(0);
     state.registry.access_operation = None;
     state.registry.access_generation = state.registry.access_generation.wrapping_add(1);
+}
+
+/// Ask for the page older than the loaded buffer, if the window has more and
+/// no fetch is already running.
+fn request_older_page(state: &mut AppState) {
+    let c = &mut state.registry;
+    if c.access_truncated
+        && !c.access_loading_more
+        && !c.access_pending
+        && c.access_events.is_some()
+    {
+        c.access_fetch_older = true;
+    }
 }
 
 fn set_window(state: &mut AppState, window: AccessWindow) -> bool {
@@ -556,6 +576,11 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     match action {
         Action::MoveDown => {
             if len > 0 {
+                // Already on the last row: ask for the older-than page
+                // (drained by `after_action` — handlers can't spawn).
+                if state.registry.access_cursor + 1 >= len {
+                    request_older_page(state);
+                }
                 state.registry.access_cursor = (state.registry.access_cursor + 1).min(len - 1);
             }
             true
@@ -566,6 +591,9 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::HalfPageDown => {
             if len > 0 {
+                if state.registry.access_cursor + HALF_PAGE >= len {
+                    request_older_page(state);
+                }
                 state.registry.access_cursor =
                     (state.registry.access_cursor + HALF_PAGE).min(len - 1);
             }
@@ -581,6 +609,7 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
         }
         Action::GotoBottom => {
             state.registry.access_cursor = len.saturating_sub(1);
+            request_older_page(state);
             true
         }
         Action::SetWindowHour => set_window(state, AccessWindow::Hour),
@@ -918,5 +947,43 @@ mod tests {
         let s = format!("{:?}", term.backend().buffer());
         assert!(s.contains("error:"));
         assert!(s.contains("no Log Analytics workspace you can read"));
+    }
+
+    #[test]
+    fn pushing_past_the_last_row_requests_an_older_page() {
+        let mut state = fixture();
+        let len = state.registry.visible_access_events().len();
+        state.registry.access_cursor = len - 1;
+
+        state.registry.access_truncated = false;
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.registry.access_fetch_older, "nothing older to get");
+
+        state.registry.access_truncated = true;
+        handle(Action::MoveDown, &mut state);
+        assert!(state.registry.access_fetch_older);
+        assert_eq!(state.registry.access_cursor, len - 1);
+
+        state.registry.access_fetch_older = false;
+        state.registry.access_cursor = 0;
+        handle(Action::GotoBottom, &mut state);
+        assert!(state.registry.access_fetch_older);
+
+        state.registry.access_fetch_older = false;
+        state.registry.access_loading_more = true;
+        handle(Action::MoveDown, &mut state);
+        assert!(!state.registry.access_fetch_older, "already loading");
+    }
+
+    #[test]
+    fn scope_change_cancels_older_paging() {
+        let mut state = fixture();
+        state.registry.access_truncated = true;
+        state.registry.access_loading_more = true;
+        state.registry.access_fetch_older = true;
+        handle(Action::SetWindowWeek, &mut state);
+        assert!(!state.registry.access_truncated);
+        assert!(!state.registry.access_loading_more);
+        assert!(!state.registry.access_fetch_older);
     }
 }

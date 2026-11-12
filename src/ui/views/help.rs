@@ -93,6 +93,7 @@ const KV_ACCESS_LOG: Section = (
         ("t", "custom window (e.g. 12h, 30d, 6m, 1y)"),
         ("m", "hide your own accesses (your user / sign-in IP)"),
         ("Tab / S-Tab", "cycle operation filter (SecretGet, …)"),
+        ("bottom j / G", "fetch rows older than the page"),
         ("y", "yank row (incl. full managed-identity id)"),
     ],
 );
@@ -201,6 +202,7 @@ const STORAGE_ACCESS_LOG: Section = (
             "hide your own accesses (your user / object id / sign-in IP)",
         ),
         ("Tab / S-Tab", "cycle operation filter (GetBlob, …)"),
+        ("bottom j / G", "fetch rows older than the page"),
         ("y", "yank row (incl. raw identity)"),
     ],
 );
@@ -235,6 +237,7 @@ const ACR_ACCESS_LOG: Section = (
             "hide your own pulls (your user / object id / sign-in IP)",
         ),
         ("Tab / S-Tab", "cycle operation filter (Pull, Push, …)"),
+        ("bottom j / G", "fetch rows older than the page"),
         ("y", "yank row (incl. raw identity and full digest)"),
     ],
 );

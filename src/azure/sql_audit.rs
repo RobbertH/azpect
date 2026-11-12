@@ -217,10 +217,28 @@ pub async fn fetch_events(
     let kql = build_events_kql(target.database.as_deref(), principal, errors_only, before);
     let client = LogsClient::new(auth.clone())?;
     let resp = query_with_fallback(&client, target, &kql, &window.timespan()).await?;
-    let events = parse_events_response(&resp)?;
+    events_page(&resp)
+}
+
+/// Turn one events response into a page: parse, judge truncation, trim the
+/// page boundary, stitch chunks.
+fn events_page(resp: &serde_json::Value) -> anyhow::Result<EventsPage> {
+    let mut rows = parse_event_rows(resp)?;
     // Truncation is judged on raw rows fetched, before stitching merges chunks.
-    let truncated = raw_row_count(&resp) as u32 >= EVENTS_PAGE_SIZE;
-    Ok(EventsPage { events, truncated })
+    let truncated = raw_row_count(resp) as u32 >= EVENTS_PAGE_SIZE;
+    // Same page-boundary rule as the logs view: a full page's `take` may cut
+    // through rows sharing one timestamp, and the next page's strict `<`
+    // cursor would skip the rest of them. Trim the tied tail so the next page
+    // re-fetches the whole group. Done on *raw* rows, before stitching: a
+    // chunked statement's rows share one timestamp, so they leave and come
+    // back together instead of landing as two half-statements.
+    if truncated {
+        crate::azure::logs::trim_boundary_ties(&mut rows, |r| r.event.ts);
+    }
+    Ok(EventsPage {
+        events: stitch_chunks(rows),
+        truncated,
+    })
 }
 
 /// Query the server's `master` database (server-level auditing), falling back
@@ -333,11 +351,10 @@ pub fn build_events_kql(
         kql.push_str("| where succeeded_ == \"false\"\n");
     }
     if let Some(before) = before {
-        // Older-than page for the scroll-past-bottom fetch.
-        kql.push_str(&format!(
-            "| where ts < datetime({})\n",
-            before.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        ));
+        // Older-than page for the scroll-past-bottom fetch — the shared
+        // full-precision cursor (a coarser stamp truncates *below* the oldest
+        // row held, and the strict `<` then skips its same-tick siblings).
+        kql.push_str(&crate::azure::logs::older_than_clause("ts", before));
     }
     kql.push_str(&format!(
         "| order by ts desc\n| take {EVENTS_PAGE_SIZE}\n| project ts, action_, succeeded_, db_, ip_, app_, host_, stmt_, info_, affected_, response_, seqgrp_, seq_\n",
@@ -487,7 +504,21 @@ fn parse_principals_response(value: &serde_json::Value) -> anyhow::Result<Vec<Pr
     Ok(out)
 }
 
+#[cfg(test)]
 fn parse_events_response(value: &serde_json::Value) -> anyhow::Result<Vec<AuditEvent>> {
+    Ok(stitch_chunks(parse_event_rows(value)?))
+}
+
+/// One audit row before chunk stitching: the event with *this row's*
+/// statement chunk in `statement`, plus its sequence group / number.
+struct EventRow {
+    event: AuditEvent,
+    group: String,
+    seq: i64,
+}
+
+/// Raw rows in response order (newest first), one per audit record.
+fn parse_event_rows(value: &serde_json::Value) -> anyhow::Result<Vec<EventRow>> {
     let table = ResponseTable::from_response(value)?;
     let (Some(i_ts), Some(i_action)) = (table.idx("ts"), table.idx("action_")) else {
         if table.rows.is_empty() {
@@ -521,12 +552,7 @@ fn parse_events_response(value: &serde_json::Value) -> anyhow::Result<Vec<AuditE
         table.idx("seq_"),
     );
 
-    // Statement chunks: rows sharing a non-empty `sequence_group_id` are one
-    // logical statement split at 4000 chars. Keep the first row's slot (rows
-    // arrive newest-first), collect `(sequence_number, chunk)` per group, and
-    // assemble in sequence order at the end.
-    let mut out: Vec<(AuditEvent, Vec<(i64, String)>)> = Vec::new();
-    let mut groups: HashMap<String, usize> = HashMap::new();
+    let mut rows = Vec::new();
     for row in table.rows {
         let Some(row) = row.as_array() else { continue };
         let Some(ts) = cell_ts(row, i_ts) else {
@@ -543,28 +569,44 @@ fn parse_events_response(value: &serde_json::Value) -> anyhow::Result<Vec<AuditE
             ip: cell_str(row, i_ip),
             app: cell_str(row, i_app),
             host: cell_str(row, i_host),
-            statement: String::new(),
+            statement,
             info: cell_str(row, i_info),
             affected_rows: cell_i64(row, i_affected),
             response_rows: cell_i64(row, i_response),
         };
+        rows.push(EventRow { event, group, seq });
+    }
+    Ok(rows)
+}
+
+/// Merge statement chunks: rows sharing a non-empty `sequence_group_id` are
+/// one logical statement split at 4000 chars. Keep the first row's slot (rows
+/// arrive newest-first), collect `(sequence_number, chunk)` per group, and
+/// assemble in sequence order at the end.
+fn stitch_chunks(rows: Vec<EventRow>) -> Vec<AuditEvent> {
+    let mut out: Vec<(AuditEvent, Vec<(i64, String)>)> = Vec::new();
+    let mut groups: HashMap<String, usize> = HashMap::new();
+    for EventRow {
+        mut event,
+        group,
+        seq,
+    } in rows
+    {
         if group.is_empty() {
-            let mut event = event;
-            event.statement = statement;
             out.push((event, Vec::new()));
             continue;
         }
+        let chunk = std::mem::take(&mut event.statement);
         match groups.get(&group) {
-            Some(&slot) => out[slot].1.push((seq, statement)),
+            Some(&slot) => out[slot].1.push((seq, chunk)),
             None => {
                 groups.insert(group, out.len());
-                out.push((event, vec![(seq, statement)]));
+                out.push((event, vec![(seq, chunk)]));
             }
         }
     }
 
-    Ok(out
-        .into_iter()
+    out.into_iter()
         .map(|(mut event, mut chunks)| {
             if !chunks.is_empty() {
                 chunks.sort_by_key(|(seq, _)| *seq);
@@ -572,7 +614,7 @@ fn parse_events_response(value: &serde_json::Value) -> anyhow::Result<Vec<AuditE
             }
             event
         })
-        .collect())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +811,10 @@ mod tests {
             .with_timezone(&Utc);
         let kql = build_events_kql(None, "app-orders", true, Some(before));
         assert!(kql.contains("| where succeeded_ == \"false\""));
-        assert!(kql.contains("| where ts < datetime(2026-08-01T10:00:00.000Z)"));
+        assert!(
+            kql.contains(r#"| where ts < datetime("2026-08-01T10:00:00.000000000Z")"#),
+            "{kql}"
+        );
     }
 
     #[test]
@@ -927,5 +972,103 @@ mod tests {
         assert_eq!(humanize_ago(at("2026-08-05T12:00:00Z"), now), "5d");
         assert_eq!(humanize_ago(at("2026-05-10T12:00:00Z"), now), "3mo");
         assert_eq!(humanize_ago(at("2024-01-10T12:00:00Z"), now), "2y");
+    }
+
+    /// A raw events response with the projected column set.
+    fn events_resp(rows: Vec<serde_json::Value>) -> serde_json::Value {
+        let cols: Vec<serde_json::Value> = [
+            "ts",
+            "action_",
+            "succeeded_",
+            "db_",
+            "ip_",
+            "app_",
+            "host_",
+            "stmt_",
+            "info_",
+            "affected_",
+            "response_",
+            "seqgrp_",
+            "seq_",
+        ]
+        .iter()
+        .map(|n| serde_json::json!({"name": n}))
+        .collect();
+        serde_json::json!({"tables": [{"columns": cols, "rows": rows}]})
+    }
+
+    fn row(ts: &str, stmt: &str, group: &str, seq: Option<i64>) -> serde_json::Value {
+        serde_json::json!([
+            ts,
+            "BCM",
+            "true",
+            "orders",
+            "10.0.0.4",
+            "orders-api",
+            "host-1",
+            stmt,
+            "",
+            null,
+            null,
+            group,
+            seq
+        ])
+    }
+
+    #[test]
+    fn full_page_trims_the_tied_tail_and_keeps_chunked_statements_whole() {
+        // 497 distinct newer rows, then a 2-chunk statement and an unrelated
+        // row all sharing the boundary timestamp: 500 raw rows = a full page,
+        // and `take` may have cut that tied group anywhere.
+        let base = DateTime::parse_from_rfc3339("2026-08-09T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut rows: Vec<serde_json::Value> = (0..497)
+            .map(|i| {
+                let ts = (base - chrono::Duration::milliseconds(i)).to_rfc3339();
+                row(&ts, "SELECT 1", "", None)
+            })
+            .collect();
+        let tied = "2026-08-09T09:00:00.1234567Z";
+        rows.push(row(tied, "SELECT * FROM ", "g-1", Some(1)));
+        rows.push(row(tied, "big_table", "g-1", Some(2)));
+        rows.push(row(tied, "SELECT 2", "", None));
+
+        let page = events_page(&events_resp(rows)).unwrap();
+        assert!(page.truncated);
+        assert_eq!(page.events.len(), 497, "the whole tied group is trimmed");
+        let tied_ts = DateTime::parse_from_rfc3339(tied)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            page.events.iter().all(|e| e.ts > tied_ts),
+            "the next page's `< oldest` cursor re-fetches the tied group in full"
+        );
+    }
+
+    #[test]
+    fn partial_page_is_not_trimmed() {
+        let rows = vec![
+            row("2026-08-09T10:00:00Z", "SELECT 1", "", None),
+            row("2026-08-09T09:00:00Z", "SELECT * FROM ", "g-1", Some(1)),
+            row("2026-08-09T09:00:00Z", "big_table", "g-1", Some(2)),
+        ];
+        let page = events_page(&events_resp(rows)).unwrap();
+        assert!(!page.truncated);
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.events[1].statement, "SELECT * FROM big_table");
+    }
+
+    #[test]
+    fn events_kql_cursor_keeps_sub_millisecond_precision() {
+        // TimeGenerated carries 100ns ticks; a millisecond stamp would round
+        // the cursor below the oldest row and skip its same-ms siblings.
+        let before = DateTime::parse_from_rfc3339("2026-08-01T10:00:00.1234567Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let kql = build_events_kql(None, "app-orders", false, Some(before));
+        let cursor = r#"| where ts < datetime("2026-08-01T10:00:00.123456700Z")"#;
+        let idx = kql.find(cursor).unwrap_or_else(|| panic!("{kql}"));
+        assert!(idx < kql.find("| order by ts desc").unwrap());
     }
 }

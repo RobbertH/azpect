@@ -235,8 +235,11 @@ pub enum AppEvent {
     /// storage access-logs view. `generation` mirrors
     /// `StorageCache::access_generation` — a page fetched under an older
     /// query scope (window / container / exclude-me) is discarded on landing.
+    /// `append` marks a scroll-past-bottom *older-than* page — see
+    /// `KeyVaultAccessLoaded`.
     StorageAccessLoaded {
         generation: u64,
+        append: bool,
         result: Result<crate::azure::storage_logs::AccessPage, String>,
     },
     /// Background load completion: list of container registries for the
@@ -262,8 +265,11 @@ pub enum AppEvent {
     /// rows for the registry access-logs view. `generation` mirrors
     /// `RegistryCache::access_generation` — a page fetched under an older
     /// query scope (window / repository / exclude-me) is discarded on landing.
+    /// `append` marks a scroll-past-bottom *older-than* page — see
+    /// `KeyVaultAccessLoaded`.
     RegistryAccessLoaded {
         generation: u64,
+        append: bool,
         result: Result<crate::azure::registry_logs::AccessPage, String>,
     },
     /// Background load completion: registry-wide pull/push counts from
@@ -403,8 +409,11 @@ pub enum AppEvent {
     /// for the access-logs view. `generation` mirrors
     /// `KeyVaultCache::access_generation` — a page fetched under an older
     /// query scope (window / item / exclude-me) is discarded on landing.
+    /// `append` marks a scroll-past-bottom *older-than* page (push onto the
+    /// end) vs. the initial / refresh fetch (replace), mirroring `LogsLoaded`.
     KeyVaultAccessLoaded {
         generation: u64,
+        append: bool,
         result: Result<crate::azure::key_vault_logs::AccessPage, String>,
     },
     /// Background load completion: the SQL audit principal roll-up.
