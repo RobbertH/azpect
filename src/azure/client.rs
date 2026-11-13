@@ -86,7 +86,10 @@ fn build_http() -> anyhow::Result<reqwest::Client> {
 }
 
 fn build_http_with_timeout(timeout: Duration) -> anyhow::Result<reqwest::Client> {
+    // azure_core's default features also compile native-tls into the shared
+    // reqwest, which would otherwise win as the default backend.
     reqwest::Client::builder()
+        .use_rustls_tls()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(timeout)

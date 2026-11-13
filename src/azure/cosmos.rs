@@ -462,6 +462,7 @@ pub(crate) fn parse_documents_count(usage: &str) -> Option<u64> {
 /// resolves but doesn't route) would otherwise hang a fetch forever.
 pub(crate) fn build_http() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
+        .use_rustls_tls()
         .user_agent(concat!("azpect/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
