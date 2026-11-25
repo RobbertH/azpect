@@ -2842,6 +2842,19 @@ pub struct LogsCache {
     /// (resource id, generation, row count, first/last timestamps) is enough to
     /// detect staleness. `RefCell` because render holds `&AppState`.
     pub sources_memo: RefCell<Option<(LogsBufferFingerprint, Vec<String>)>>,
+    /// Live-tail mode (`t`, Container Apps only): the buffer is fed by the
+    /// real-time log stream instead of Log Analytics queries. Also switched
+    /// on automatically when the historical query is denied. Reset on every
+    /// (re)entry to the logs view.
+    pub live: bool,
+    /// The running stream supervisor, if any. Aborting it tears down every
+    /// per-replica stream. Reconciled on each tick: it is stopped once the
+    /// logs view is left or another resource is selected.
+    pub live_task: Option<tokio::task::AbortHandle>,
+    /// Resource id `live_task` is streaming for.
+    pub live_resource: Option<String>,
+    /// Last reported connection state of the live tail, for the header chip.
+    pub live_status: Option<crate::azure::container_app_live_logs::LiveStatus>,
 }
 
 /// Identity of one exact logs-buffer state, used to invalidate
@@ -2883,6 +2896,16 @@ impl LineAnchor {
 }
 
 impl LogsCache {
+    /// Abort the live-tail stream, if one is running. Leaves `live` alone —
+    /// callers decide whether the mode itself ends.
+    pub fn stop_live_tail(&mut self) {
+        if let Some(task) = self.live_task.take() {
+            task.abort();
+        }
+        self.live_resource = None;
+        self.live_status = None;
+    }
+
     /// Clear the per-view, resource-specific filters when (re)opening the Logs
     /// view. The `source_filter` in particular holds a value from whatever
     /// resource was viewed last (for Container Apps, a container name) — carried
@@ -2892,6 +2915,10 @@ impl LogsCache {
     /// no longer exists. Fetch-scoping prefs (`errors_only`, `range`, `wrap`)
     /// are intentionally left alone — they're resource-agnostic.
     pub fn reset_view_filters(&mut self) {
+        // Each visit starts on the historical view; live tail is opt-in (or
+        // re-entered by the access-denied fallback).
+        self.live = false;
+        self.stop_live_tail();
         self.source_filter = None;
         self.search_active = false;
         self.search_input.reset();

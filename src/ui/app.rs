@@ -296,6 +296,7 @@ async fn event_loop(
                     }
                 }
                 maybe_auto_refresh(state, auth, tx, now);
+                reconcile_live_tail(state);
             }
             AppEvent::Resize { .. } => {
                 // ratatui re-measures on next draw. Nothing to do.
@@ -628,17 +629,72 @@ async fn event_loop(
                             crate::ui::views::logs::advance_error_hunt(state, &resource_id);
                         }
                         Err(e) => {
+                            // A Container App whose historical logs we may not
+                            // read (no access to the environment / workspace)
+                            // can still be tailed: the stream only needs the
+                            // app itself. Fall back instead of dead-ending.
+                            let fallback = !append
+                                && !state.logs.live
+                                && is_access_denied(&e)
+                                && matches!(state.view, View::Logs | View::LogDetail)
+                                && state.selected_resource().is_some_and(|r| {
+                                    r.id == resource_id
+                                        && r.kind
+                                            == crate::azure::resources::ResourceKind::ContainerApp
+                                });
                             state.logs.last_error = Some(e);
                             // The chain is broken — don't leave the "searching…"
                             // chip up with nothing in flight. The pending anchor is
                             // kept: the next fresh page resolves it as usual.
                             state.logs.error_hunt = false;
+                            if fallback {
+                                state.logs.live = true;
+                                state.set_status(
+                                    "no access to historical logs — showing live tail (t toggles)",
+                                );
+                                start_live_tail(state, auth, tx);
+                            }
                         }
                     }
                     // Anchor/hunt resolution above may have raised
                     // `fetch_more_requested`; the usual drain point runs only on
                     // key events, so chain the next page here.
                     drain_fetch_more_requested(state, auth, tx);
+                }
+            }
+            AppEvent::LiveLog {
+                resource_id,
+                generation,
+                event,
+            } => {
+                use crate::azure::container_app_live_logs::{LiveEvent, LiveStatus};
+                // Same stale guard as `LogsLoaded`: a stream that was replaced
+                // (toggle, refresh, another resource) may still have events queued.
+                if generation == state.logs.generation && state.logs.live {
+                    match event {
+                        LiveEvent::Lines(lines) => {
+                            state.logs.loading = false;
+                            state.logs.last_error = None;
+                            crate::ui::views::logs::append_live_lines(state, &resource_id, lines);
+                        }
+                        LiveEvent::Status(status) => {
+                            match &status {
+                                LiveStatus::Connecting => {}
+                                LiveStatus::Streaming { .. } | LiveStatus::Waiting(_) => {
+                                    state.logs.loading = false;
+                                    state.logs.last_error = None;
+                                }
+                                // Shown full-screen only while the buffer is
+                                // empty; once lines exist the header chip
+                                // carries the reconnecting state.
+                                LiveStatus::Failed(e) => {
+                                    state.logs.loading = false;
+                                    state.logs.last_error = Some(e.clone());
+                                }
+                            }
+                            state.logs.live_status = Some(status);
+                        }
+                    }
                 }
             }
             AppEvent::HealthLoaded {
@@ -4172,6 +4228,7 @@ fn after_action(
         | Action::SetWindowWeek
         | Action::SetWindowMonth
         | Action::SetWindowYear
+        | Action::ToggleLiveTail
         | Action::ToggleExcludeSelf => {
             // Chart windows force too: the view handler dropped the cached
             // series for the new range, and a fetch for the *old* range still
@@ -4733,6 +4790,17 @@ fn kick_off_loads_for_view(
                     }
                     _ => {}
                 }
+            }
+        }
+        View::Logs if crate::ui::views::logs::live_tail_active(state) => {
+            // Idempotent: scope-changing keys that are inert in live mode still
+            // arrive here with `force`, and must not restart a healthy stream.
+            // `r` drops the stream first, so it does reconnect.
+            let streaming_selected = state.logs.live_task.is_some()
+                && state.logs.live_resource.as_deref()
+                    == state.selected_resource().map(|r| r.id.as_str());
+            if !streaming_selected {
+                start_live_tail(state, auth, tx);
             }
         }
         View::Logs => {
@@ -8918,6 +8986,95 @@ fn spawn_load_sb_subscriptions(
             .map_err(|e| format!("{e:#}"));
         let _ = tx.send(AppEvent::ServiceBusSubscriptionsLoaded { key, result });
     });
+}
+
+/// Whether a failed log fetch was an authorization failure rather than a
+/// transient or query error — the case the live tail can route around.
+fn is_access_denied(err: &str) -> bool {
+    err.contains("azure api error 403") || err.contains("AuthorizationFailed")
+}
+
+/// Stop the live-tail stream once nothing is showing it any more: the logs
+/// views were left, or a different resource is selected. Run on every tick so
+/// no navigation path has to remember to do it.
+fn reconcile_live_tail(state: &mut AppState) {
+    if state.logs.live_task.is_none() {
+        return;
+    }
+    let showing = matches!(state.view, View::Logs | View::LogDetail)
+        && state.logs.live_resource.as_deref() == state.selected_resource().map(|r| r.id.as_str());
+    if !showing {
+        state.logs.stop_live_tail();
+    }
+}
+
+/// (Re)start the live log stream for the selected Container App, replacing
+/// the buffer. Events are tagged with the new generation so anything still
+/// queued from a previous stream or fetch is dropped.
+fn start_live_tail(state: &mut AppState, auth: &AzureAuth, tx: &UnboundedSender<AppEvent>) {
+    use crate::azure::container_app_live_logs::{self as live, LiveEvent, LiveStatus};
+
+    let Some(resource) = state.selected_resource().cloned() else {
+        return;
+    };
+    state.logs.stop_live_tail();
+    crate::ui::views::logs::reset_buffer_scope(state, &resource.id);
+    state.logs.loading = true;
+    state.logs.loading_more = false;
+    state.logs.live_status = Some(LiveStatus::Connecting);
+    state.logs.live_resource = Some(resource.id.clone());
+
+    let generation = state.logs.generation;
+    let resource_id = resource.id.clone();
+    let tx = tx.clone();
+    let emit: live::Emit = std::sync::Arc::new(move |event: LiveEvent| {
+        let _ = tx.send(AppEvent::LiveLog {
+            resource_id: resource_id.clone(),
+            generation,
+            event,
+        });
+    });
+    let task = if auth.is_demo() {
+        tokio::spawn(demo_live_tail(emit))
+    } else {
+        tokio::spawn(live::run(auth.clone(), resource.id, emit))
+    };
+    state.logs.live_task = Some(task.abort_handle());
+}
+
+/// Synthetic stream for `--demo`: one line a second, with the odd warning.
+async fn demo_live_tail(emit: crate::azure::container_app_live_logs::Emit) {
+    use crate::azure::container_app_live_logs::{LiveEvent, LiveStatus};
+    use crate::azure::logs::{LogLevel, LogLine};
+
+    emit(LiveEvent::Status(LiveStatus::Streaming { streams: 1 }));
+    let mut n: u64 = 0;
+    loop {
+        n += 1;
+        let (level, message) = if n.is_multiple_of(15) {
+            (LogLevel::Warn, format!("WARNING queue poll {n} took 2.4s"))
+        } else {
+            (
+                LogLevel::Info,
+                format!("INFO [poll] polling queue 'demo-jobs' (iteration {n})"),
+            )
+        };
+        emit(LiveEvent::Lines(vec![LogLine {
+            ts: chrono::Utc::now(),
+            level,
+            source: "listener".to_string(),
+            message,
+            fields: vec![
+                ("container".to_string(), "listener".to_string()),
+                (
+                    "replica".to_string(),
+                    "demo--0000001-5c4ccc869d-wsckt".to_string(),
+                ),
+                ("stream".to_string(), "stderr".to_string()),
+            ],
+        }]));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

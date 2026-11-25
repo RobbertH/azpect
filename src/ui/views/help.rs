@@ -56,6 +56,10 @@ const DETAIL_LOGS: Section = (
             "H",
             "hide health-probe requests (/health, /healthz, /warmup, …) (logs)",
         ),
+        (
+            "t",
+            "live tail: real-time log stream, no workspace access needed (Container App logs)",
+        ),
         ("Tab / S-Tab", "cycle source filter (logs)"),
         (
             "s",

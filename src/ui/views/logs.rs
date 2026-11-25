@@ -13,6 +13,7 @@ use ratatui::Frame;
 
 use crate::azure::logs::{LogLevel, LogLine};
 use crate::azure::metrics::TimeRange;
+use crate::azure::resources::ResourceKind;
 use crate::ui::events::Action;
 #[cfg(test)]
 use crate::ui::state::View;
@@ -87,10 +88,34 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
             format!(" ({}) ", r.kind.short_tag()),
             Style::default().fg(theme.muted),
         ));
-        header_spans.push(Span::styled(
-            format!("· {} ", state.logs.range.label()),
-            Style::default().fg(theme.muted),
-        ));
+        let live = live_tail_active(state);
+        if live {
+            use crate::azure::container_app_live_logs::LiveStatus;
+            let (text, color) = match state.logs.live_status.as_ref() {
+                Some(LiveStatus::Streaming { streams: 1 }) => {
+                    ("· ● LIVE ".to_string(), theme.healthy)
+                }
+                Some(LiveStatus::Streaming { streams }) => {
+                    (format!("· ● LIVE ({streams} streams) "), theme.healthy)
+                }
+                Some(LiveStatus::Waiting(why)) => (format!("· ○ LIVE — {why} "), theme.muted),
+                Some(LiveStatus::Failed(_)) => {
+                    ("· ○ LIVE — reconnecting… ".to_string(), theme.degraded)
+                }
+                Some(LiveStatus::Connecting) | None => {
+                    ("· ○ LIVE — connecting… ".to_string(), theme.muted)
+                }
+            };
+            header_spans.push(Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            header_spans.push(Span::styled(
+                format!("· {} ", state.logs.range.label()),
+                Style::default().fg(theme.muted),
+            ));
+        }
         // Buffer status: row count, plus a hint about whether more older rows
         // are reachable. Lets the user see why G stops where it does, and
         // confirms when scroll-to-load has actually pulled fresh pages in.
@@ -111,7 +136,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 format!("· {cached} rows "),
                 Style::default().fg(theme.muted),
             ));
-            if state.logs.loading_more {
+            if live {
+                // No pagination: the stream only ever grows at the top.
+            } else if state.logs.loading_more {
                 header_spans.push(Span::styled(
                     "· loading more… ",
                     Style::default().fg(theme.muted),
@@ -128,13 +155,13 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 ));
             }
         }
-        if state.logs.errors_only {
+        if state.logs.errors_only && !live {
             header_spans.push(Span::styled(
                 "· filter: errors only ✓ ",
                 Style::default().fg(theme.degraded),
             ));
         }
-        if state.logs.hide_health {
+        if state.logs.hide_health && !live {
             header_spans.push(Span::styled(
                 "· filter: health probes hidden ✓ ",
                 Style::default().fg(theme.degraded),
@@ -289,8 +316,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let lines = state.logs.by_resource.get(&resource.id);
 
+    let live = live_tail_active(state);
     if state.logs.loading && lines.map(|l| l.is_empty()).unwrap_or(true) {
-        center_message(frame, body, "Loading logs…", theme.muted);
+        let msg = if live {
+            "Connecting to live log stream…"
+        } else {
+            "Loading logs…"
+        };
+        center_message(frame, body, msg, theme.muted);
         render_footer(frame, footer_chunk, &footer);
         return;
     }
@@ -305,7 +338,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     if lines.map(|v| v.is_empty()).unwrap_or(true) {
-        center_message(frame, body, "no log lines in window.", theme.muted);
+        let msg = if live {
+            "live tail: waiting for log lines…"
+        } else {
+            "no log lines in window."
+        };
+        center_message(frame, body, msg, theme.muted);
         render_footer(frame, footer_chunk, &footer);
         return;
     }
@@ -337,7 +375,7 @@ fn footer_line_for(state: &AppState, theme: &Theme) -> Line<'static> {
         ));
     }
     let mut segments: Vec<(String, bool)> = vec![(
-        "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  H hide /health  Tab source  s shell  w wrap  r refresh"
+        "j/k scroll  h/l ← →  Enter detail  / search  n/N next/prev match  y yank  V select  e errors-only (off→context)  H hide /health  t live tail  Tab source  s shell  w wrap  r refresh"
             .to_string(),
         false,
     )];
@@ -1084,6 +1122,38 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
     }
 
     match action {
+        Action::ToggleLiveTail => {
+            let Some(resource) = state.selected_resource().cloned() else {
+                return true;
+            };
+            if resource.kind != ResourceKind::ContainerApp {
+                state.set_status("live tail is only available for Container Apps");
+                return true;
+            }
+            // Either direction replaces the buffer with a different feed;
+            // `after_action` starts the stream or the historical fetch.
+            state.logs.live = !state.logs.live;
+            state.logs.stop_live_tail();
+            reset_buffer_scope(state, &resource.id);
+            true
+        }
+        // `r` in live mode reconnects: drop the stream so the forced load
+        // that follows starts a fresh one.
+        Action::Refresh if live_tail_active(state) => {
+            state.logs.stop_live_tail();
+            false
+        }
+        // The stream has no server-side filters or time window.
+        Action::ToggleErrorsOnly
+        | Action::ToggleHideHealth
+        | Action::SetWindowHour
+        | Action::SetWindowDay
+        | Action::SetWindowWeek
+            if live_tail_active(state) =>
+        {
+            state.set_status("not available in live tail — t returns to history");
+            true
+        }
         Action::ToggleVisualLine => {
             // Toggle: anchor at the current cursor, or clear if already active.
             if lines_len == 0 {
@@ -1257,6 +1327,75 @@ pub fn handle(action: Action, state: &mut AppState) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Whether the logs view is showing the real-time stream: live mode is on and
+/// the selected resource is a Container App (the only kind that has one).
+pub fn live_tail_active(state: &AppState) -> bool {
+    state.logs.live
+        && state
+            .selected_resource()
+            .is_some_and(|r| r.kind == ResourceKind::ContainerApp)
+}
+
+/// Invalidate `id`'s buffer for a change of feed (live ↔ historical): bump
+/// the generation so in-flight results are dropped, and reset everything
+/// that indexes into the old rows.
+pub fn reset_buffer_scope(state: &mut AppState, id: &str) {
+    state.logs.generation = state.logs.generation.wrapping_add(1);
+    state.logs.by_resource.remove(id);
+    state.logs.more_available.remove(id);
+    state.logs.last_error = None;
+    state.logs.context_around = None;
+    state.logs.pending_anchor = None;
+    state.logs.error_hunt = false;
+    state.logs.scroll = 0;
+    state.logs.view_top.set(0);
+    state.logs.visual_anchor = None;
+}
+
+/// Rows kept while live-tailing; the oldest fall off the end.
+pub const LIVE_BUFFER_CAP: usize = 5_000;
+
+/// Merge freshly streamed lines into `resource_id`'s buffer (newest first,
+/// like the historical pages). A cursor resting on the top row follows the
+/// tail; anywhere else it stays on the line it was on, and the viewport and
+/// any visual selection shift with it so new arrivals don't move the text
+/// under the reader.
+pub fn append_live_lines(state: &mut AppState, resource_id: &str, mut new: Vec<LogLine>) {
+    if new.is_empty() {
+        return;
+    }
+    let on_screen = state
+        .selected_resource()
+        .is_some_and(|r| r.id == resource_id);
+    let old_scroll = state.logs.scroll;
+    let pinned = on_screen && (old_scroll > 0 || state.logs.visual_anchor.is_some());
+    let anchor = if pinned {
+        state.selected_log_line().map(|l| LineAnchor::of(&l))
+    } else {
+        None
+    };
+
+    let buf = state
+        .logs
+        .by_resource
+        .entry(resource_id.to_string())
+        .or_default();
+    buf.append(&mut new);
+    // Streams from several replicas interleave, and each one opens with a
+    // backlog, so arrival order is not time order.
+    buf.sort_by_key(|l| std::cmp::Reverse(l.ts));
+    buf.truncate(LIVE_BUFFER_CAP);
+
+    if let Some(new_scroll) = anchor.and_then(|a| state.anchor_index(resource_id, &a)) {
+        let shift = new_scroll.saturating_sub(old_scroll);
+        state.logs.scroll = new_scroll;
+        state.logs.view_top.set(state.logs.view_top.get() + shift);
+        if let Some(v) = state.logs.visual_anchor.as_mut() {
+            *v += shift;
+        }
     }
 }
 
@@ -1557,6 +1696,104 @@ mod tests {
         s.list_cursor = 0;
         s.view = View::Logs;
         s
+    }
+
+    #[test]
+    fn live_lines_follow_the_tail_from_the_top_row() {
+        let mut s = fixture(ResourceKind::ContainerApp);
+        let id = s.resources[0].id.clone();
+        s.logs.live = true;
+        append_live_lines(&mut s, &id, vec![line(5, LogLevel::Info, "c", "old")]);
+        // Arrival order is not time order: an older backlog line lands after.
+        append_live_lines(
+            &mut s,
+            &id,
+            vec![
+                line(1, LogLevel::Info, "c", "new"),
+                line(9, LogLevel::Info, "c", "older"),
+            ],
+        );
+        let msgs: Vec<&str> = s.logs.by_resource[&id]
+            .iter()
+            .map(|l| l.message.as_str())
+            .collect();
+        assert_eq!(msgs, ["new", "old", "older"]);
+        assert_eq!(s.logs.scroll, 0, "cursor on the top row follows the tail");
+    }
+
+    #[test]
+    fn live_lines_keep_a_scrolled_cursor_on_its_line() {
+        let mut s = fixture(ResourceKind::ContainerApp);
+        let id = s.resources[0].id.clone();
+        s.logs.live = true;
+        append_live_lines(
+            &mut s,
+            &id,
+            vec![
+                line(5, LogLevel::Info, "c", "a"),
+                line(6, LogLevel::Info, "c", "b"),
+                line(7, LogLevel::Info, "c", "c"),
+            ],
+        );
+        s.logs.scroll = 1;
+        s.logs.view_top.set(1);
+        append_live_lines(
+            &mut s,
+            &id,
+            vec![
+                line(1, LogLevel::Info, "c", "x"),
+                line(2, LogLevel::Info, "c", "y"),
+            ],
+        );
+        assert_eq!(s.selected_log_line().unwrap().message, "b");
+        assert_eq!(s.logs.scroll, 3);
+        assert_eq!(s.logs.view_top.get(), 3, "viewport moves with the cursor");
+    }
+
+    #[test]
+    fn live_buffer_is_capped() {
+        let mut s = fixture(ResourceKind::ContainerApp);
+        let id = s.resources[0].id.clone();
+        let many = (0..LIVE_BUFFER_CAP as i64 + 10)
+            .map(|i| line(i, LogLevel::Info, "c", "m"))
+            .collect();
+        append_live_lines(&mut s, &id, many);
+        assert_eq!(s.logs.by_resource[&id].len(), LIVE_BUFFER_CAP);
+    }
+
+    #[test]
+    fn live_tail_toggle_is_container_app_only() {
+        let mut s = fixture(ResourceKind::FunctionApp);
+        assert!(handle(Action::ToggleLiveTail, &mut s));
+        assert!(!s.logs.live);
+
+        let mut s = fixture(ResourceKind::ContainerApp);
+        let id = s.resources[0].id.clone();
+        s.logs
+            .by_resource
+            .insert(id.clone(), vec![line(1, LogLevel::Info, "c", "history")]);
+        let generation = s.logs.generation;
+        assert!(handle(Action::ToggleLiveTail, &mut s));
+        assert!(s.logs.live && live_tail_active(&s));
+        assert!(!s.logs.by_resource.contains_key(&id), "buffer is replaced");
+        assert_ne!(s.logs.generation, generation, "in-flight fetch goes stale");
+    }
+
+    #[test]
+    fn server_side_filters_are_inert_in_live_tail() {
+        let mut s = fixture(ResourceKind::ContainerApp);
+        let id = s.resources[0].id.clone();
+        s.logs.live = true;
+        append_live_lines(&mut s, &id, vec![line(1, LogLevel::Info, "c", "m")]);
+        for action in [
+            Action::ToggleErrorsOnly,
+            Action::ToggleHideHealth,
+            Action::SetWindowDay,
+        ] {
+            assert!(handle(action, &mut s));
+        }
+        assert!(!s.logs.errors_only && !s.logs.hide_health);
+        assert_eq!(s.logs.by_resource[&id].len(), 1, "stream buffer survives");
     }
 
     #[test]

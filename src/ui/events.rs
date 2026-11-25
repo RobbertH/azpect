@@ -80,6 +80,14 @@ pub enum AppEvent {
         generation: u64,
         result: Result<crate::azure::logs::LogsPage, String>,
     },
+    /// Lines or a connection-state change from a Container App's live log
+    /// stream. `generation` is the `logs.generation` the stream was started
+    /// under; events from a stream that has since been replaced are dropped.
+    LiveLog {
+        resource_id: String,
+        generation: u64,
+        event: crate::azure::container_app_live_logs::LiveEvent,
+    },
     /// Background load completion: Azure Resource Health availability for a
     /// specific resource id.
     HealthLoaded {
@@ -527,6 +535,9 @@ pub enum Action {
     /// App Service's `/robots933456.txt` warm-up ping). Bound to `H`, scoped
     /// to the logs view.
     ToggleHideHealth,
+    /// Logs view (Container Apps): switch between historical Log Analytics
+    /// rows and the real-time log stream. Bound to `t` (tail).
+    ToggleLiveTail,
     ToggleFavorite,
     ToggleFavoritesOnly,
     StartSearch,
@@ -802,6 +813,7 @@ pub fn key_to_action(key: KeyEvent, view: View, search_active: bool) -> Action {
             | View::SqlAuditPrincipals
             | View::SqlAuditEvents => Action::SetCustomWindow,
             View::LogicAppRuns => Action::OpenTriggerHistory,
+            View::Logs => Action::ToggleLiveTail,
             _ => Action::Noop,
         },
         // `c` / `C` measure a container (all listed containers) on the storage
@@ -1054,6 +1066,15 @@ mod tests {
         assert_eq!(key_to_action(key('?'), v, false), Action::Help);
         assert_eq!(key_to_action(key(':'), v, false), Action::StartCommand);
         assert_eq!(key_to_action(key('o'), v, false), Action::OpenInBrowser);
+    }
+
+    #[test]
+    fn t_toggles_live_tail_in_logs_only() {
+        assert_eq!(
+            key_to_action(key('t'), View::Logs, false),
+            Action::ToggleLiveTail
+        );
+        assert_eq!(key_to_action(key('t'), View::List, false), Action::Noop);
     }
 
     #[test]
