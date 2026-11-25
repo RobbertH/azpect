@@ -8,10 +8,13 @@
 //! leaves the view at the root). Enter on a blob pins its full name and opens
 //! [`View::StorageBlobDetail`].
 //!
-//! Listings are fetched one page (1000 rows) at a time. Moving the cursor
-//! near the end of a listing the server has more of raises
-//! `blobs_fetch_more`; `app.rs::after_action` drains the flag and appends
-//! the next page, so a big folder streams in as you scroll.
+//! Listings are fetched one page (1000 rows) at a time. The service returns
+//! folders and blobs interleaved in name order, so `app.rs` keeps fetching
+//! pages in the background (up to `BLOBS_AUTO_LOAD_ROWS`) until the folder is
+//! complete — otherwise folders that sort after the first page would be
+//! missing from the top. Past that cap, moving the cursor near the end of
+//! the listing raises `blobs_fetch_more`; `app.rs::after_action` drains the
+//! flag and appends the next page.
 //!
 //! `Tab` / `Shift+Tab` sort by the next / previous column, `i` inverts the
 //! direction. Folders always stay above blobs; the direction only reorders
@@ -90,6 +93,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         if loading_more {
             count_label.push_str("· loading more … ");
+        } else if p.next_marker.is_some() {
+            // Folders arrive interleaved with blobs, so an unfinished
+            // listing can still be hiding some.
+            count_label.push_str("· partial: more folders may follow, scroll to load ");
         }
     }
     let mut title_spans: Vec<Span> = vec![

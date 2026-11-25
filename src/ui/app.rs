@@ -297,6 +297,9 @@ async fn event_loop(
                 }
                 maybe_auto_refresh(state, auth, tx, now);
                 reconcile_live_tail(state);
+                // Resumes a listing whose background load paused when the
+                // user stepped into another folder and came back.
+                auto_continue_storage_blobs(state, auth, tx);
             }
             AppEvent::Resize { .. } => {
                 // ratatui re-measures on next draw. Nothing to do.
@@ -993,6 +996,7 @@ async fn event_loop(
                 result,
             } => {
                 apply_storage_blobs_page(state, key, from_marker, result);
+                auto_continue_storage_blobs(state, auth, tx);
             }
             AppEvent::StorageBlobPreviewLoaded { key, result } => {
                 state.storage.blob_preview_pending.remove(&key);
@@ -7606,25 +7610,121 @@ fn apply_storage_blobs_page(
         }
         return;
     };
-    let Some(listing) = state
+    let expected = state
         .storage
         .blobs
-        .get_mut(&key)
-        .filter(|p| p.next_marker.as_deref() == Some(marker.as_str()))
-    else {
+        .get(&key)
+        .is_some_and(|p| p.next_marker.as_deref() == Some(marker.as_str()));
+    if !expected {
         return;
-    };
+    }
     state.storage.blobs_loading_more.remove(&key);
     match result {
         Ok(page) => {
             state.storage.blobs_more_error.remove(&key);
+            // Folders sort above blobs, so a later page's folders land above
+            // rows already on screen. Remember the highlighted row to keep
+            // the cursor on it.
+            let anchor = blobs_cursor_anchor(state, &key);
+            let Some(listing) = state.storage.blobs.get_mut(&key) else {
+                return;
+            };
             listing.prefixes.extend(page.prefixes);
             listing.blobs.extend(page.blobs);
             listing.next_marker = page.next_marker;
+            if let Some(name) = anchor {
+                restore_blobs_cursor(state, &name);
+            }
         }
         Err(e) => {
             state.storage.blobs_more_error.insert(key, e);
         }
+    }
+}
+
+/// Full name of the row under the blobs cursor, when `key` is the listing on
+/// screen and the user has moved off the top. At the very top nothing is
+/// pinned, so folders arriving from later pages appear in view.
+fn blobs_cursor_anchor(state: &AppState, key: &str) -> Option<String> {
+    let acc = state.storage.selected_account.as_ref()?;
+    let container = state.storage.selected_container.as_deref()?;
+    let current = crate::ui::state::StorageCache::blob_listing_key(
+        &acc.name,
+        container,
+        &state.storage.blobs_prefix,
+    );
+    if current != key || state.storage.blobs_cursor == 0 {
+        return None;
+    }
+    state
+        .storage
+        .visible_blob_rows(&acc.name, container)
+        .get(state.storage.blobs_cursor)
+        .map(|row| row.full_name().to_string())
+}
+
+/// Move the blobs cursor back onto the row named `name` after the listing
+/// grew, scrolling the viewport by the same amount so the text stays put.
+fn restore_blobs_cursor(state: &mut AppState, name: &str) {
+    let (Some(acc), Some(container)) = (
+        state.storage.selected_account.as_ref(),
+        state.storage.selected_container.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(index) = state
+        .storage
+        .visible_blob_rows(&acc.name, container)
+        .iter()
+        .position(|row| row.full_name() == name)
+    else {
+        return;
+    };
+    let shift = index.saturating_sub(state.storage.blobs_cursor);
+    state.storage.blobs_cursor = index;
+    state
+        .storage
+        .blobs_view_top
+        .set(state.storage.blobs_view_top.get() + shift);
+}
+
+/// Rows the blobs view loads on its own before falling back to
+/// scroll-to-load. The service returns folders and blobs interleaved in name
+/// order, so a folder is only known once its page has been fetched; loading
+/// ahead is what lets every folder show at the top. The cap keeps a folder
+/// holding millions of blobs from being walked uninvited.
+const BLOBS_AUTO_LOAD_ROWS: usize = 20_000;
+
+/// Fetch the next page of the folder on screen while its listing is partial
+/// and under [`BLOBS_AUTO_LOAD_ROWS`]. Stops on a failed page (the title
+/// shows the error; scrolling retries).
+fn auto_continue_storage_blobs(
+    state: &mut AppState,
+    auth: &AzureAuth,
+    tx: &UnboundedSender<AppEvent>,
+) {
+    if state.view != View::StorageBlobs {
+        return;
+    }
+    let (Some(acc), Some(container)) = (
+        state.storage.selected_account.as_ref(),
+        state.storage.selected_container.as_deref(),
+    ) else {
+        return;
+    };
+    let key = crate::ui::state::StorageCache::blob_listing_key(
+        &acc.name,
+        container,
+        &state.storage.blobs_prefix,
+    );
+    if state.storage.blobs_more_error.contains_key(&key) {
+        return;
+    }
+    let wanted = state.storage.blobs.get(&key).is_some_and(|p| {
+        p.next_marker.is_some() && p.prefixes.len() + p.blobs.len() < BLOBS_AUTO_LOAD_ROWS
+    });
+    if wanted {
+        fetch_more_storage_blobs(state, auth, tx);
     }
 }
 
@@ -9349,6 +9449,94 @@ mod tests {
                 return apply_storage_blobs_page(state, key, from_marker, result);
             }
         }
+    }
+
+    #[test]
+    fn storage_blobs_load_ahead_surfaces_late_folders_and_keeps_the_cursor() {
+        use crate::azure::storage::{Blob, BlobPage};
+        let auth = AzureAuth::demo();
+        let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = storage_blobs_demo_state();
+        let acc = state.storage.selected_account.clone().unwrap().name;
+        let key = crate::ui::state::StorageCache::blob_listing_key(&acc, "raw-events", "");
+        let blob = |name: &str| Blob {
+            name: name.to_string(),
+            size: 1,
+            content_type: None,
+            last_modified: None,
+            blob_type: "BlockBlob".to_string(),
+        };
+
+        // First page: one folder and two blobs, with more to come.
+        apply_storage_blobs_page(
+            &mut state,
+            key.clone(),
+            None,
+            Ok(BlobPage {
+                prefixes: vec!["a-dir/".into()],
+                blobs: vec![blob("b.txt"), blob("c.txt")],
+                next_marker: Some("m1".into()),
+            }),
+        );
+        // A partial listing on screen is continued without any key press.
+        auto_continue_storage_blobs(&mut state, &auth, &tx);
+        assert!(state.storage.blobs_loading_more.contains(&key));
+        while rx.try_recv().is_ok() {}
+
+        // Cursor on `c.txt`; the next page brings a folder that sorts after it
+        // by name but belongs above every blob.
+        state.storage.blobs_cursor = 2;
+        apply_storage_blobs_page(
+            &mut state,
+            key.clone(),
+            Some("m1".into()),
+            Ok(BlobPage {
+                prefixes: vec!["z-dir/".into()],
+                blobs: vec![blob("d.txt")],
+                next_marker: None,
+            }),
+        );
+        let rows: Vec<String> = state
+            .storage
+            .visible_blob_rows(&acc, "raw-events")
+            .iter()
+            .map(|r| r.full_name().to_string())
+            .collect();
+        assert_eq!(rows, ["a-dir/", "z-dir/", "b.txt", "c.txt", "d.txt"]);
+        assert_eq!(rows[state.storage.blobs_cursor], "c.txt");
+
+        // Complete listing: nothing further is requested.
+        auto_continue_storage_blobs(&mut state, &auth, &tx);
+        assert!(!state.storage.blobs_loading_more.contains(&key));
+    }
+
+    #[test]
+    fn storage_blobs_load_ahead_stops_on_error_and_outside_the_view() {
+        use crate::azure::storage::BlobPage;
+        let auth = AzureAuth::demo();
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mut state = storage_blobs_demo_state();
+        let acc = state.storage.selected_account.clone().unwrap().name;
+        let key = crate::ui::state::StorageCache::blob_listing_key(&acc, "raw-events", "");
+        state.storage.blobs.insert(
+            key.clone(),
+            BlobPage {
+                next_marker: Some("m1".into()),
+                ..BlobPage::default()
+            },
+        );
+
+        state.view = View::StorageContainers;
+        auto_continue_storage_blobs(&mut state, &auth, &tx);
+        assert!(!state.storage.blobs_loading_more.contains(&key));
+
+        state.view = View::StorageBlobs;
+        state
+            .storage
+            .blobs_more_error
+            .insert(key.clone(), "boom".into());
+        auto_continue_storage_blobs(&mut state, &auth, &tx);
+        assert!(!state.storage.blobs_loading_more.contains(&key));
     }
 
     #[test]
