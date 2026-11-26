@@ -10,7 +10,7 @@
 //!
 //! Listings are fetched one page (1000 rows) at a time. The service returns
 //! folders and blobs interleaved in name order, so `app.rs` keeps fetching
-//! pages in the background (up to `BLOBS_AUTO_LOAD_ROWS`) until the folder is
+//! pages in the background (up to [`AUTO_LOAD_ROWS`]) until the folder is
 //! complete — otherwise folders that sort after the first page would be
 //! missing from the top. Past that cap, moving the cursor near the end of
 //! the listing raises `blobs_fetch_more`; `app.rs::after_action` drains the
@@ -46,6 +46,12 @@ const HALF_PAGE: usize = 10;
 /// Ask for the next page once the cursor is this close to the end of the
 /// loaded rows, so a steady `j` never stalls on the page boundary.
 const PREFETCH_ROWS: usize = 20;
+/// Rows the blobs view loads on its own before falling back to
+/// scroll-to-load. The service returns folders and blobs interleaved in name
+/// order, so a folder is only known once its page has been fetched; loading
+/// ahead is what lets every folder show at the top. The cap keeps a folder
+/// holding millions of blobs from being walked uninvited.
+pub const AUTO_LOAD_ROWS: usize = 20_000;
 
 pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // Global breadcrumb (rendered by app::dispatch_view) carries the account,
@@ -93,25 +99,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         }
         if loading_more {
             count_label.push_str("· loading more … ");
-        } else if p.next_marker.is_some() {
-            // Folders arrive interleaved with blobs, so an unfinished
-            // listing can still be hiding some.
-            count_label.push_str("· partial: more folders may follow, scroll to load ");
         }
     }
     let mut title_spans: Vec<Span> = vec![
         Span::styled(" blobs ", Style::default().fg(theme.fg)),
         Span::styled(count_label, Style::default().fg(theme.muted)),
     ];
-    if let Some(err) = key
+    // A listing that stopped short (cap reached or a page failed) gets a
+    // banner above the table instead of a title chip — see below.
+    let more_error = key
         .as_ref()
-        .and_then(|k| state.storage.blobs_more_error.get(k))
-    {
-        title_spans.push(Span::styled(
-            format!("next page failed: {} ", truncate_line(err, 80)),
-            Style::default().fg(theme.critical),
-        ));
-    }
+        .and_then(|k| state.storage.blobs_more_error.get(k));
     if filter_active || !filter_value.is_empty() {
         title_spans.push(Span::styled(
             format!("/{filter_value} "),
@@ -168,6 +166,56 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     let loading = state.storage.blobs_pending.contains(&key);
     let prefix = state.storage.blobs_prefix.as_str();
+
+    // Incomplete listing that is no longer loading on its own: say so loudly.
+    // The service returns folders and blobs interleaved by name, so anything
+    // past the loaded rows — folders included — is simply not on screen.
+    let body_area = match listing {
+        Some(p) if p.next_marker.is_some() && !loading_more => {
+            let total = p.prefixes.len() + p.blobs.len();
+            let capped = total >= AUTO_LOAD_ROWS;
+            if more_error.is_some() || capped {
+                let warn = Style::default()
+                    .fg(theme.degraded)
+                    .add_modifier(Modifier::BOLD);
+                let mut lines = vec![Line::from(Span::styled(
+                    format!(
+                        "⚠ INCOMPLETE: only the first {total} entries are loaded — \
+                         folders and blobs further down are missing."
+                    ),
+                    warn,
+                ))];
+                if let Some(err) = more_error {
+                    lines.push(Line::from(Span::styled(
+                        format!("  next page failed: {}", err.lines().next().unwrap_or("")),
+                        Style::default().fg(theme.critical),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "  G (or scrolling to the end) retries; r reloads the folder.",
+                        Style::default().fg(theme.degraded),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  Background loading stops at {AUTO_LOAD_ROWS}. \
+                             G (or scrolling to the end) loads the next page."
+                        ),
+                        Style::default().fg(theme.degraded),
+                    )));
+                }
+                let width = body_area.width.max(1) as usize;
+                let height: usize = lines.iter().map(|l| l.width().div_ceil(width).max(1)).sum();
+                let height = (height as u16).min(body_area.height.saturating_sub(2));
+                let parts = Layout::vertical([Constraint::Length(height), Constraint::Min(0)])
+                    .split(body_area);
+                frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
+                parts[1]
+            } else {
+                body_area
+            }
+        }
+        _ => body_area,
+    };
     match listing {
         None if loading => {
             let p = Paragraph::new(Line::from(Span::styled(
@@ -244,11 +292,20 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                     .add_modifier(Modifier::BOLD),
             );
 
+            // Width the table will give NAME: same constraints, minus the
+            // selection symbol. ratatui clips an over-long cell silently, which
+            // makes a cut name look like the whole name.
+            let name_w = Layout::horizontal(widths).spacing(2).split(Rect {
+                width: body_area.width.saturating_sub(2),
+                ..body_area
+            })[0]
+                .width as usize;
+
             let body_rows: Vec<Row> = rows
                 .iter()
                 .map(|row| match row {
                     BlobRow::Folder(_) => Row::new(vec![
-                        Cell::from(row.display_name(prefix).to_string())
+                        Cell::from(truncate_middle(row.display_name(prefix), name_w))
                             .style(Style::default().fg(theme.accent)),
                         Cell::from(Line::from("—").alignment(Alignment::Right))
                             .style(Style::default().fg(theme.muted)),
@@ -257,7 +314,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                         Cell::from("folder").style(Style::default().fg(theme.muted)),
                     ]),
                     BlobRow::Blob(b) => Row::new(vec![
-                        Cell::from(row.display_name(prefix).to_string())
+                        Cell::from(truncate_middle(row.display_name(prefix), name_w))
                             .style(Style::default().fg(theme.fg)),
                         // Right-align inside the cell so digits line up with
                         // the right-aligned `SIZE` header.
@@ -319,6 +376,26 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{n} B")
     }
+}
+
+/// Fit `s` into `max` columns by replacing its middle with an ellipsis. The
+/// tail is kept because that is where blob names differ — a timestamp or
+/// sequence number and the extension — while the head is often a prefix
+/// shared by every row.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let tail = ((max - 1) / 2).min(20);
+    let head = max - 1 - tail;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
@@ -923,6 +1000,48 @@ mod tests {
             buf.contains("1 of 2"),
             "title count should switch to `N of M` when filtering, got: {buf}",
         );
+    }
+
+    #[test]
+    fn long_names_keep_their_tail_behind_a_middle_ellipsis() {
+        assert_eq!(truncate_middle("short.jpg", 20), "short.jpg");
+        let cut = truncate_middle(
+            "AL6101059-POST_14_AL6101059-POST-14_20261121_124005.jpg",
+            30,
+        );
+        assert_eq!(cut.chars().count(), 30);
+        assert!(cut.starts_with("AL6101059-POST_"), "got: {cut}");
+        assert!(cut.ends_with("_124005.jpg"), "got: {cut}");
+        assert!(cut.contains('…'));
+    }
+
+    #[test]
+    fn stalled_partial_listing_gets_a_banner() {
+        let theme = Theme::catppuccin_mocha();
+        let backend = TestBackend::new(140, 12);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut state = fixture();
+        let mut p = page(&[], vec![blob("a", 1), blob("b", 1)]);
+        p.next_marker = Some("tok".into());
+        insert(&mut state, "", p);
+
+        // Partial but still under the cap with no error: background loading
+        // owns it, no banner.
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(!buf.contains("INCOMPLETE"), "got: {buf}");
+
+        state.storage.blobs_more_error.insert(
+            StorageCache::blob_listing_key("acct1", "logs", ""),
+            "403 from storage data plane".into(),
+        );
+        term.draw(|f| render(f, f.area(), &state, &theme)).unwrap();
+        let buf = format!("{:?}", term.backend().buffer());
+        assert!(
+            buf.contains("INCOMPLETE: only the first 2 entries"),
+            "got: {buf}"
+        );
+        assert!(buf.contains("next page failed: 403"), "got: {buf}");
     }
 
     #[test]

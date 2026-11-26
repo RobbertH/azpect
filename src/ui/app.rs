@@ -7688,16 +7688,9 @@ fn restore_blobs_cursor(state: &mut AppState, name: &str) {
         .set(state.storage.blobs_view_top.get() + shift);
 }
 
-/// Rows the blobs view loads on its own before falling back to
-/// scroll-to-load. The service returns folders and blobs interleaved in name
-/// order, so a folder is only known once its page has been fetched; loading
-/// ahead is what lets every folder show at the top. The cap keeps a folder
-/// holding millions of blobs from being walked uninvited.
-const BLOBS_AUTO_LOAD_ROWS: usize = 20_000;
-
 /// Fetch the next page of the folder on screen while its listing is partial
-/// and under [`BLOBS_AUTO_LOAD_ROWS`]. Stops on a failed page (the title
-/// shows the error; scrolling retries).
+/// and under [`crate::ui::views::storage_blobs::AUTO_LOAD_ROWS`]. Stops on a failed page (the view
+/// shows a banner; scrolling retries).
 fn auto_continue_storage_blobs(
     state: &mut AppState,
     auth: &AzureAuth,
@@ -7721,7 +7714,8 @@ fn auto_continue_storage_blobs(
         return;
     }
     let wanted = state.storage.blobs.get(&key).is_some_and(|p| {
-        p.next_marker.is_some() && p.prefixes.len() + p.blobs.len() < BLOBS_AUTO_LOAD_ROWS
+        p.next_marker.is_some()
+            && p.prefixes.len() + p.blobs.len() < crate::ui::views::storage_blobs::AUTO_LOAD_ROWS
     });
     if wanted {
         fetch_more_storage_blobs(state, auth, tx);

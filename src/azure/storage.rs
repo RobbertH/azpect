@@ -1202,8 +1202,14 @@ fn classify_service_error(
     let lower = msg.to_lowercase();
     if msg.contains("azure api error 403") || lower.contains(" 403 ") || lower.contains("forbidden")
     {
+        // Keep the service's own error code: it separates a missing role
+        // (`AuthorizationPermissionMismatch`) from a network rule
+        // (`AuthorizationFailure`) or a rejected token (`AuthenticationFailed`).
+        let code = xml_tag(&msg, "Code")
+            .map(|c| format!(" ({c})"))
+            .unwrap_or_default();
         return anyhow!(
-            "403 from storage data plane: identity likely lacks '{role}' role \
+            "403 from storage data plane{code}: identity likely lacks '{role}' role \
              on account '{account_name}' (or the account's firewall blocks this network). \
              Control-plane access (Reader) is not sufficient for {service} data."
         );
@@ -1225,6 +1231,14 @@ fn classify_service_error(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Text of the first `<tag>…</tag>` element in an XML error body, if any.
+fn xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&format!("</{tag}>"))?;
+    Some(body[start..start + end].trim()).filter(|s| !s.is_empty())
+}
 
 /// Minimal percent-encoder for query-string values. Avoids pulling in
 /// `percent-encoding` for the one place we need to escape a user prefix.
@@ -1669,6 +1683,21 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("Storage Blob Data Reader"), "got: {msg}");
         assert!(msg.contains("acct"), "got: {msg}");
+    }
+
+    #[test]
+    fn classified_403_keeps_the_service_error_code() {
+        let err = classify_data_plane_error(
+            "acct",
+            anyhow!(
+                "azure api error 403: <?xml version=\"1.0\"?><Error><Code>AuthorizationFailure</Code><Message>no</Message></Error>"
+            ),
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("403 from storage data plane (AuthorizationFailure):"),
+            "got: {msg}"
+        );
     }
 
     #[test]
